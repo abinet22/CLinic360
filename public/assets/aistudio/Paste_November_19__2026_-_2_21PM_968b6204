@@ -1,0 +1,847 @@
+# Clinic Management System: User Role Designs and Workflow Designs
+
+Companion to `clinic-system-modules-and-access.md`. That file says **what** exists and **who may do what**. This file says **how each person works day to day** and **how each process moves through the system**.
+
+Status tags: **[V1]** built in the delivered code, **[V1+]** partly built, **[NEW]** to be built.
+In the current code the role values are `admin, receptionist, doctor, nurse, lab, pharmacist, cashier`. The other roles (WRD, IMG, STO, ACC, HRO, MGR, AUD) are **[NEW]**.
+
+---
+
+## Part A. Conventions
+
+| Term | Meaning |
+|---|---|
+| Visit | One episode of care for a patient (OPD, emergency or inpatient stay). Every order, bill line and result hangs off a visit |
+| Order | A request from a doctor or nurse to another department (lab, imaging, pharmacy, procedure) |
+| Payment gate | Rule that a paid order is needed before service is released. Configurable per payer type and per department |
+| Worklist | The queue of items waiting for a role, sorted by priority then time |
+| Handoff | A status change that moves work from one role to the next and notifies them |
+| Approval | A request that another role must accept or reject before the action completes |
+| Reversal | The only way to correct posted money or released results: a new linked record, never an edit |
+
+**Priority levels used everywhere:** `emergency` (red), `urgent` (amber), `routine` (green).
+
+---
+
+## Part B. Role designs
+
+Each role lists mission, daily rhythm, screens, what they can and cannot do, handoffs, alerts, KPIs and controls.
+
+### B1. Receptionist / Registration clerk (REC)
+
+**Mission:** every patient has exactly one correct record and knows where to go next.
+
+**Daily rhythm**
+- Start: open today's appointment list and doctor availability; check display screen and queue counters.
+- During: register new patients, search existing ones, check in appointments, issue queue tickets, answer "where is my patient" questions, book follow-ups.
+- End: clear unchecked appointments (mark no-show), print next-day list, hand over any unresolved duplicate suspicions to admin.
+
+**Screens:** Dashboard, Patient search and register, Appointments (day/week calendar), Queue board, Bed board (read), Bill status (read), My profile.
+
+**Can**
+- Create and edit demographics, next of kin, payer type, photo, attachments.
+- Book, move, cancel appointments; check in; issue tickets; call next patient to cashier.
+- See whether a bill is paid or unpaid.
+
+**Cannot**
+- Take money (unless also given CSH), view clinical notes, results or prescriptions, merge records, change MRN.
+
+**Receives from:** patient (walk-in), phone calls, doctors (follow-up requests).
+**Hands to:** Cashier (fee), Triage (queue ticket).
+
+**Alerts:** possible duplicate on save; appointment about to be missed; doctor on leave on booked date.
+**KPIs:** registration time, duplicate rate, no-show rate, queue wait time.
+**Controls:** duplicate check on name + date of birth + phone; edits to identity fields (name, date of birth, sex) after first visit need a reason and are audited.
+
+---
+
+### B2. Cashier (CSH)
+
+**Mission:** all money in is correct, receipted and traceable to a patient, a service and a shift.
+
+**Daily rhythm**
+- Start: **open shift** with counted float. No shift, no payments.
+- During: find the patient, review the open bill, take payment (cash, card, mobile, bank), print receipt, release the payment gate, handle deposits for admissions, mark credit/insurance bills, request discounts, void or refund requests.
+- End: **close shift**: enter counted cash by denomination, system shows expected vs counted and the variance, print shift report, hand over cash and report to Finance.
+
+**Screens:** Shift (open/close), Patient bills, Take payment, Receipts, Deposits, Credit and insurance bills, My shift report, Requests (discounts, refunds, status).
+
+**Can**
+- Create bills from orders or price list, receive full or part payments, print and reprint receipts (reprints are marked COPY and logged).
+- Request discount, waiver, refund, void with a reason.
+- See only their own shift totals.
+
+**Cannot**
+- Edit or delete a receipt, approve own requests, see other cashiers' totals, see clinical data, change prices.
+
+**Receives from:** Reception (patients), Doctors (orders to be paid), Ward (deposit and discharge clearance).
+**Hands to:** Lab, Imaging, Pharmacy (payment gate opens), Finance (shift report).
+
+**Alerts:** unpaid orders waiting; shift open longer than 12 hours; request approved or rejected; cash in drawer above safe limit (suggest cash drop).
+**KPIs:** collections per shift, variance (target zero), average time per transaction, share of voids and refunds.
+**Controls:** sequential receipt numbers; cash variance beyond tolerance needs a reason and Finance sign-off; refund always references the original receipt.
+
+---
+
+### B3. Triage / OPD Nurse (NUR)
+
+**Mission:** safe, fast first assessment and correct priority.
+
+**Daily rhythm**
+- Start: open triage queue; check equipment (a configurable checklist can be logged).
+- During: call next ticket, confirm identity (name and date of birth), record vitals and chief complaint, set priority, flag red-flag signs, send to doctor room; perform nursing procedures ordered by the doctor (injection, dressing, nebulisation) and record consumables.
+- End: clear the queue, hand over observation patients.
+
+**Screens:** Triage queue, Vitals form, OPD nursing worklist, Procedure log, Patient summary (read), Results (read).
+
+**Can**
+- Create and edit vitals for open visits within the edit window, set triage priority, record nursing notes and procedures, collect lab samples if allowed.
+
+**Cannot**
+- Diagnose, prescribe, edit doctor notes, see bills or money.
+
+**Receives from:** Reception queue.
+**Hands to:** Doctor (patient ready), Cashier (procedure charges flow to bill automatically).
+
+**Alerts:** out-of-range vital (for example SpO₂ below 92%, temperature above 39 °C) shown in red with prompt to escalate; child under 5 with danger signs; pregnant patient flagged.
+**KPIs:** triage time, share of emergency cases seen within target, vitals completeness.
+**Controls:** vitals older than the edit window are locked; corrections by doctor are tagged "corrected by".
+
+---
+
+### B4. Doctor (DOC)
+
+**Mission:** accurate diagnosis and safe, complete orders in the least clicks.
+
+**Daily rhythm**
+- Start: open My patients: booked, waiting (vitals done), results back, follow-ups due, inpatients to round on.
+- During: call patient, review history and allergies, consult, write notes, diagnose, order lab/imaging, prescribe, refer, admit, issue certificates, close visit.
+- End: review pending results, close open visits (those without diagnosis cannot close), hand over inpatients.
+
+**Screens:** My patients, Consultation (vitals, notes, orders, prescriptions in one page), Results inbox, Patient history, Inpatient list, Certificates and letters, My schedule.
+
+**Can**
+- Full clinical write on own visits; order; prescribe; refer; admit and discharge; add follow-up appointments; read any patient with a reason if not own (break-glass).
+
+**Cannot**
+- Take payment, change prices, dispense, edit another doctor's closed notes, approve their own discount.
+
+**Receives from:** Triage, appointments, Lab and Imaging (results), Ward (inpatient updates).
+**Hands to:** Cashier (orders to pay), Lab, Imaging, Pharmacy, Ward (admission), Reception (follow-up).
+
+**Alerts:** critical lab value; imaging report final; allergy conflict when prescribing; drug out of stock (suggest alternative); patient waiting longer than target.
+**KPIs:** consultation time, results acknowledged within target, open visits older than 24 hours, antibiotic prescribing rate.
+**Controls:** reopening a closed visit needs reason and manager approval; every read of a non-own patient asks for a reason.
+
+---
+
+### B5. Ward Nurse (WRD) [NEW]
+
+**Mission:** continuous safe care of admitted patients and correct bed use.
+
+**Daily rhythm**
+- Start of shift: handover screen (each patient's status, pending orders, alerts), accept handover.
+- During: vitals at scheduled times, medication rounds with the medication chart, wound care, intake and output, assist doctor rounds, request drugs and consumables, update care plan, manage bed status.
+- End of shift: write handover note per patient, sign off.
+
+**Screens:** Bed board, Patient care view, Vitals chart, Medication chart (MAR), Nursing notes, Care plan, Ward requests, Handover.
+
+**Can**
+- Record vitals and notes, give or withhold medication with reason, raise requests to pharmacy and store, allocate and transfer beds within the ward, prepare discharge checklist.
+
+**Cannot**
+- Change doctor orders, discharge without doctor's order, edit bills.
+
+**Receives from:** Doctor (admission, orders), Pharmacy (ward drugs), Cashier (deposit confirmed).
+**Hands to:** Doctor (alerts), Pharmacy and Store (requests), Cashier (discharge clearance), Cleaning (bed status).
+
+**Alerts:** medication due or overdue; vitals due; abnormal early-warning score; new order; low ward stock.
+**KPIs:** medication on-time rate, vitals compliance, falls and pressure injuries, bed turnaround time.
+**Controls:** each medication given needs initials and time; "not given" needs a reason; missed doses escalate to charge nurse.
+
+---
+
+### B6. Laboratory Technician (LAB)
+
+**Mission:** accurate results, released on time, with a clean sample trail.
+
+**Daily rhythm**
+- Start: check worklist, reagent levels, run quality control and log it.
+- During: receive paid orders, collect or receive samples, label, run tests, enter results, flag abnormal, request verification, release, call critical values, request reagents.
+- End: clear pending, record consumption, handover unresolved samples.
+
+**Screens:** Worklist (to collect, in progress, to verify, released), Sample receiving, Result entry (single and panel), Verification, Rejections, Test catalogue, Lab stock, QC log, Reports.
+
+**Can**
+- Enter and verify results (verifier must be a different user), reject samples with reason, request recollection, manage catalogue if lead technician.
+
+**Cannot**
+- Order tests, see bills or clinical notes beyond clinical question and patient basics, edit a released result without amend reason.
+
+**Receives from:** Doctor/Nurse (orders), Cashier (payment gate).
+**Hands to:** Doctor (results), Store (reagent requests).
+
+**Alerts:** urgent order; critical result; reagent below reorder level; QC failure; sample waiting past stability time.
+**KPIs:** turnaround time by test, rejected-sample rate, critical call time, amended-result rate.
+**Controls:** two-step release; amended results keep the old value visible as "previous".
+
+---
+
+### B7. Imaging Technician / Radiologist (IMG) [NEW]
+
+**Mission:** right exam on the right patient, with a clear report.
+
+**Daily rhythm**
+- Start: open worklist; check room readiness and consumables.
+- During: identify patient, pregnancy check for women of reproductive age, perform exam, record details and repeats, upload images, hand to reporting doctor; radiologist writes and finalises report.
+- End: clear worklist, reconcile films or media used.
+
+**Screens:** Imaging worklist, Exam form, Image viewer, Report editor (templates), Catalogue, Imaging stock.
+
+**Can**
+- Perform exams, upload images, write draft report; finalise if reporting rights are granted.
+
+**Cannot**
+- Order exams, change bills, edit a finalised report (addendum only).
+
+**Receives from:** Doctor (orders), Cashier (payment gate), Ward.
+**Hands to:** Doctor (final report), Store (consumables).
+
+**Alerts:** urgent or emergency order; unreported exams older than target; critical finding to be called.
+**KPIs:** report turnaround, repeat rate, exams per modality.
+**Controls:** addendum instead of edit after final; critical findings must be acknowledged by the doctor.
+
+---
+
+### B8. Pharmacist (PHA)
+
+**Mission:** the right drug, dose and quantity to the right patient, with stock under control.
+
+**Daily rhythm**
+- Start: check prescription queue, expiry and stock alerts, controlled drugs balance.
+- During: pick prescription, verify payment gate, allergy and dose check, select batch (earliest expiry first), dispense, label, counsel, record; handle OTC sales and returns; answer ward requests; raise requisitions to store.
+- End: count controlled drugs, reconcile cash drawer if the counter takes money (or hand to cashier), file daily report.
+
+**Screens:** Prescription queue, Dispense, OTC sale, Returns, Ward requests, Dispensary stock, Requisitions, Controlled drug register, Reports.
+
+**Can**
+- Dispense full or partial, substitute with generic (note required), adjust dispensary stock with reason, return to store.
+
+**Cannot**
+- Prescribe, change prices (request only), dispense an unpaid prescription unless the payer rules allow it.
+
+**Receives from:** Doctor (Rx), Cashier (paid), Ward (requests), Store (issues).
+**Hands to:** Patient, Ward, Store (returns, requisitions).
+
+**Alerts:** allergy match; stock-out; batch near expiry; controlled drug balance mismatch; new urgent prescription.
+**KPIs:** dispensing time, stock-out days, expiry write-offs, dispensing error reports.
+**Controls:** one transaction per dispense (all or nothing); controlled drugs need second signature; stock never below zero.
+
+---
+
+### B9. Store Keeper (STO) [NEW]
+
+**Mission:** nothing runs out, nothing expires unnoticed, every movement has a document.
+
+**Daily rhythm**
+- Start: review low-stock and expiry dashboards, open requisitions.
+- During: approve and issue requisitions, receive deliveries against purchase orders (GRN with batch and expiry), transfer between stores, raise purchase requests, handle returns.
+- End: file documents, update bin cards; monthly: run stock count.
+
+**Screens:** Dashboard, Items, Stock by store and batch, Requisitions, Issues, Receive goods (GRN), Purchase requests and orders, Suppliers, Transfers, Adjustments, Stock count, Expiry.
+
+**Can**
+- Receive, issue, transfer, count, raise purchase requests and orders; request adjustments.
+
+**Cannot**
+- Approve own purchase orders or own adjustments, see patient data, post accounting entries.
+
+**Receives from:** Departments (requisitions), Suppliers (deliveries).
+**Hands to:** Departments (issues), Finance (GRN for payables).
+
+**Alerts:** below reorder level; expiring in 90/60/30 days; delivery overdue; count variance.
+**KPIs:** stock-out incidents, expiry loss value, requisition fulfilment time, count accuracy.
+**Controls:** person who orders cannot receive; person who counts cannot approve variance; FEFO enforced on issue.
+
+---
+
+### B10. Accountant / Finance Officer (ACC) [NEW]
+
+**Mission:** books that agree with cash, bank, stock and payroll, closed on time.
+
+**Daily rhythm**
+- Start: review cashier shifts submitted overnight, pending approvals (refunds, discounts, expenses).
+- During: reconcile shifts to bank deposits, post journals, process supplier invoices (matched to PO and GRN), pay vouchers, record expenses, follow receivables.
+- End/Month: bank reconciliation, ageing reports, payroll posting, period closing.
+
+**Screens:** Dashboard, Approvals, Cash and bank, Shift reconciliation, Receivables, Payables, Expenses, Journals, Budgets, Period close, Financial reports.
+
+**Can**
+- Approve refunds, discounts, write-offs (within limit), post and reverse journals, close periods.
+
+**Cannot**
+- Take patient payments, edit posted entries, approve own expense claims, see clinical notes.
+
+**Receives from:** Cashiers (shift reports), Store (GRN), HR (payroll), Departments (expense claims).
+**Hands to:** Manager (approvals above limit, monthly reports), Auditor.
+
+**Alerts:** cash variance; unmatched invoice; payment due; budget overspend; period close due.
+**KPIs:** days to close, outstanding receivables, cash variance, budget variance.
+**Controls:** posted entries are immutable; reversal needs reason; closed periods locked.
+
+---
+
+### B11. HR Officer (HRO) [NEW]
+
+**Mission:** accurate staff records, fair attendance and leave, correct pay.
+
+**Daily rhythm**
+- Start: attendance exceptions, leave requests pending, expiring licences and contracts.
+- During: staff registration, contracts, roster, leave balances, discipline and training records, prepare payroll inputs.
+- Month: payroll run, payslips, handover to Finance for posting.
+
+**Screens:** Staff directory, Staff profile and documents, Contracts, Attendance, Roster, Leave, Payroll, Recruitment, Appraisals, Reports.
+
+**Can**
+- Create and edit staff records, set up salary structures, run payroll draft, publish payslips after approval.
+
+**Cannot**
+- Create login accounts (Admin does, from the staff record), approve own payroll, see clinical data or patient bills.
+
+**Receives from:** Supervisors (leave, roster changes), Devices (attendance), Admin (account status).
+**Hands to:** Admin (new staff to create user, leavers to deactivate), Finance (payroll).
+
+**Alerts:** licence expiry in 60/30 days; contract end; probation end; leave balance negative; payroll deadline.
+**KPIs:** attendance rate, vacancy time, payroll errors, licence compliance.
+**Controls:** salary data visible only to HRO, ACC, MGR and the staff member; payroll needs three steps (prepare, verify, approve).
+
+---
+
+### B12. Administrator (ADM)
+
+**Mission:** the system works, is secure, and the right people have the right access.
+
+**Daily rhythm**
+- Start: system health, failed logins, backup status.
+- During: create users from staff records, assign roles, reset passwords, maintain master data, import data, answer access requests, review role changes.
+- Periodic: review inactive accounts, test restore, apply updates.
+
+**Screens:** Users, Roles and permissions, Departments and wards, Price lists and catalogues, Clinic settings, Approval limits, Templates, Notifications, Backups, Imports, System health.
+
+**Can**
+- Create, edit, deactivate users; edit roles; edit master data; run backups.
+
+**Cannot**
+- Read clinical notes, salaries, or post to accounts. Cannot deactivate own account. Cannot delete audit logs.
+
+**Alerts:** repeated failed logins; account created outside HR process; role change; backup failed; user inactive over 60 days.
+**KPIs:** time to onboard, accounts without owner, backup success, open access requests.
+**Controls:** every role or permission change is audited; two administrators exist at all times; admin changes to price lists need manager approval.
+
+---
+
+### B13. Manager / Medical Director (MGR) [NEW]
+
+**Mission:** see the whole clinic, decide, and approve what is above others' limits.
+
+**Daily rhythm:** open management dashboard; approve pending requests (discounts, purchase orders, reopen visit, leave of heads, payroll); read daily summary; review exceptions (voids, stock write-offs, long waits).
+
+**Screens:** Management dashboard, Approvals, All reports, Staff performance (read), Finance summary, Quality and incidents.
+
+**Can:** read all modules, approve above-limit actions, export reports.
+**Cannot:** enter clinical, cash or stock transactions (keeps independence).
+**Alerts:** approvals waiting, revenue vs target, stock-out of essential drugs, incident reports, audit flags.
+**KPIs:** all clinic KPIs (visits, revenue, wait times, occupancy, stock availability, staff attendance).
+
+---
+
+### B14. Auditor (AUD) [NEW]
+
+**Mission:** independent verification.
+
+**Daily rhythm:** run exception reports, sample transactions, trace one patient visit end to end, verify stock counts, check audit chain integrity.
+
+**Screens:** Audit log search, Exceptions, Transaction trace, Finance and stock (read), User access report, Export.
+
+**Can:** read finance, stock, HR summary (no salary detail unless granted), audit log; export.
+**Cannot:** change anything. Access to patient clinical notes is off by default and, if granted for an investigation, is time-limited and logged.
+**Alerts:** audit chain break; high-risk events (see W16).
+
+---
+
+## Part C. Workflow designs
+
+Format: trigger, actors, steps, states, rules, exceptions, notifications, audit events. Diagrams are Mermaid and render in GitHub, GitLab, VS Code and most Markdown viewers.
+
+### W0. End-to-end patient journey
+
+```mermaid
+flowchart TD
+  A["Arrive"] --> B["Reception: find or register, queue ticket"]
+  B --> C["Cashier: card and consultation fee"]
+  C --> D["Triage nurse: vitals, priority"]
+  D --> E["Doctor: consultation"]
+  E --> F{"Orders?"}
+  F -->|"Lab / Imaging"| G["Cashier: pay"]
+  G --> H["Lab or Imaging: service and result"]
+  H --> E
+  F -->|"Drugs"| I["Cashier: pay"]
+  I --> J["Pharmacy: dispense"]
+  F -->|"Admit"| K["Inpatient workflow W9"]
+  F -->|"None"| L["Close visit"]
+  J --> L
+  K --> L
+  L --> M["Finance: daily reconciliation"]
+```
+
+---
+
+### W1. Registration and patient card [V1+]
+
+**Trigger:** patient arrives without a record, or record not found.
+**Actors:** REC, CSH.
+
+| # | Actor | Action | System |
+|---|---|---|---|
+| 1 | REC | Search by name, MRN, phone | Shows matches with age, sex, last visit |
+| 2 | REC | If none, click Register | Form: name, sex, date of birth (or estimated age), phone, address, next of kin, payer type, allergies |
+| 3 | System | Duplicate check | Warns if name + date of birth + phone resembles an existing record |
+| 4 | REC | Save | MRN generated, card fee line added to a new bill |
+| 5 | CSH | Take card fee | Receipt printed; card printed with MRN and barcode |
+| 6 | REC | Issue ticket | Queue ticket for the next department |
+
+**Rules:** unknown patient in emergency may be registered as "Unknown + number" and merged later (W10). Estimated age is flagged. Under-18 requires guardian details.
+**Exceptions:** duplicate found after the fact, so ADM merges (both records kept, one marked merged-into, history combined, audited). Lost card, so re-issue fee and card reprint logged.
+**Audit events:** `patient.create`, `patient.update`, `patient.merge`, `card.reprint`.
+
+---
+
+### W2. Appointment booking and check-in [V1]
+
+```mermaid
+stateDiagram-v2
+  [*] --> scheduled
+  scheduled --> checked_in: patient arrives
+  scheduled --> cancelled: cancelled
+  scheduled --> no_show: not arrived by end of day
+  checked_in --> in_consultation: doctor starts visit
+  checked_in --> cancelled: patient leaves
+  in_consultation --> completed: visit closed
+```
+
+**Trigger:** patient or doctor needs a future slot, or follow-up from a visit.
+**Steps:** REC picks patient, doctor, date and time; system checks the doctor's schedule and overlaps; booking saved; reminder sent (SMS **[NEW]**); on the day, REC checks in, which creates a queue ticket and tells triage; doctor starts the visit from the appointment.
+**Rules:** no overlapping slots for the same doctor [V1]; no booking on leave days **[NEW]**; follow-up created by doctor appears in REC's list; cancellation under a set time frees the slot and notifies waiting list **[NEW]**.
+**Exceptions:** patient late, so REC may move to next free slot or convert to walk-in; doctor absent, so REC bulk-reschedules and SMS goes out.
+**Audit events:** `appointment.create`, `.update`, `.cancel`, `.checkin`, `.noshow`.
+
+---
+
+### W3. Triage and queue [V1+]
+
+**Trigger:** ticket issued.
+**Steps:** NUR calls next ticket (priority first, then time) → confirms identity → records vitals and complaint → system computes BMI and early-warning flags → NUR sets priority and marks "ready for doctor" → doctor's list shows the patient with priority colour.
+**Rules:** emergency priority jumps the queue and notifies the doctor; vitals required before consultation (configurable skip for emergency); identity must be confirmed with two identifiers (name and date of birth or phone).
+**Exceptions:** patient leaves before triage, so ticket marked "left without being seen" after a timeout; wrong patient picked, so NUR cancels and reselects before saving (after saving, correction is by reason).
+**Audit events:** `triage.set`, `vitals.create`, `vitals.update`.
+
+---
+
+### W4. OPD consultation [V1]
+
+```mermaid
+stateDiagram-v2
+  [*] --> open: visit started
+  open --> open: notes, vitals, orders saved
+  open --> closed: doctor closes (diagnosis required)
+  closed --> open: reopen with reason and manager approval
+```
+
+**Steps:** DOC opens patient → reviews allergies, history, today's vitals → writes complaint, history, examination → orders tests, imaging, prescription → system creates orders in "ordered" state and adds charges to the bill → results come back to the Results inbox → DOC updates diagnosis and plan → closes the visit.
+**Rules:** diagnosis required to close; closed visits are read-only; orders added after close need reopen; prescription items need dose, frequency, duration, quantity; allergy warning before saving a conflicting drug **[NEW]**.
+**Exceptions:** patient needs admission, so use W9; patient referred out, so referral letter created and visit closed with outcome "referred".
+**Audit events:** `visit.create`, `.update`, `.close`, `.reopen`, `order.*`, `prescription.create`, `record.view` (non-own).
+
+---
+
+### W5. Cashier: billing, payment gate, discount, refund, shift [V1+]
+
+```mermaid
+flowchart TD
+  A["Order created by clinician"] --> B["Charge added to patient bill"]
+  B --> C{"Payer type"}
+  C -->|"Self-pay"| D["Cashier takes payment"]
+  C -->|"Credit or insurance"| E["Marked to be invoiced, gate opens by rule"]
+  C -->|"Exempt"| F["Zero-pay approval logged"]
+  D --> G["Receipt printed, gate opens"]
+  E --> G
+  F --> G
+  G --> H["Department sees PAID"]
+```
+
+**Payment steps**
+1. CSH searches patient → sees open bill lines from orders.
+2. Selects lines to pay → chooses method (cash, card, mobile, bank) and reference where needed → confirms.
+3. System allocates payment, updates bill status (unpaid → part paid → paid), prints receipt, marks paid orders as released.
+
+**Discount / waiver:** CSH enters request with reason → status "pending" → ACC or MGR approves or rejects → on approval, bill reduced and the approver is recorded → CSH collects the remainder.
+**Refund / void:** CSH raises request linked to receipt → approval by ACC → on approval a reversal payment is posted; original receipt stays. A bill with payments cannot be voided; it is refunded then voided.
+**Shift:** open with float → all payments tagged to shift → close with counted cash → system computes expected = float + cash receipts − cash refunds → variance recorded → shift locked → ACC reconciles.
+
+**Rules:** no payment without an open shift; overpayment rejected [V1]; part payment allowed if clinic policy permits; payer types control the gate (for example, emergency treatment is never blocked by payment); prepaid deposit is used before cash.
+**Exceptions:** wrong amount, so reverse and re-enter; wrong patient, so reverse (approval) and re-take; power or network loss, so use paper receipt book and enter within one working day with the paper number captured.
+**Audit events:** `billing.invoice.create`, `.void.request`, `payment.create`, `refund.approve`, `discount.approve`, `shift.open`, `shift.close`, `receipt.reprint`.
+
+---
+
+### W6. Laboratory: order to verified result [V1+]
+
+```mermaid
+stateDiagram-v2
+  [*] --> ordered
+  ordered --> collected: sample collected or received
+  ordered --> cancelled: cancelled by doctor or lab
+  collected --> rejected: poor sample
+  rejected --> ordered: recollect requested
+  collected --> resulted: result entered
+  resulted --> verified: second person verifies
+  verified --> released: sent to doctor
+  released --> amended: correction with reason
+```
+
+(The V1 build uses `ordered → collected → resulted`. Verify and release states are **[NEW]**.)
+
+**Steps:** DOC orders → CSH payment gate → LAB sees order in worklist → collects or receives sample, labels with ID → runs test → enters result (reference range shown, abnormal flagged automatically and manually) → senior verifies → released; DOC notified; critical results phoned and call logged.
+**Rules:** verifier cannot be the person who entered; critical values require acknowledgment by the doctor; released results are never edited, only amended with reason, and both versions remain visible; reagent use deducted from lab sub-store per test **[NEW]**.
+**Exceptions:** sample rejected (haemolysed, insufficient), so reason recorded, doctor and nurse notified, recollect order created at no extra charge; test not available, so referral to outside lab with tracking number.
+**Audit events:** `lab.order.create`, `.sample.collect`, `.result.enter`, `.result.verify`, `.result.amend`, `.critical.call`.
+
+---
+
+### W7. Imaging: order to final report [NEW]
+
+```mermaid
+stateDiagram-v2
+  [*] --> ordered
+  ordered --> scheduled: slot given
+  ordered --> performed: walk-in exam
+  scheduled --> performed: exam done
+  performed --> reported_draft: report drafted
+  reported_draft --> reported_final: radiologist finalises
+  reported_final --> addendum: addendum added
+```
+
+**Steps:** DOC orders with clinical question → CSH gate → IMG sees worklist → confirms identity and pregnancy status → performs exam, records views, repeats, exposure → uploads images → reporting doctor writes findings and impression → finalises → DOC notified.
+**Rules:** urgent exams jump the list; repeats need a reason (feeds repeat-rate KPI); final report immutable, addendum only; consumables deducted from imaging sub-store.
+**Exceptions:** patient cannot be examined (preparation not done), so status returns to "scheduled" with reason; critical finding, so called to doctor and logged.
+**Audit events:** `imaging.order.create`, `.exam.perform`, `.image.upload`, `.report.finalise`, `.addendum`.
+
+---
+
+### W8. Prescription and dispensing [V1]
+
+```mermaid
+flowchart TD
+  A["Doctor prescribes"] --> B["Charges added, Cashier collects payment"]
+  B --> C["Pharmacist opens pending Rx"]
+  C --> D{"Allergy or interaction?"}
+  D -->|"Yes"| E["Call doctor, change or cancel"]
+  D -->|"No"| F{"Stock enough?"}
+  F -->|"No"| G["Partial dispense or substitute or refer outside"]
+  F -->|"Yes"| H["Select batch, earliest expiry first"]
+  G --> H
+  H --> I["Dispense, label, counsel"]
+  I --> J["Stock reduces, status dispensed"]
+```
+
+**States:** `pending → dispensed` (or `cancelled`). Partial dispense and `partially_dispensed` **[NEW]**.
+**Rules:** one database transaction per dispense (all lines or none) [V1]; error shows which medicine is short [V1]; stock movement written per line with prescription reference [V1]; batch and expiry selected by earliest expiry **[NEW]**; controlled drugs need second signature **[NEW]**.
+**OTC sale:** PHA selects items, system prices them, bill is created and paid at pharmacy counter (or sent to cashier), stock reduces.
+**Returns:** patient return only for unopened, in-date items and per policy; returns to store for expired and damaged, with approval.
+**Exceptions:** wrong drug dispensed, so incident report, reverse dispense, correct, doctor informed; prescription cancelled by doctor before dispense, so pharmacy queue removes it with notice.
+**Audit events:** `pharmacy.dispense`, `.otc.sell`, `.return`, `.stock.adjust`, `.controlled.dispense`.
+
+---
+
+### W9. Inpatient: admission to discharge [NEW]
+
+```mermaid
+flowchart TD
+  A["Doctor: admission order"] --> B["Reception: admission form"]
+  B --> C["Cashier: deposit"]
+  C --> D["Ward nurse: bed allocation, admission vitals"]
+  D --> E["Daily care: rounds, orders, medication chart, vitals, nursing notes"]
+  E --> F{"Ready for discharge?"}
+  F -->|"No"| E
+  F -->|"Yes"| G["Doctor: discharge summary"]
+  G --> H["Cashier: final bill, balance, clearance"]
+  H --> I["Ward: bed to cleaning then vacant"]
+```
+
+**Admission states:** `ordered → admitted → (transferred) → discharge_ordered → cleared → discharged`; alternatives: `referred`, `absconded`, `died`, `against_advice`.
+**Bed states:** `vacant → reserved → occupied → cleaning → vacant`, plus `out_of_service`.
+**Steps**
+1. DOC creates admission order with diagnosis, ward type, expected stay.
+2. REC completes paperwork (consent, guardian). CSH takes the deposit (policy can allow admission first in emergencies).
+3. WRD assigns bed; bed tariff starts accruing per day.
+4. Daily: DOC rounds (SOAP note) and orders; WRD records vitals and gives medication per chart; lab, imaging and pharmacy process inpatient orders; every order adds to the running bill.
+5. DOC writes discharge summary (diagnosis, treatment, medicines to take home, follow-up) → discharge order.
+6. CSH produces final bill, applies deposit, collects balance or arranges credit; issues clearance.
+7. WRD completes discharge checklist, patient leaves; bed set to cleaning; housekeeping marks vacant.
+**Rules:** a bed cannot be assigned to two patients; transfers keep one continuous admission and charge per day per bed type; discharge needs clearance unless manager overrides with reason; death or absconding has its own form and notifications.
+**Exceptions:** patient cannot pay, so manager approves credit or waiver; wrong bed, so transfer with reason; drug allergy event, so incident report.
+**Audit events:** `ipd.admission.create`, `.bed.assign`, `.bed.transfer`, `.round.write`, `.mar.give`, `.discharge.create`, `.discharge.clear`.
+
+---
+
+### W10. Emergency / casualty [NEW]
+
+**Trigger:** patient arrives in critical condition.
+**Steps:** NUR (or any clinical staff) registers as "Unknown" or with minimum data → triage colour assigned → DOC treats immediately → orders raised with status "emergency" (payment gate bypassed) → stabilised: continue to OPD, admission, referral or discharge → REC later completes the full record; if unknown, merge to real record (ADM) → CSH raises the bill after treatment; unpaid emergency bills go to the credit or waiver process.
+**Rules:** never block life-saving treatment for payment; every bypass is flagged and listed in the daily exception report; unknown records are marked until resolved.
+**Audit events:** `emergency.register`, `payment.gate.bypass`, `patient.merge`.
+
+---
+
+### W11. Store: requisition, issue, procurement, payment [NEW]
+
+**11a. Department requisition**
+
+```mermaid
+stateDiagram-v2
+  [*] --> requested
+  requested --> approved: department head
+  requested --> rejected: with reason
+  approved --> issued: store keeper issues
+  issued --> received: department confirms
+  issued --> partially_received: shortage noted
+```
+
+**Steps:** department raises requisition (items, quantity, urgency) → approver confirms → STO issues from main store (earliest expiry first) → department confirms receipt → both stores' stock updates; shortages create backorder.
+
+**11b. Purchase to payment**
+
+```mermaid
+flowchart TD
+  A["Purchase request"] --> B["Store keeper: purchase order"]
+  B --> C{"Value above limit?"}
+  C -->|"Yes"| D["Accountant then Manager approve"]
+  C -->|"No"| E["Accountant approves"]
+  D --> F["Send to supplier"]
+  E --> F
+  F --> G["Goods arrive: GRN with batch, expiry, quantity"]
+  G --> H["Supplier invoice entered in Finance"]
+  H --> I{"PO, GRN, invoice match?"}
+  I -->|"Yes"| J["Payment voucher"]
+  I -->|"No"| K["Query supplier or credit note"]
+  K --> H
+  J --> L["Pay and post to cash or bank book"]
+```
+
+**Rules:** raiser of PO cannot receive it; received quantity above ordered needs approval; items without expiry date are rejected for drugs and reagents; GRN creates stock and a payable accrual; supplier price changes are recorded per GRN.
+**Exceptions:** short or damaged delivery, so GRN records actual, debit note raised; wrong item, so return to supplier note.
+**Audit events:** `store.po.create`, `.po.approve`, `.grn.create`, `.requisition.approve`, `.issue.create`, `.transfer.create`.
+
+---
+
+### W12. Stock count and expiry control [NEW]
+
+**Steps:** STO schedules count and freezes movements for the store (or counts with movements allowed using a cut-off time) → counters record physical quantity per batch (blind count: system quantity hidden) → system shows variance → recount for large variances → ACC approves adjustments, MGR above limit → adjustments posted with reason → AUD may observe.
+**Expiry:** daily job lists batches expiring in 90/60/30 days and expired; expired batches are blocked from issue and dispensing; write-off needs approval and a disposal record.
+**Audit events:** `store.count.start`, `.count.submit`, `.adjust.approve`, `.expiry.writeoff`.
+
+---
+
+### W13. Finance: daily and month-end close [NEW]
+
+**Daily**
+1. CSH closes shifts; ACC reviews variance.
+2. Bank deposit matched to total cash receipts.
+3. Pending approvals cleared.
+4. Day's revenue by department produced.
+
+**Month-end**
+1. All shifts closed and reconciled.
+2. Stock count approved; consumption posted.
+3. Supplier invoices and GRNs matched; accruals set.
+4. Payroll approved and posted.
+5. Bank reconciliation done.
+6. Trial balance reviewed; adjustments journaled with reasons.
+7. Period closed (locked); statements issued to MGR and AUD.
+
+**Rules:** closed periods cannot receive postings; corrections in a closed period go to the next open period with reference.
+**Audit events:** `finance.journal.post`, `.journal.reverse`, `.period.close`, `.bank.reconcile`.
+
+---
+
+### W14. HR: onboarding, leave, payroll, offboarding [NEW]
+
+**14a. Staff onboarding to working login** (user creation)
+
+```mermaid
+flowchart TD
+  A["HR: create staff record, contract, documents"] --> B["HR: request user account"]
+  B --> C["Admin: create user linked to staff, assign role and department"]
+  C --> D["System: invite link by email or SMS"]
+  D --> E["Staff: set password, accept policy"]
+  E --> F["Account active, first login logged"]
+```
+
+**14b. Leave**
+`draft → submitted → supervisor_approved → hr_approved` (or `rejected`, `cancelled`). Balance checked on submit; approved leave blocks roster and appointment schedules for doctors; return-to-work closes the record.
+
+**14c. Payroll (monthly)**
+`draft → verified (HR) → approved (ACC) → approved (MGR) → posted → paid`. Inputs: attendance, overtime, leave, loans, allowances, tax and pension. Payslips are published only after posting. Any change after approval needs the whole chain again.
+
+**14d. Offboarding**
+HR records exit date and reason → clearance checklist (asset return, store and cash clearance) → final pay → Admin deactivates user on exit date (automatic) → sessions end → history kept.
+
+**Audit events:** `hr.staff.create`, `.contract.update`, `.leave.approve`, `.payroll.approve`, `.payslip.view`, `admin.user.create`, `.user.deactivate`.
+
+---
+
+### W15. User, role and access management [V1+]
+
+| Request | Flow |
+|---|---|
+| New user | HR record → Admin creates user (W14a) |
+| Change role | Supervisor request → Admin changes role → system records old and new set → notifies the user and the Auditor's dashboard |
+| Temporary access | Admin adds role with end date; access expires automatically |
+| Forgotten password | User requests reset link; or Admin resets and forces change at next login |
+| Lockout | 5 failed attempts lock the account for 15 minutes; Admin may unlock |
+| Deactivate | Admin sets inactive; user cannot sign in, history stays |
+| Break-glass | Clinician opens a patient with no visit, enters reason, system logs and flags for review within 24 hours |
+
+**Rules:** the system keeps at least one active admin; admins cannot change their own role or status [V1]; permission overrides for a single user are rare, time-limited and listed in the weekly access report.
+
+---
+
+### W16. Audit review [NEW]
+
+**Daily:** AUD or MGR opens the exception report: voids and refunds, discounts above limit, payment-gate bypasses, break-glass access, stock write-offs, reopened visits, results amended, after-hours logins.
+**Weekly:** access report (role changes, new accounts, inactive accounts); chain integrity check result.
+**On demand:** "trace a patient" (every action on one patient), "trace a user" (every action by one user), "trace a document" (receipt, GRN, invoice history).
+**Rules:** reviewing the audit log is itself logged; findings are recorded with owner and due date.
+
+---
+
+## Part D. Statuses by entity (quick reference)
+
+| Entity | Statuses |
+|---|---|
+| Appointment | scheduled, checked_in, in_consultation, completed, cancelled, no_show |
+| Visit | open, closed |
+| Order (generic) | ordered, paid, in_progress, completed, cancelled |
+| Lab order | ordered, collected, rejected, resulted, verified, released, amended, cancelled |
+| Imaging order | ordered, scheduled, performed, reported_draft, reported_final, cancelled |
+| Prescription | pending, partially_dispensed, dispensed, cancelled |
+| Invoice | unpaid, partial, paid, void |
+| Payment request (discount, refund) | pending, approved, rejected |
+| Cashier shift | open, closed, reconciled |
+| Requisition | requested, approved, rejected, issued, partially_received, received |
+| Purchase order | draft, pending_approval, approved, sent, partially_received, received, closed, cancelled |
+| Admission | ordered, admitted, discharge_ordered, cleared, discharged, referred, died, against_advice, absconded |
+| Bed | vacant, reserved, occupied, cleaning, out_of_service |
+| Leave | draft, submitted, supervisor_approved, hr_approved, rejected, cancelled |
+| Payroll run | draft, verified, approved, posted, paid |
+| User | invited, active, locked, inactive |
+| Period | open, closing, closed |
+
+---
+
+## Part E. Notification matrix
+
+| Event | Who is told | Channel |
+|---|---|---|
+| Appointment booked / changed | Patient | SMS |
+| Appointment tomorrow | Patient | SMS |
+| Patient ready for doctor | Doctor | In-app |
+| Emergency triage | Duty doctor, charge nurse | In-app + sound |
+| Order paid | Lab, Imaging, Pharmacy | In-app |
+| Result released | Ordering doctor | In-app |
+| Critical result | Ordering doctor | In-app + phone call logged |
+| Prescription waiting over target | Pharmacist | In-app |
+| Medication due or overdue | Ward nurse | In-app |
+| Low stock, near expiry | Store keeper, Pharmacist, Lab | In-app + daily email |
+| Approval requested | Approver | In-app + email |
+| Request approved or rejected | Requester | In-app |
+| Cash variance | Accountant | In-app |
+| Licence or contract expiring | HR officer, staff member | In-app + email |
+| New account invite | Staff member | Email or SMS |
+| Role changed / failed-login spike | Admin, Auditor | In-app + email |
+| Audit chain break | Admin, Auditor, Manager | Email, high priority |
+
+---
+
+## Part F. Handoff matrix (who passes work to whom)
+
+| From \ To | REC | CSH | NUR | DOC | WRD | LAB | IMG | PHA | STO | ACC | HRO | MGR |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| REC | | fee | ticket | | admission papers | | | | | | | |
+| CSH | | | | | clearance | paid | paid | paid | | shift report | | |
+| NUR | | procedure charges | | ready | | sample | | | | | | |
+| DOC | follow-up | orders | | | admission | order | order | Rx | | | | reopen request |
+| WRD | | deposit, discharge | | alerts | | | | ward requests | ward requests | | | |
+| LAB | | | | results | | | | | reagent request | | | |
+| IMG | | | | reports | | | | | consumables | | | |
+| PHA | | | | stock-out info | drugs | | | | requisition | | | |
+| STO | | | | | | stock | stock | stock | | GRN | | PO approval |
+| ACC | | approvals | | | | | | | PO approval | | payroll posting | reports |
+| HRO | | | | | roster | | | | | payroll | | payroll, leave |
+
+---
+
+## Part G. Exception playbook
+
+| Situation | What to do in the system | Who |
+|---|---|---|
+| Patient registered twice | Request merge with both MRNs and reason | REC → ADM |
+| Wrong patient chosen on an order | Cancel order with reason, re-order on right patient; if paid, refund request | DOC, CSH |
+| Payment on wrong bill | Reversal with approval, re-take payment | CSH, ACC |
+| Cash shortage at shift close | Record variance with reason; ACC reviews; repeated cases escalate to MGR | CSH, ACC |
+| Result entered on wrong patient | Amend with reason; notify doctor; incident report | LAB |
+| Expired drug found on shelf | Block batch, write-off with approval, review FEFO use | PHA, STO |
+| Dispensed wrong drug | Reverse and correct dispense; incident; doctor and patient informed | PHA |
+| Stock count variance | Recount; approve adjustment with reason; investigate | STO, ACC |
+| System or internet down | Use paper forms; enter within one working day with paper reference; cashier uses numbered receipt book | All |
+| Staff forgot password / locked out | Self-service reset, or Admin reset | ADM |
+| Staff leaves suddenly | HR enters exit date today; Admin deactivates immediately | HRO, ADM |
+| Suspected misuse of records | AUD runs user and patient trace; MGR decides action | AUD, MGR |
+| Patient cannot pay for emergency care | Treat first, flag bypass, process credit or waiver afterwards | CSH, MGR |
+
+---
+
+## Part H. Screen inventory by role (menu order)
+
+| Role | Menu |
+|---|---|
+| REC | Dashboard, Patients, Appointments, Queue, Bed board |
+| CSH | Dashboard, Shift, Bills and payments, Receipts, Deposits, Requests |
+| NUR | Dashboard, Triage queue, OPD nursing, Patients |
+| DOC | Dashboard, My patients, Results inbox, Inpatients, Appointments, Letters |
+| WRD | Dashboard, Bed board, My patients, Medication chart, Handover, Ward requests |
+| LAB | Dashboard, Worklist, Verify, Catalogue, Lab stock, QC, Reports |
+| IMG | Dashboard, Worklist, Reporting, Catalogue, Imaging stock |
+| PHA | Dashboard, Prescriptions, OTC, Returns, Dispensary stock, Requisitions, Controlled register |
+| STO | Dashboard, Items, Stock, Requisitions, Purchasing, Receiving, Transfers, Counts, Expiry |
+| ACC | Dashboard, Approvals, Cash and bank, Receivables, Payables, Expenses, Journals, Budgets, Reports |
+| HRO | Dashboard, Staff, Attendance, Roster, Leave, Payroll, Recruitment, Reports |
+| ADM | Dashboard, Users, Roles, Master data, Settings, Backups, System health |
+| MGR | Dashboard, Approvals, Reports, Quality |
+| AUD | Dashboard, Audit log, Exceptions, Trace, Reports |
+
+---
+
+## Part I. Build order for these workflows
+
+| Step | Build | Why first |
+|---|---|---|
+| 1 | Roles and permissions tables, permission middleware, audit log | Everything else depends on them |
+| 2 | Cashier shifts, receipts, payment gate, approvals (discount, refund) | Money control |
+| 3 | Triage and queue, appointments schedules and reminders | Daily front-office flow |
+| 4 | Lab verify/release states, imaging module | Complete OPD |
+| 5 | Store: items, batches, GRN, requisitions; pharmacy batch dispensing | Stock integrity |
+| 6 | Inpatient: wards, beds, rounds, medication chart, discharge | Biggest clinical addition |
+| 7 | Finance ledger, receivables, payables, bank | Needs steps 2 and 5 |
+| 8 | HR and payroll, user creation from staff | Needs roles and finance |
+| 9 | Reports library, notifications, templates | Needs data from all above |

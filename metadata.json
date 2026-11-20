@@ -1,0 +1,6 @@
+{
+  "name": "Clinic360",
+  "description": "Role-based Clinic Management System with patient records, queue triage, OPD consultation, lab & imaging orders, pharmacy dispensing, appointment scheduling, secure billing, and tamper-evident audit logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

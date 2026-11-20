@@ -1,0 +1,755 @@
+# Clinic Management System: Modules, Roles and Access Specification
+
+Stack: Node.js + Express, MySQL, React + Ant Design.
+Status key used throughout: **[V1]** already built in the delivered code, **[V1+]** partly built, **[NEW]** to be built.
+
+---
+
+## 1. Purpose and scope
+
+A single web system that follows a patient from the front desk to discharge and keeps the money, stock, staff and audit trail behind it. Everything is role-based: a user only sees the screens and actions their role allows, and every sensitive action is written to the audit log.
+
+### 1.1 Patient journey (who touches the patient, in order)
+
+| Step | Where | Role | System action |
+|---|---|---|---|
+| 1 | Reception / Cashier | Receptionist, Cashier | Register or find patient, pay card or consultation fee, get queue number |
+| 2 | Triage | Nurse | Record vitals, chief complaint, triage priority |
+| 3 | OPD room | Doctor | Consultation, diagnosis, orders (lab, imaging, drugs, procedures) |
+| 4 | Cashier | Cashier | Pay for ordered services (or credit/insurance approval) |
+| 5 | Laboratory / Imaging | Lab tech, Imaging tech | Collect sample or perform scan, enter result or report |
+| 6 | Doctor | Doctor | Review results, finalise treatment |
+| 7 | Pharmacy | Pharmacist | Dispense paid prescription, stock reduces |
+| 8 | Ward (if admitted) | Doctor, Ward nurse | Admission, bed, rounds, medication chart, discharge |
+| 9 | Finance | Accountant | Daily cash reconciliation, receivables, expenses, reports |
+
+---
+
+## 2. Roles
+
+| Code | Role | Main job in the system |
+|---|---|---|
+| ADM | System administrator | Users, roles, settings, master data, backups. No clinical or financial entry by default |
+| MGR | Medical director / Manager | Read all dashboards and reports, approve high-value actions |
+| REC | Receptionist / Registration clerk | Patient registration, appointments, queue |
+| CSH | Cashier | Collect payments, issue receipts, refunds (with approval), shift closing |
+| NUR | Triage / OPD nurse | Vitals, triage, OPD nursing notes, injections and dressings |
+| DOC | Doctor | Consultation, orders, prescriptions, admission, discharge |
+| WRD | Ward nurse | Inpatient nursing care, medication administration, bed management |
+| LAB | Laboratory technician | Sample handling, test results, lab stock requests |
+| IMG | Imaging technician / Radiologist | X-ray, ultrasound and other scans, image reports |
+| PHA | Pharmacist | Dispense, drug stock in dispensary, drug returns |
+| STO | Store keeper | Main store, receiving, issuing, stock counts, purchase requests |
+| ACC | Accountant / Finance officer | Ledgers, expenses, receivables, payables, financial reports |
+| HRO | HR officer | Staff records, attendance, leave, payroll, contracts |
+| AUD | Auditor | Read-only access to finance, stock and the audit log |
+
+A user can hold more than one role (for example, a small clinic where one person is both cashier and receptionist). Permissions are the union of all assigned roles.
+
+---
+
+## 3. Master access summary
+
+Legend: **F** full (create, read, update, approve where applicable), **R** read only, **L** limited (own records or own department only, see module section), **–** no access.
+
+| Module | ADM | MGR | REC | CSH | NUR | DOC | WRD | LAB | IMG | PHA | STO | ACC | HRO | AUD |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1. Registration and queue | L | R | F | L | R | R | R | – | – | – | – | – | – | R |
+| 2. Cashier | – | R | – | F | – | – | – | – | – | – | – | R | – | R |
+| 3. Triage and vitals | – | R | – | – | F | F | F | – | – | – | – | – | – | R |
+| 4. OPD consultation | – | R | – | – | L | F | – | R | R | R | – | – | – | R |
+| 5. Laboratory | – | R | – | – | R | L | – | F | – | – | – | – | – | R |
+| 6. Imaging | – | R | – | – | R | L | – | – | F | – | – | – | – | R |
+| 7. Pharmacy and dispensing | – | R | – | – | – | L | L | – | – | F | – | – | – | R |
+| 8. Store management | – | R | – | – | – | – | L | L | L | L | F | R | – | R |
+| 9. Inpatient (IPD) | – | R | L | L | – | F | F | R | R | L | – | R | – | R |
+| 10. Appointments | – | R | F | – | R | L | – | – | – | – | – | – | – | R |
+| 11. Finance and accounting | – | R | – | L | – | – | – | – | – | – | – | F | – | R |
+| 12. Human resources | L | R | – | – | – | – | – | – | – | – | – | R | F | R |
+| 13. Administration | F | R | – | – | – | – | – | – | – | – | – | – | – | R |
+| 14. Reports and analytics | L | F | L | L | L | L | L | L | L | L | L | F | L | F |
+| 15. Audit log | R | R | – | – | – | – | – | – | – | – | – | – | – | F |
+
+Admin is deliberately kept out of patient clinical data and money. Administration of the system and handling of patients are separate duties.
+
+---
+
+## 4. Modules
+
+### 4.1 Registration and queue [V1+]
+
+**Purpose:** create the patient record once and give every visit a queue position.
+
+**Functions**
+- Register patient: name, sex, date of birth (or estimated age), phone, address, next of kin, blood group, allergies, photo (optional), national ID or insurance number (optional).
+- Auto-generated medical record number (MRN) with clinic prefix. [V1]
+- Duplicate check on name + date of birth + phone before saving. [NEW]
+- Search by name, MRN, phone. [V1]
+- Patient types: self-pay, credit (company or NGO), insurance, exempt (staff, free care). [NEW]
+- Registration card fee and re-issue of lost card. [NEW]
+- Merge two duplicate records (admin approval, logged). [NEW]
+- Queue: ticket number per department (OPD, lab, imaging, pharmacy, cashier), call next, skip, recall, display screen. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| REC | Create, read, update patients. Issue queue tickets |
+| CSH | Read demographic fields only, to match payments |
+| NUR, DOC, WRD | Read; update clinical fields (allergies, blood group) |
+| ADM | Merge duplicates, correct wrong MRN (always audited) |
+| MGR, AUD | Read |
+
+**Permissions:** `patient.create`, `patient.read`, `patient.update`, `patient.merge`, `queue.manage`, `queue.call`.
+
+---
+
+### 4.2 Cashier [V1+]
+
+**Purpose:** every shilling or birr that comes in passes through here, linked to a patient, a service and a cashier shift.
+
+**Functions**
+- Service price list lookup (consultation, card, procedures, lab, imaging, bed days). [V1]
+- Create bill / invoice for a patient: manual lines or pulled from doctor's orders. [V1]
+- Receive payment: cash, card, mobile money, bank transfer, part payment. [V1]
+- Receipt printing with sequential receipt numbers. [V1+]
+- Prepayment / deposit for inpatients and advance wallet. [NEW]
+- Credit and insurance billing: mark bill as "to be invoiced" to a named payer. [NEW]
+- Discounts and waivers: cashier requests, manager or finance approves with reason. [NEW]
+- Refunds and voids: reason required, approval required, original receipt linked. [V1 void only]
+- Cash shift: open shift with float, close shift with counted cash, system shows variance. [NEW]
+- Daily cashier summary by payment method. [NEW]
+- Payment gate: lab, imaging and pharmacy orders show "paid / unpaid" so staff do not release services for unpaid bills (configurable per clinic and per payer type). [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| CSH | Create bills and payments, print receipts, see own shift only |
+| CSH | Cannot delete payments. Void or refund creates a request for approval |
+| ACC | Read all payments, approve refunds and waivers, reconcile shifts |
+| MGR | Approve discounts above limit, read everything |
+| REC | May view bill status (paid/unpaid) but not take money unless also given CSH |
+| AUD | Read |
+
+**Rules**
+- A receipt can never be edited. Corrections are reversals plus a new receipt.
+- A cashier cannot approve their own discount or refund.
+- Shift cannot be closed with an open unpaid-draft bill older than the configured limit.
+
+**Permissions:** `billing.invoice.create`, `billing.payment.create`, `billing.receipt.print`, `billing.invoice.void.request`, `billing.refund.approve`, `billing.discount.approve`, `billing.shift.open`, `billing.shift.close`, `billing.report.own`.
+
+---
+
+### 4.3 Triage and vitals [V1+]
+
+**Purpose:** capture measurements and priority before the doctor sees the patient.
+
+**Functions**
+- Vitals: blood pressure, temperature, pulse, respiratory rate, SpO₂, weight, height, BMI (auto), MUAC for children, blood glucose (optional). [V1]
+- Chief complaint and triage category (emergency, urgent, routine). [V1+]
+- Early-warning score and out-of-range highlighting (for example SpO₂ below 92). [NEW]
+- Pregnancy status and last menstrual period for women of reproductive age. [NEW]
+- Growth chart data for under-5s. [NEW]
+- Reorder queue by triage priority. [NEW]
+- Nursing procedures from OPD: injection, dressing, nebulisation, observation, charged to the bill. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| NUR | Create and edit vitals for open visits (edit window configurable, for example 24 hours) |
+| DOC | Read; may add or correct vitals during consultation (logged) |
+| WRD | Create vitals for inpatients |
+| MGR, AUD | Read |
+
+**Permissions:** `vitals.create`, `vitals.read`, `vitals.update`, `triage.set`, `nursing.procedure.create`.
+
+---
+
+### 4.4 OPD, outpatient consultation [V1]
+
+**Purpose:** the doctor's workspace for one visit.
+
+**Functions**
+- Visit created from appointment, queue or walk-in. [V1]
+- History, examination, diagnosis (free text now, ICD-10 coded later), plan, follow-up date. [V1, ICD-10 NEW]
+- Orders: lab tests, imaging, prescriptions, procedures, referral, admission. [V1 lab and prescriptions]
+- Previous visits, lab results, allergies and active medications visible in the visit screen. [V1+]
+- Prescription templates and drug interaction / allergy warning. [NEW]
+- Sick leave note, medical certificate, referral letter, with clinic letterhead and print. [NEW]
+- Close visit: needs diagnosis; closed visits are locked. Reopen needs a reason (doctor in charge or manager). [V1, reopen NEW]
+- Follow-up and recall list. [NEW]
+- Doctor's own patient list and day summary. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| DOC | Full on own consultations; read all patient history; cannot edit another doctor's closed notes |
+| NUR | Vitals and nursing notes only |
+| LAB, IMG, PHA | Read only the orders addressed to them and the minimum patient details |
+| MGR | Read |
+| AUD | Read; every read of a full record is logged |
+
+**Permissions:** `visit.create`, `visit.read`, `visit.update`, `visit.close`, `visit.reopen`, `order.lab.create`, `order.imaging.create`, `prescription.create`, `referral.create`, `certificate.create`, `diagnosis.create`.
+
+**Break-glass:** a doctor opening a patient they have no visit with must enter a reason. The access is flagged in the audit log.
+
+---
+
+### 4.5 Laboratory [V1+]
+
+**Purpose:** from order to verified result.
+
+**Functions**
+- Test catalogue with price, sample type, unit, reference ranges (by age and sex), turnaround time. [V1 basic]
+- Lab worklist: ordered, paid, collected, in progress, resulted, verified. [V1+]
+- Sample collection with barcode or sample ID label. [NEW]
+- Result entry per test, panel templates (CBC, urinalysis, LFT, RFT), automatic abnormal flags. [V1 single result]
+- Two-step: entered by technician, verified by senior technician before release. [NEW]
+- Rejection of poor samples with reason and recollect request. [NEW]
+- Critical value alert to doctor. [NEW]
+- Result print and result history trend per patient. [NEW]
+- Reagent and consumable use per test, linked to lab sub-store. [NEW]
+- Referral to outside lab with tracking. [NEW]
+- Instrument interface (HL7 or CSV import), optional. [NEW]
+- Internal quality control log. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| LAB | Process orders, enter results, manage test catalogue (catalogue changes limited to a lead technician) |
+| DOC | Order tests, read results of own patients |
+| NUR | Read results; collect samples if permitted |
+| MGR, AUD | Read |
+| CSH | See only order and paid status, not results |
+
+**Permissions:** `lab.order.create`, `lab.sample.collect`, `lab.result.enter`, `lab.result.verify`, `lab.result.amend`, `lab.catalog.manage`, `lab.qc.log`.
+
+**Rules:** a released result can only be amended with a reason; the old value is kept in the audit log.
+
+---
+
+### 4.6 Imaging / Radiology [NEW]
+
+**Purpose:** X-ray, ultrasound, ECG and other diagnostic imaging.
+
+**Functions**
+- Imaging catalogue: modality (X-ray, ultrasound, CT, ECG, echo), body region, price, preparation instructions.
+- Imaging worklist: ordered, paid, scheduled, performed, reported.
+- Technician records exam details: views, contrast, dose or exposure where relevant, repeat reason.
+- Attach images (JPEG, PNG, PDF) or link PACS study; image viewer in browser.
+- Radiologist or reporting doctor writes report with template (findings, impression), status draft then final.
+- Urgent flag and result notification to ordering doctor.
+- Print report with clinic header.
+- Consumables (film, gel, contrast) deducted from imaging sub-store.
+- Pregnancy check prompt before X-ray for women of reproductive age.
+
+**Access**
+
+| Role | Access |
+|---|---|
+| IMG | Perform exams, upload images, write and finalise reports (if reporting rights are granted) |
+| DOC | Order, read reports and images for own patients |
+| NUR, WRD | Read reports for inpatients |
+| MGR, AUD | Read |
+
+**Permissions:** `imaging.order.create`, `imaging.exam.perform`, `imaging.image.upload`, `imaging.report.write`, `imaging.report.finalise`, `imaging.catalog.manage`.
+
+---
+
+### 4.7 Pharmacy and dispensing [V1]
+
+**Purpose:** safe dispensing of paid prescriptions and over-the-counter sales.
+
+**Functions**
+- Prescription queue from OPD and IPD. [V1]
+- Allergy check against patient record before dispensing. [V1 shows allergy; auto-block NEW]
+- Dispense full or partial, with batch and expiry selected by FEFO (first expired, first out). [V1 full only, batch NEW]
+- Substitution with generic equivalent (pharmacist note). [NEW]
+- Dispensing label and patient counselling notes. [NEW]
+- OTC (walk-in) sale without prescription, billed at the pharmacy counter. [NEW]
+- Returns from patient (policy limited) and returns to store (expired, damaged). [NEW]
+- Dispensary stock levels, reorder alerts, requisition from main store. [V1 stock and alerts; requisition NEW]
+- Controlled drugs register with double signature. [NEW]
+- Drug formulary with generic name, strength, form, price, reorder level. [V1]
+- Daily dispensing and consumption report. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| PHA | Dispense, adjust dispensary stock with reason, manage formulary prices (price changes approved by finance) |
+| DOC | Prescribe; see stock availability |
+| WRD | Request drugs for ward stock, record medication administration |
+| STO | Issue stock to dispensary |
+| MGR, AUD | Read |
+
+**Permissions:** `pharmacy.prescription.read`, `pharmacy.dispense`, `pharmacy.otc.sell`, `pharmacy.return.create`, `pharmacy.stock.adjust`, `pharmacy.formulary.manage`, `pharmacy.controlled.dispense`.
+
+**Rules:** stock never goes below zero; dispensing is one database transaction (all items or none); every adjustment needs a reason.
+
+---
+
+### 4.8 Store management [NEW]
+
+**Purpose:** control everything the clinic holds: drugs, lab reagents, consumables, stationery, equipment.
+
+**Functions**
+- Item master: code, name, category (drug, lab, imaging, general, equipment), unit, pack size, reorder level, storage condition.
+- Multiple stores: main store, pharmacy, lab, imaging, wards, theatre. Stock is tracked per store and per batch with expiry date.
+- Suppliers: contact details, payment terms, price history.
+- Purchase request, then purchase order, then approval, then goods received note (GRN) with batch, expiry, quantity, cost.
+- Three-way match: PO, GRN and supplier invoice before finance pays. [links to Finance]
+- Requisition from a department to the main store, approval, issue note, receipt confirmation.
+- Stock transfers between stores.
+- Stock adjustments: damage, expiry write-off, loss, with approval above a limit.
+- Periodic and spot stock count with variance report.
+- Expiry dashboard: expired, expiring within 30, 60, 90 days.
+- Reorder suggestions from consumption.
+- Stock card per item: every movement, who, when, reference document.
+- Fixed assets register (optional): item, serial number, location, custodian, maintenance schedule.
+
+**Access**
+
+| Role | Access |
+|---|---|
+| STO | Receive, issue, transfer, count, raise purchase requests |
+| PHA, LAB, IMG, WRD | Request from main store; manage and count their own sub-store |
+| ACC | Read stock value, approve purchase orders and write-offs (with manager above a limit) |
+| MGR | Approve purchase orders above limit |
+| AUD | Read, observe stock counts |
+
+**Permissions:** `store.item.manage`, `store.supplier.manage`, `store.po.create`, `store.po.approve`, `store.grn.create`, `store.requisition.create`, `store.requisition.approve`, `store.issue.create`, `store.transfer.create`, `store.adjust.approve`, `store.count.perform`.
+
+**Rules:** the person who raises a purchase order cannot receive it; the person who counts cannot approve the adjustment.
+
+---
+
+### 4.9 Finance and accounting [NEW]
+
+**Purpose:** turn daily activity into books that can be audited.
+
+**Functions**
+- Chart of accounts, cost centres (OPD, IPD, lab, imaging, pharmacy, admin), financial periods with closing.
+- Automatic postings: patient payments, supplier invoices, stock movements, payroll.
+- Cash book and bank book, bank reconciliation.
+- Daily revenue reconciliation: cashier shifts vs bank deposits.
+- Receivables: credit patients, companies, NGOs, insurers; invoicing, statements, ageing, receipts against invoices, write-off with approval.
+- Payables: supplier invoices linked to GRN and PO, payment vouchers, ageing.
+- Expenses: petty cash, utilities, repairs, with attachments and approvals.
+- Budget per cost centre and variance report.
+- Insurance claims batch: select visits, generate claim, track approved and rejected amounts. [optional]
+- Financial statements: income statement, balance sheet, trial balance, cash flow.
+- Tax settings (VAT, withholding) if applicable.
+
+**Access**
+
+| Role | Access |
+|---|---|
+| ACC | Full |
+| CSH | Own shift and own receipts only |
+| MGR | Read all, approve payments and budgets above limit |
+| STO | Read supplier invoice status for own POs |
+| AUD | Read |
+| ADM | No access to postings; may configure accounts mapping only if also given ACC |
+
+**Permissions:** `finance.coa.manage`, `finance.journal.post`, `finance.period.close`, `finance.ar.invoice`, `finance.ar.receipt`, `finance.ap.invoice`, `finance.ap.pay`, `finance.expense.create`, `finance.expense.approve`, `finance.bank.reconcile`, `finance.report.view`.
+
+**Rules:** posted entries are never edited, only reversed; closed periods are locked.
+
+---
+
+### 4.10 Inpatient (IPD) [NEW]
+
+**Purpose:** admission, bed, daily care, charges and discharge.
+
+**Functions**
+- Wards, rooms, beds with status (vacant, occupied, cleaning, reserved, out of service) and bed tariff.
+- Admission order from doctor; admission form; deposit required before bed allocation (configurable).
+- Bed allocation, transfer between beds or wards, bed board view.
+- Admission notes, daily doctor rounds (SOAP), fluid and vital charts.
+- Nursing care plan, nursing notes, handover notes per shift.
+- Medication chart: ordered by doctor, given by nurse with time and initials (MAR).
+- Inpatient orders: lab, imaging, drugs, diet, procedures, all charged to the admission.
+- Ward drug requests to pharmacy, ward stock from store.
+- Running bill: bed days, services, drugs, with deposits and interim payments.
+- Discharge: summary (diagnosis, treatment, medicines, follow-up), final bill, clearance by cashier, bed released automatically.
+- Referral out, death notification, discharge against medical advice.
+- Delivery and newborn record, if maternity is enabled. [optional]
+- Theatre / procedure booking and operation note. [optional]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| DOC | Admit, round, order, discharge |
+| WRD | Nursing care, vitals, give medication, request items, bed management |
+| CSH | Deposits, interim payments, discharge clearance |
+| REC | Admission paperwork and bed board (read) |
+| PHA | Fill ward drug requests |
+| LAB, IMG | Process inpatient orders |
+| ACC, MGR, AUD | Read |
+
+**Permissions:** `ipd.admission.create`, `ipd.bed.assign`, `ipd.bed.transfer`, `ipd.round.write`, `ipd.nursing.write`, `ipd.mar.give`, `ipd.discharge.create`, `ipd.discharge.clear`, `ipd.ward.manage`.
+
+---
+
+### 4.11 Appointments [V1]
+
+**Purpose:** scheduled visits with no double booking.
+
+**Functions**
+- Doctor schedules (working days, hours, slot length, leave days). [NEW; V1 has overlap check only]
+- Book, reschedule, cancel, mark no-show. [V1]
+- Check-in from appointment into the OPD queue and visit. [V1]
+- SMS or email reminders and confirmation. [NEW]
+- Walk-in vs booked rules and overbooking limits. [NEW]
+- Follow-up appointments created from the visit. [NEW]
+- Calendar view per doctor and per clinic. [NEW]
+- Waiting-list for fully booked days. [NEW]
+- No-show report. [NEW]
+
+**Access**
+
+| Role | Access |
+|---|---|
+| REC | Full |
+| DOC | Own calendar, can block time and add follow-ups |
+| NUR | Read, check-in |
+| MGR, AUD | Read |
+
+**Permissions:** `appointment.create`, `appointment.update`, `appointment.cancel`, `appointment.checkin`, `schedule.manage`.
+
+---
+
+### 4.12 Human resources [NEW]
+
+**Purpose:** staff records through to payroll.
+
+**Functions**
+- Staff registration: personal data, ID, photo, contact, emergency contact, qualifications, professional licence number and expiry, department, job title, contract type and dates, bank account.
+- Document storage: contracts, certificates, licences, with expiry alerts.
+- Organisation structure: departments, positions, supervisors.
+- Recruitment (basic): vacancy, applicants, interview notes, offer, convert to staff.
+- Attendance: manual or fingerprint/device import, late and absent summary.
+- Shift roster: ward and OPD shifts, swap requests, on-call list.
+- Leave: types, balances, request, approval by supervisor, calendar.
+- Payroll: salary structure, allowances, overtime, deductions, tax, pension, loans and advances, payslip, payroll journal to Finance.
+- Performance appraisal and training records.
+- Disciplinary and exit records, clearance checklist.
+- Link staff record to a user account (user creation starts here).
+
+**Access**
+
+| Role | Access |
+|---|---|
+| HRO | Full on staff, attendance, leave, roster, payroll preparation |
+| ACC | Approve and post payroll, read payroll reports |
+| MGR | Approve leave of heads, approve payroll, read |
+| Any staff | Own profile, own payslip, own leave and attendance (self-service) |
+| Supervisors | Approve leave and view roster for their team |
+| ADM | Creates login for a staff record but cannot see salary |
+| AUD | Read |
+
+**Permissions:** `hr.staff.manage`, `hr.contract.manage`, `hr.attendance.manage`, `hr.leave.request`, `hr.leave.approve`, `hr.roster.manage`, `hr.payroll.prepare`, `hr.payroll.approve`, `hr.payslip.own`, `hr.salary.view`.
+
+**Rules:** salary fields are visible only to HRO, ACC, MGR and the staff member. They are hidden from all other roles, including ADM.
+
+---
+
+### 4.13 Administration [V1+]
+
+**Purpose:** set up and keep the system healthy.
+
+**Functions**
+- **Staff registration to user creation:** HR creates the staff record, admin creates the login from it, assigns roles and department, system sends a one-time password or invite link. [V1 users only]
+- User management: create, edit, deactivate (never delete), reset password, force password change, unlock account, end sessions.
+- Roles and permissions: view and edit permission sets, create custom roles, copy a role.
+- Password policy, session timeout, failed-login lockout, optional two-factor authentication.
+- Clinic profile: name, logo, address, letterhead for print, currency, time zone, number formats (MRN, invoice, receipt).
+- Master data: departments, wards and beds, price lists, service catalogue, insurers and payers, ICD-10 list, units, payment methods, document templates.
+- Branch / facility setup if the clinic has more than one site.
+- Notification settings (SMS and email gateways, templates).
+- Approval workflow settings: limits and approvers for discounts, refunds, write-offs, purchase orders.
+- Data tools: backup and restore, data import (patients, items, prices), data export.
+- System health: version, database status, scheduled jobs, error log.
+
+**Access**
+
+| Role | Access |
+|---|---|
+| ADM | Full on this module; no read of clinical notes or salaries |
+| MGR | Read; approve changes to price list and approval limits |
+| Others | Own profile and own password only |
+
+**Permissions:** `admin.user.create`, `admin.user.update`, `admin.user.deactivate`, `admin.user.reset`, `admin.role.manage`, `admin.settings.manage`, `admin.masterdata.manage`, `admin.backup.run`, `admin.import.run`.
+
+**Rules:** an admin cannot deactivate or demote their own account (built in [V1]); at least one active admin must always exist; every role or permission change is audited.
+
+---
+
+### 4.14 Reports and analytics [V1 dashboard only]
+
+All reports filter by date range, department, doctor and payer, and export to PDF, Excel and CSV. Access to each report follows the module permission, plus `report.view.<name>`.
+
+| Group | Reports | Main users |
+|---|---|---|
+| Clinical | OPD attendance by day, age, sex; top 10 diagnoses; admissions and discharges; bed occupancy and length of stay; referrals; mortality; maternal and child indicators; notifiable disease report | MGR, DOC |
+| Laboratory | Tests by type, turnaround time, abnormal rate, rejected samples, reagent consumption | LAB, MGR |
+| Imaging | Exams by modality, report turnaround, repeat rate | IMG, MGR |
+| Pharmacy | Dispensing by drug, top consumed drugs, stock-outs, expiry, controlled drugs register, prescriptions per doctor | PHA, MGR |
+| Store | Stock on hand and value, movement by item, GRN, issues by department, near-expiry, count variance, supplier performance | STO, ACC |
+| Cashier | Cashier shift report, collections by method, receipts list, voids and refunds, discounts and waivers | CSH, ACC |
+| Finance | Revenue by service and department, receivables ageing, payables ageing, cash and bank book, expenses vs budget, trial balance, income statement, balance sheet | ACC, MGR |
+| Insurance and credit | Claims submitted, approved, rejected, outstanding by payer | ACC |
+| Inpatient | Current inpatients, bed board, daily census, discharge summary list, running bills | WRD, DOC, ACC |
+| Appointments | Booked vs attended, no-show rate, waiting time | REC, MGR |
+| HR | Headcount, attendance, leave balances, license expiry, payroll summary, turnover | HRO, MGR |
+| Management dashboard | Today's visits, revenue, outstanding balance, low stock, pending lab and imaging, bed occupancy, top diagnoses, trend lines | MGR |
+| Admin and security | User list with roles, last login, inactive accounts, failed logins, role change history | ADM, AUD |
+
+---
+
+### 4.15 Audit log [NEW]
+
+**Purpose:** prove who did what, when, from where, and what changed.
+
+**What is logged**
+
+| Category | Events |
+|---|---|
+| Authentication | Login success and failure, logout, password change and reset, lockout, two-factor events |
+| Users and roles | User created, edited, deactivated, role or permission changed |
+| Patient data | Patient created, edited, merged; **record opened** (read access), break-glass access, print and export |
+| Clinical | Visit created, edited, closed, reopened; orders, results entered, amended, released; prescriptions |
+| Money | Invoice created, voided; payment, refund, discount, waiver; shift opened and closed; journal posted and reversed; period closed |
+| Stock | Item created, price changed, GRN, issue, transfer, adjustment, write-off, count approved |
+| HR | Staff edited, contract change, salary change, leave approval, payroll approved, payslip viewed |
+| System | Settings changed, backup and restore, data import and export, failed API authorisation |
+
+**Record structure**
+
+```
+audit_logs
+  id, occurred_at (UTC), user_id, user_name, role_at_time,
+  action            e.g. billing.payment.create
+  entity_type, entity_id
+  patient_id        (when relevant, for per-patient access reports)
+  before_json, after_json   (changed fields only)
+  reason            (required for void, refund, amend, reopen, break-glass)
+  ip_address, user_agent, session_id, branch_id
+  prev_hash, row_hash        (hash chain to detect tampering)
+```
+
+**Rules**
+- Append-only: the application database user has insert and select rights on this table, never update or delete.
+- Hash chain: each row stores a hash of the previous row, and a nightly job verifies the chain and alerts on a break.
+- Retention: keep at least the period your local health-records and tax rules require (commonly 7 to 10 years); archive older rows rather than deleting.
+- Sensitive values (passwords, tokens, full card numbers) are never written to the log.
+
+**Screens:** filter by user, action, entity, patient, date and IP; "who viewed this patient" panel; per-record history tab; export; saved alerts (for example, more than five failed logins, refund above limit, access outside working hours).
+
+**Access:** AUD full read and export; ADM and MGR read; nobody can edit or delete. Reading the audit log is itself logged.
+
+**Permissions:** `audit.read`, `audit.export`, `audit.alert.manage`.
+
+---
+
+## 5. Additional modules
+
+| # | Module | What it adds | Roles |
+|---|---|---|---|
+| 5.1 | Emergency / casualty | Fast registration of unknown patients, triage colour, treatment first and pay later, incident record | NUR, DOC, CSH |
+| 5.2 | Maternity and child health | ANC visits, delivery record, postnatal, family planning, immunisation schedule, growth monitoring | DOC, NUR, WRD |
+| 5.3 | Procedures and minor theatre | Procedure catalogue, consent, procedure note, consumables used, charges | DOC, NUR |
+| 5.4 | Referral management | Referral in and out, feedback tracking, ambulance request | DOC, REC |
+| 5.5 | Insurance and credit payers | Payer list, coverage rules, pre-authorisation, claim batches | CSH, ACC |
+| 5.6 | Notifications | SMS and email for reminders, results ready, low stock, licence expiry; in-app alerts | All |
+| 5.7 | Documents and printing | Templates for receipts, prescriptions, labels, certificates, discharge summary, reports, with clinic letterhead | ADM, DOC |
+| 5.8 | Patient attachments | Upload scanned outside reports, consent forms, photos | REC, DOC, NUR |
+| 5.9 | Patient portal (optional) | Patient sees appointments, results, invoices; books online | Patients |
+| 5.10 | Multi-branch | Branch-level data, stock, cash and reports, with head-office roll-up | ADM, MGR |
+| 5.11 | Mobile / tablet views | Ward round and triage on tablets, doctor on phone | NUR, DOC, WRD |
+| 5.12 | Integrations | Fingerprint attendance, lab analysers, PACS, SMS gateway, mobile money, national health information system (DHIS2 style export) | ADM |
+| 5.13 | Quality and safety | Incident reporting, infection control log, equipment maintenance, complaints | MGR |
+
+---
+
+## 6. Role-based access: how it works
+
+### 6.1 Layers
+
+1. **Authentication:** email and password (bcrypt), JWT access token with short life and refresh, optional two-factor for ADM, ACC, MGR.
+2. **Role to permission mapping:** a role is a named set of permissions such as `billing.payment.create`. The server checks the permission on every route. The menu and buttons in React hide what the user cannot use, but the server is the real gate.
+3. **Data scope:** a permission can be limited by scope: `own` (own records), `department`, `branch`, `all`. For example, a cashier sees `own` shift, an accountant sees `all`.
+4. **Field-level rules:** salary, clinical notes and results are hidden from roles that do not need them.
+5. **State rules:** closed visits, posted journals, released results and closed periods cannot be edited.
+6. **Approvals:** actions above a configured limit create a request that another role must approve.
+7. **Segregation of duties:** the same user cannot both create and approve the same discount, refund, purchase order, stock adjustment or payroll.
+
+### 6.2 Permission naming
+
+`module.resource.action`, for example `lab.result.verify`. Actions used: `read`, `create`, `update`, `delete` (rare, mostly void or deactivate), `approve`, `export`, `print`.
+
+### 6.3 Database tables
+
+```
+roles(id, code, name, description, system_role)
+permissions(id, code, module, description)
+role_permissions(role_id, permission_id, scope)       -- scope: own | department | branch | all
+users(id, staff_id, email, password_hash, active, must_change_password, last_login_at, two_factor_secret)
+user_roles(user_id, role_id, branch_id)
+user_permission_overrides(user_id, permission_id, allow, expires_at)   -- rare, audited
+```
+
+### 6.4 Approval limits (examples to configure)
+
+| Action | Initiator | Approver | Limit |
+|---|---|---|---|
+| Discount | CSH | ACC or MGR | Above 10% of bill |
+| Refund / void | CSH | ACC | Any |
+| Write-off of receivable | ACC | MGR | Any |
+| Stock adjustment or write-off | STO, PHA | ACC | Above set value |
+| Purchase order | STO | ACC, then MGR | Above set value |
+| Leave | Staff | Supervisor, then HRO | Per leave policy |
+| Payroll | HRO | ACC, then MGR | Each month |
+| Reopen closed visit | DOC | MGR | Any |
+
+---
+
+## 7. Detailed permission matrix by function
+
+Legend: **C** create, **R** read, **U** update, **A** approve, **P** print or export, blank = no access.
+
+| Function | REC | CSH | NUR | DOC | WRD | LAB | IMG | PHA | STO | ACC | HRO | MGR | AUD | ADM |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Register patient | CRUP | R | RU | RU | R | | | | | | | R | R | U (merge) |
+| Book appointment | CRUP | | R | RU | | | | | | | | R | R | |
+| Take payment | | CRP | | | | | | | | R | | R | R | |
+| Approve refund / discount | | | | | | | | | | A | | A | R | |
+| Record vitals | | | CRU | RU | CRU | | | | | | | R | R | |
+| Write consultation | | | R | CRU | R | R | R | R | | | | R | R | |
+| Order lab / imaging | | | | C | C | R | R | | | | | R | R | |
+| Enter lab result | | | | R | R | CRU | | | | | | R | R | |
+| Verify lab result | | | | | | A | | | | | | | R | |
+| Imaging report | | | | R | R | | CRUA | | | | | R | R | |
+| Prescribe | | | | C | C | | | R | | | | R | R | |
+| Dispense | | | | | | | | CRU | | | | R | R | |
+| Receive stock (GRN) | | | | | | | | | C | R | | R | R | |
+| Issue / transfer stock | | | | | | | | CU | CRU | R | | R | R | |
+| Approve purchase order | | | | | | | | | | A | | A | R | |
+| Admit / discharge | R | R | | CRUA | RU | | | | | R | | R | R | |
+| Give medication (MAR) | | | | R | CU | | | | | | | R | R | |
+| Post journal | | | | | | | | | | CRU | | R | R | |
+| Prepare payroll | | | | | | | | | | R | CRU | R | R | |
+| Approve payroll | | | | | | | | | | A | | A | R | |
+| Manage staff records | | | | | | | | | | | CRUP | R | R | |
+| Create user / assign role | | | | | | | | | | | R | | R | CRUA |
+| Edit settings, master data | | | | | | | | | | | | R | R | CRUA |
+| View audit log | | | | | | | | | | | | R | RP | R |
+| Run reports | own | own | own | own | own | own | own | own | own | all fin. | all HR | all | all | system |
+
+---
+
+## 8. Key workflows
+
+### 8.1 OPD visit with lab and drugs
+1. REC registers or finds the patient and issues a queue ticket. CSH collects the registration and consultation fee.
+2. NUR records vitals and triage.
+3. DOC consults, orders a lab test and writes a prescription.
+4. CSH shows two bills (lab, drugs) and takes payment, or approves credit.
+5. LAB collects sample, enters result, senior verifies, result released to DOC.
+6. DOC reviews, updates diagnosis, closes visit.
+7. PHA dispenses the paid prescription; stock reduces by batch.
+8. Audit log holds every step; the cashier shift and daily revenue update.
+
+### 8.2 Admission
+1. DOC creates admission order. REC completes paperwork. CSH takes the deposit.
+2. WRD allocates a bed, records admission vitals.
+3. DOC rounds daily; WRD gives medicines and records vitals; orders are charged to the admission.
+4. DOC writes discharge summary. CSH produces final bill, takes balance, clears the patient. Bed becomes "cleaning" then "vacant".
+
+### 8.3 Procurement to payment
+1. Department raises requisition; STO issues from main store or raises a purchase request.
+2. STO creates PO; ACC and MGR approve per limit.
+3. Supplier delivers; STO creates GRN with batch and expiry; stock increases.
+4. Supplier invoice entered in Finance and matched to PO and GRN.
+5. ACC creates payment voucher; payment posted to cash or bank book.
+
+### 8.4 New staff to working account
+1. HRO creates staff record and contract.
+2. ADM creates user linked to that staff record, assigns role(s) and department.
+3. Staff gets invite link, sets password, accepts policy.
+4. When the staff member leaves, HRO sets exit date; the account is deactivated automatically and sessions end. History is kept.
+
+### 8.5 Month end
+1. CSH shifts closed and reconciled; bank deposits matched.
+2. STO completes stock count; variances approved.
+3. HRO finalises attendance and payroll; ACC approves and posts.
+4. ACC closes the period; reports go to MGR and AUD.
+
+---
+
+## 9. Data model overview (tables by module)
+
+| Module | Main tables |
+|---|---|
+| Core | users, roles, permissions, role_permissions, user_roles, branches, departments, settings, sequences, audit_logs |
+| Registration | patients, patient_contacts, patient_payers, queue_tickets, attachments |
+| Appointments | doctor_schedules, appointments, leave_blocks |
+| Cashier and billing | services, price_lists, invoices, invoice_items, payments, receipts, cashier_shifts, refunds, discount_requests, deposits |
+| Triage and OPD | visits, vitals, triage, diagnoses, procedures, certificates, referrals |
+| Laboratory | lab_tests, lab_panels, lab_reference_ranges, lab_orders, lab_samples, lab_results, lab_qc |
+| Imaging | imaging_catalog, imaging_orders, imaging_exams, imaging_files, imaging_reports |
+| Pharmacy | medicines, prescriptions, prescription_items, dispenses, dispense_items, pharmacy_returns, controlled_register |
+| Store | items, item_categories, stores, stock_batches, stock_movements, suppliers, purchase_requests, purchase_orders, grns, requisitions, issues, transfers, stock_counts, assets |
+| Finance | accounts, journals, journal_lines, periods, ar_invoices, ap_invoices, vouchers, expenses, budgets, bank_accounts, bank_reconciliations, claims |
+| Inpatient | wards, rooms, beds, admissions, bed_assignments, rounds, nursing_notes, care_plans, medication_orders, medication_administrations, discharges |
+| HR | staff, staff_documents, contracts, positions, attendance, shifts, rosters, leave_types, leave_balances, leave_requests, salary_structures, payroll_runs, payslips, loans, appraisals, training |
+| Notifications | notification_templates, notification_queue |
+
+Conventions: every table has `id`, `created_at`, `created_by`, `updated_at`, `updated_by`; money uses DECIMAL(12,2); clinical and financial rows are never hard-deleted (use `status` or reversal); every table that belongs to a branch has `branch_id`.
+
+---
+
+## 10. Non-functional requirements
+
+- **Security:** HTTPS only; bcrypt hashes; login rate limiting [V1]; account lockout; session timeout; encryption of backups; protection against SQL injection (parameterised queries [V1]) and XSS; CORS limited to the clinic domain.
+- **Privacy:** patient data accessible on a need-to-know basis; access logged; export restricted; follow the local data protection and health-records law.
+- **Availability and backup:** nightly database backup, off-site copy, restore test every quarter; target recovery within 4 hours.
+- **Performance:** list screens return within 2 seconds with 100,000 patients; searches are indexed [V1 indexes on name and phone].
+- **Usability:** works on desktop, tablet and phone; keyboard-friendly cashier and pharmacy screens; printing for receipts and labels (A4 and 80 mm thermal).
+- **Offline tolerance:** if the internet is unreliable, run the server on the clinic LAN. Optional later: offline queue for cashier.
+- **Localisation:** English plus local languages (for example Amharic), local calendar and currency formats, right-to-left ready.
+- **Auditability:** nothing important is changed without a trace.
+- **Testing:** automated API tests for permissions (each role against each route), financial totals and stock movements.
+
+---
+
+## 11. Build roadmap
+
+| Phase | Contents | Status |
+|---|---|---|
+| 1 (done) | Login, users and 7 roles, patients, appointments, OPD visit, prescriptions, lab orders and results, pharmacy dispensing and stock, billing and payments, dashboard | **[V1]** |
+| 2 | Permission engine (roles and permissions tables, scopes), audit log, cashier shifts and approvals, triage and vitals upgrade, queue, receipts | NEW |
+| 3 | Store management (items, batches, GRN, requisitions, transfers), pharmacy batch/expiry and requisitions, lab results workflow and verification | NEW |
+| 4 | Imaging, inpatient (wards, beds, rounds, MAR, discharge), deposits and running bills | NEW |
+| 5 | Finance and accounting (ledger, AR, AP, expenses, bank, statements), insurance and credit claims | NEW |
+| 6 | HR (staff registration, contracts, attendance, leave, roster, payroll) and user creation from staff | NEW |
+| 7 | Reports library, notifications and SMS, document templates, multi-branch | NEW |
+| 8 | Maternity and child health, emergency, procedures, patient portal, integrations | NEW |
+
+---
+
+## 12. Default seed roles and the first-day checklist
+
+1. Create the 14 roles in section 2 with their permissions from sections 4 and 7.
+2. Create the first administrator and force a password change at first login.
+3. Load master data: departments, wards and beds, service price list, lab and imaging catalogues, formulary, suppliers, chart of accounts.
+4. HR enters staff; admin creates their users and assigns roles.
+5. Set approval limits (section 6.4), receipt and MRN formats, clinic letterhead.
+6. Run a day of test patients through the full journey (section 8.1), then check the cashier shift, stock cards and audit log all agree.
+7. Turn off demo users, confirm backups run, go live.
