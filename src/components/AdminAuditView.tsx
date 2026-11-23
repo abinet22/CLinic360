@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { CheckCircle2, Search, ShieldCheck, UserPlus, X } from 'lucide-react';
+import { CheckCircle2, Database, Search, ShieldCheck, UserPlus, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type { AuditLog, UserContext } from '../types';
 
@@ -9,9 +9,24 @@ interface StaffUserRow {
   email: string;
   specialty: string | null;
   active: number;
+  must_change_password?: number;
+  two_fa_enabled?: number;
   last_login_at: string | null;
   role_code: string;
   role_name: string;
+}
+
+interface DeploymentStatus {
+  dialect: 'sqlite' | 'mysql';
+  dbClientMode: string;
+  mysqlConfigured: boolean;
+  mysqlSsl: boolean;
+  counts?: {
+    patients: number;
+    visits: number;
+    journalEntries: number;
+    auditLogs: number;
+  };
 }
 
 interface RoleRow {
@@ -47,6 +62,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
 
   const [users, setUsers] = useState<StaffUserRow[]>([]);
   const [roles, setRoles] = useState<RoleRow[]>([]);
+  const [deployStatus, setDeployStatus] = useState<DeploymentStatus | null>(null);
   const [showCreateUser, setShowCreateUser] = useState(false);
   const [newUserForm, setNewUserForm] = useState({
     full_name: '',
@@ -67,8 +83,12 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
         setExceptions(excRes.exceptions);
       }
       if (canManageUsers || canAudit) {
-        const uRes = await apiFetch<{ users: StaffUserRow[] }>('/api/admin/users');
+        const [uRes, dRes] = await Promise.all([
+          apiFetch<{ users: StaffUserRow[] }>('/api/admin/users'),
+          apiFetch<DeploymentStatus>('/api/admin/deployment-status'),
+        ]);
         setUsers(uRes.users);
+        setDeployStatus(dRes);
       }
       if (canRoles || canManageUsers || canAudit) {
         const rRes = await apiFetch<{ roles: RoleRow[] }>('/api/admin/roles');
@@ -202,6 +222,31 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
           </button>
         )}
       </div>
+
+      {deployStatus && (
+        <div className="bg-white border border-slate-200 rounded-lg px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 text-xs">
+          <div className="flex items-center gap-2.5">
+            <Database className="w-4 h-4 text-teal-700 shrink-0" />
+            <div>
+              <span className="font-semibold text-slate-900">
+                Database Engine: <span className="font-mono uppercase">{deployStatus.dialect}</span>
+              </span>
+              <span className="text-slate-400 mx-2">·</span>
+              <span className="text-slate-600">
+                Mode: <span className="font-mono">{deployStatus.dbClientMode}</span>
+                {' · '}
+                MySQL 8 Configured: <span className="font-mono">{deployStatus.mysqlConfigured ? 'Yes' : 'Fallback SQLite'}</span>
+                {deployStatus.mysqlConfigured && ` · TLS/SSL: ${deployStatus.mysqlSsl ? 'Enabled' : 'Disabled'}`}
+              </span>
+            </div>
+          </div>
+          {deployStatus.counts && (
+            <div className="font-mono tabular-nums text-slate-600">
+              {deployStatus.counts.patients} patients · {deployStatus.counts.visits} visits · {deployStatus.counts.journalEntries} GL entries · {deployStatus.counts.auditLogs} audit rows
+            </div>
+          )}
+        </div>
+      )}
 
       {tab === 'audit' && canAudit && (
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
@@ -377,7 +422,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
                   <th className="py-2.5 px-4">Staff Member</th>
                   <th className="py-2.5 px-4">Email</th>
                   <th className="py-2.5 px-4">Role</th>
-                  <th className="py-2.5 px-4">Status</th>
+                  <th className="py-2.5 px-4">Security &amp; Status</th>
                   {canManageUsers && <th className="py-2.5 px-4 text-right">Account Control</th>}
                 </tr>
               </thead>
@@ -397,6 +442,12 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
                       <span className={u.active ? 'text-emerald-700 font-medium' : 'text-red-700'}>
                         {u.active ? 'Active' : 'Deactivated'}
                       </span>
+                      {u.two_fa_enabled === 1 && (
+                        <span className="text-teal-800 font-mono"> · 2FA</span>
+                      )}
+                      {u.must_change_password === 1 && (
+                        <span className="text-amber-700 font-mono"> · Pwd Reset Pending</span>
+                      )}
                     </td>
                     {canManageUsers && (
                       <td className="py-2.5 px-4 text-right">

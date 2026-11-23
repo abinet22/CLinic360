@@ -1,7 +1,14 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Eye, GitMerge, Plus, Search, UserPlus, X } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, CheckCircle2, CreditCard, Edit2, Eye, GitMerge, Lock, Plus, Receipt, Search, Stethoscope, UserPlus, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
-import type { Patient, QueueTicket, UserContext } from '../types';
+import { useRealtimeSync } from '../lib/useRealtimeSync';
+import type { CashierShift, Patient, QueueTicket, ServiceItem, UserContext } from '../types';
+
+interface DoctorOption {
+  id: number;
+  full_name: string;
+  specialty: string | null;
+}
 
 interface PatientsQueueViewProps {
   user: UserContext;
@@ -11,6 +18,7 @@ interface PatientsQueueViewProps {
 interface PatientDetailPayload {
   patient: Patient;
   clinicalMasked: boolean;
+  assignedDoctorIds?: number[];
   appointments: Array<{ id: number; appointment_date: string; start_time: string; doctor_name: string; status: string }>;
   visits: Array<{ id: number; visit_number: string; diagnosis_text: string | null; status: string; created_at: string; doctor_name: string | null }>;
   vitals: Array<{ id: number; bp_systolic: number | null; bp_diastolic: number | null; temperature: number | null; spo2: number | null; recorded_at: string }>;
@@ -21,7 +29,11 @@ interface PatientDetailPayload {
 export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNotify }) => {
   const [subTab, setSubTab] = useState<'patients' | 'queue'>('patients');
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [lookupField, setLookupField] = useState<'all' | 'name' | 'phone' | 'mrn'>('all');
   const [patients, setPatients] = useState<Patient[]>([]);
+  const [patientTotal, setPatientTotal] = useState(0);
+  const [patientPage, setPatientPage] = useState(1);
   const [clinicalMasked, setClinicalMasked] = useState(false);
   const [tickets, setTickets] = useState<QueueTicket[]>([]);
   const [deptFilter, setDeptFilter] = useState('ALL');
@@ -49,29 +61,102 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   });
 
   const [selectedDetail, setSelectedDetail] = useState<PatientDetailPayload | null>(null);
+  const [breakGlassPending, setBreakGlassPending] = useState<PatientDetailPayload | null>(null);
+  const [breakGlassReason, setBreakGlassReason] = useState('');
+  const [breakGlassCleared, setBreakGlassCleared] = useState<Record<number, string>>({});
   const [showMerge, setShowMerge] = useState(false);
   const [mergeSourceId, setMergeSourceId] = useState('');
   const [mergeTargetId, setMergeTargetId] = useState('');
   const [mergeReason, setMergeReason] = useState('');
 
+  const [doctors, setDoctors] = useState<DoctorOption[]>([]);
+  const [consultServices, setConsultServices] = useState<ServiceItem[]>([]);
+  const [showCreateVisit, setShowCreateVisit] = useState(false);
+  const [visitPatient, setVisitPatient] = useState<Patient | null>(null);
+  const [visitPatientSearch, setVisitPatientSearch] = useState('');
+  const [submittingVisit, setSubmittingVisit] = useState(false);
+  const [visitForm, setVisitForm] = useState({
+    visit_type: 'walk_in',
+    specialty: 'General Medicine',
+    service_code: 'CON-GEN',
+    doctor_id: '',
+    triage_priority: 'routine',
+    queue_department: 'TRIAGE',
+    chief_complaint: '',
+    generate_consultation_invoice: true,
+  });
+  const [lastCreatedVisit, setLastCreatedVisit] = useState<{
+    patientName: string;
+    mrn: string;
+    visitNumber: string;
+    ticketNumber: string;
+    queueDepartment: string;
+    consultationInvoiceNumber: string | null;
+    consultationInvoiceStatus: string | null;
+    receiptNumber: string | null;
+    consultationFee: number;
+    workflowStage: string;
+  } | null>(null);
+  const [openVisitAfterRegister, setOpenVisitAfterRegister] = useState(false);
+  const [hasOpenShift, setHasOpenShift] = useState(false);
+  const [openingShiftInline, setOpeningShiftInline] = useState(false);
+  const [collectPaymentNow, setCollectPaymentNow] = useState(true);
+  const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'mobile_money' | 'bank_transfer'>('cash');
+  const [paymentReference, setPaymentReference] = useState('');
+
+  const [editTarget, setEditTarget] = useState<Patient | null>(null);
+  const [editForm, setEditForm] = useState({
+    first_name: '',
+    last_name: '',
+    sex: 'Female',
+    date_of_birth: '',
+    phone: '',
+    email: '',
+    address: '',
+    next_of_kin_name: '',
+    next_of_kin_phone: '',
+    blood_group: 'Unknown',
+    allergies: 'None known',
+    patient_type: 'self-pay',
+    payer_name: '',
+    insurance_number: '',
+  });
+
   const canCreate = user.permissions.includes('patient.create');
+  const canUpdatePatient = user.permissions.includes('patient.update');
+  const canClinicalRead = user.permissions.includes('patient.clinical.read');
+  const canCreateVisit = user.permissions.includes('visit.create');
   const canQueue = user.permissions.includes('queue.manage');
   const canMerge = user.permissions.includes('patient.merge');
+  const canCollectPayment = user.permissions.includes('billing.payment.create');
+  const canManageShift = user.permissions.includes('billing.shift.manage');
+
+  useEffect(() => {
+    if (!search.trim()) {
+      setDebouncedSearch('');
+      return;
+    }
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const loadPatients = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiFetch<{ patients: Patient[]; clinicalMasked: boolean }>(
-        `/api/patients?q=${encodeURIComponent(search)}`
+      const res = await apiFetch<{ patients: Patient[]; total?: number; clinicalMasked: boolean }>(
+        `/api/patients?search=${encodeURIComponent(debouncedSearch)}&field=${encodeURIComponent(lookupField)}&page=${patientPage}&limit=25`
       );
-      setPatients(res.patients);
+      setPatients(res.patients || []);
+      setPatientTotal(typeof res.total === 'number' ? res.total : (res.patients || []).length);
       setClinicalMasked(res.clinicalMasked);
     } catch (err) {
       onNotify((err as Error).message, 'error');
     } finally {
       setLoading(false);
     }
-  }, [search, onNotify]);
+  }, [debouncedSearch, lookupField, patientPage, onNotify]);
 
   const loadQueue = useCallback(async () => {
     try {
@@ -82,6 +167,17 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     }
   }, [deptFilter]);
 
+  const loadCashierShift = useCallback(async () => {
+    if (!canCollectPayment) return;
+    try {
+      const res = await apiFetch<{ shifts: CashierShift[] }>('/api/billing/shifts');
+      const open = (res.shifts || []).some((s) => s.cashier_id === user.id && s.status === 'open');
+      setHasOpenShift(open);
+    } catch {
+      // ignore
+    }
+  }, [canCollectPayment, user.id]);
+
   useEffect(() => {
     loadPatients();
   }, [loadPatients]);
@@ -89,6 +185,35 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   useEffect(() => {
     loadQueue();
   }, [loadQueue]);
+
+  useEffect(() => {
+    loadCashierShift();
+  }, [loadCashierShift]);
+
+  useEffect(() => {
+    if (canCreateVisit) {
+      apiFetch<{ doctors: DoctorOption[] }>('/api/doctors')
+        .then((res) => {
+          setDoctors(res.doctors || []);
+          if (res.doctors[0]) {
+            setVisitForm((prev) => (prev.doctor_id ? prev : { ...prev, doctor_id: String(res.doctors[0].id) }));
+          }
+        })
+        .catch(() => {});
+      apiFetch<{ services: ServiceItem[] }>('/api/catalog/services')
+        .then((res) => {
+          const consults = (res.services || []).filter((s) => s.category === 'consultation');
+          setConsultServices(consults);
+        })
+        .catch(() => {});
+    }
+  }, [canCreateVisit]);
+
+  useRealtimeSync(['queue:updated', 'visit:updated', 'payment:confirmed'], () => {
+    loadPatients();
+    loadQueue();
+    loadCashierShift();
+  });
 
   async function checkDuplicates() {
     if (!form.first_name && !form.phone) return;
@@ -106,12 +231,69 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     }
   }
 
+  function defaultServiceCodeFor(specialty: string, visitType: string): string {
+    if (visitType === 'follow_up') return 'OPD-FU';
+    const s = specialty.toLowerCase();
+    if (s.includes('pediat')) return 'CON-PED';
+    if (s.includes('gyn')) return 'CON-GYN';
+    if (s.includes('derm')) return 'CON-DERM';
+    return 'CON-GEN';
+  }
+
+  function openCreatePatientFromLookup(prefillQuery?: string) {
+    const q = (prefillQuery || '').trim();
+    const isPhoneQuery = lookupField === 'phone' || /^[+\d\s\-()]{3,}$/.test(q);
+    const isMrnQuery = lookupField === 'mrn' || /^c360-/i.test(q);
+    let firstName = '';
+    let lastName = '';
+    let phone = '';
+    if (q && isPhoneQuery) {
+      phone = q;
+    } else if (q && !isMrnQuery && /[a-z]/i.test(q)) {
+      const parts = q.split(/\s+/);
+      firstName = parts[0] || '';
+      lastName = parts.slice(1).join(' ') || '';
+    }
+    setDuplicates([]);
+    setForm((prev) => ({
+      ...prev,
+      first_name: firstName,
+      last_name: lastName,
+      phone,
+    }));
+    setShowRegister(true);
+  }
+
+  function openCreateVisitModal(patient?: Patient | null) {
+    const target = patient ?? patients[0] ?? null;
+    const defaultSpecialty = 'General Medicine';
+    const matchedDoc =
+      doctors.find((d) => (d.specialty || '').toLowerCase().includes('general')) || doctors[0] || null;
+    setVisitPatient(target);
+    setVisitPatientSearch('');
+    setCollectPaymentNow(canCollectPayment && hasOpenShift);
+    setPaymentMethod('cash');
+    setPaymentReference('');
+    setVisitForm({
+      visit_type: 'walk_in',
+      specialty: defaultSpecialty,
+      service_code: defaultServiceCodeFor(defaultSpecialty, 'walk_in'),
+      doctor_id: matchedDoc ? String(matchedDoc.id) : '',
+      triage_priority: 'routine',
+      queue_department: 'TRIAGE',
+      chief_complaint: '',
+      generate_consultation_invoice: target ? target.patient_type !== 'exempt' : true,
+    });
+    setShowCreateVisit(true);
+  }
+
   async function handleCreatePatient(e: React.FormEvent) {
     e.preventDefault();
     try {
+      const payload = openVisitAfterRegister ? { ...form, issue_queue_ticket: false } : form;
       const res = await apiFetch<{ patient: Patient; ticketNumber: string | null }>('/api/patients', {
         method: 'POST',
-        body: JSON.stringify(form),
+        body: JSON.stringify(payload),
       });
       onNotify(
         `Registered ${res.patient.first_name} ${res.patient.last_name} (${res.patient.mrn})${res.ticketNumber ? ` · Queue ${res.ticketNumber}` : ''}`,
@@ -131,8 +313,74 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
         payer_name: '',
         insurance_number: '',
       });
-      loadPatients();
+      await loadPatients();
       loadQueue();
+      if (openVisitAfterRegister && canCreateVisit && res.patient) {
+        setOpenVisitAfterRegister(false);
+        openCreateVisitModal(res.patient);
+      } else {
+        setOpenVisitAfterRegister(false);
+      }
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  function openEditPatient(p: Patient) {
+    setEditTarget(p);
+    setEditForm({
+      first_name: p.first_name || '',
+      last_name: p.last_name || '',
+      sex: p.sex || 'Female',
+      date_of_birth: p.date_of_birth || '',
+      phone: p.phone || '',
+      email: p.email || '',
+      address: p.address || '',
+      next_of_kin_name: p.next_of_kin_name || '',
+      next_of_kin_phone: p.next_of_kin_phone || '',
+      blood_group: p.blood_group && p.blood_group !== 'Restricted' ? p.blood_group : 'Unknown',
+      allergies: p.allergies && p.allergies !== 'Restricted' ? p.allergies : 'None known',
+      patient_type: p.patient_type || 'self-pay',
+      payer_name: p.payer_name || '',
+      insurance_number: p.insurance_number && p.insurance_number !== 'Masked' ? p.insurance_number : '',
+    });
+  }
+
+  async function handleUpdatePatient(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editTarget) return;
+    try {
+      const payload: Record<string, string | null> = {
+        first_name: editForm.first_name,
+        last_name: editForm.last_name,
+        sex: editForm.sex,
+        date_of_birth: editForm.date_of_birth,
+        phone: editForm.phone,
+        email: editForm.email || null,
+        address: editForm.address || null,
+        next_of_kin_name: editForm.next_of_kin_name || null,
+        next_of_kin_phone: editForm.next_of_kin_phone || null,
+        patient_type: editForm.patient_type,
+        payer_name: editForm.payer_name || null,
+      };
+      if (canClinicalRead) {
+        payload.blood_group = editForm.blood_group;
+        payload.allergies = editForm.allergies;
+        if (editForm.insurance_number) {
+          payload.insurance_number = editForm.insurance_number;
+        }
+      }
+      await apiFetch(`/api/patients/${editTarget.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      });
+      onNotify(`Updated demographics for ${editForm.first_name} ${editForm.last_name}`, 'success');
+      const editedId = editTarget.id;
+      setEditTarget(null);
+      loadPatients();
+      if (selectedDetail && selectedDetail.patient.id === editedId) {
+        openPatientDetail(editedId);
+      }
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -141,7 +389,37 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   async function openPatientDetail(id: number) {
     try {
       const detail = await apiFetch<PatientDetailPayload>(`/api/patients/${id}`);
+      const isDoc = user.roles.includes('DOC');
+      const isAssigned = (detail.assignedDoctorIds || []).includes(user.id);
+      if (isDoc && !detail.clinicalMasked && !isAssigned && !breakGlassCleared[id]) {
+        setBreakGlassReason('');
+        setBreakGlassPending(detail);
+        return;
+      }
       setSelectedDetail(detail);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleConfirmBreakGlass(e: React.FormEvent) {
+    e.preventDefault();
+    if (!breakGlassPending) return;
+    const reason = breakGlassReason.trim();
+    if (reason.length < 8) {
+      onNotify('Clinical justification must be at least 8 characters.', 'error');
+      return;
+    }
+    try {
+      await apiFetch(`/api/patients/${breakGlassPending.patient.id}/break-glass`, {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      });
+      setBreakGlassCleared((prev) => ({ ...prev, [breakGlassPending.patient.id]: reason }));
+      setSelectedDetail(breakGlassPending);
+      setBreakGlassPending(null);
+      setBreakGlassReason('');
+      onNotify('Break-Glass access logged and escalated to Auditor & Manager', 'success');
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -170,6 +448,158 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
       loadQueue();
     } catch (err) {
       onNotify((err as Error).message, 'error');
+    }
+  }
+
+  const filteredVisitPatients = useMemo(() => {
+    const q = visitPatientSearch.trim().toLowerCase();
+    if (!q) return patients;
+    return patients.filter(
+      (p) =>
+        p.mrn.toLowerCase().includes(q) ||
+        `${p.first_name} ${p.last_name}`.toLowerCase().includes(q) ||
+        p.phone.toLowerCase().includes(q)
+    );
+  }, [patients, visitPatientSearch]);
+
+  const selectedConsultService = useMemo(() => {
+    return consultServices.find((s) => s.code === visitForm.service_code) || null;
+  }, [consultServices, visitForm.service_code]);
+
+  const willGenerateConsultInvoice = Boolean(
+    visitPatient &&
+      visitPatient.patient_type !== 'exempt' &&
+      (visitForm.visit_type === 'walk_in' || visitForm.generate_consultation_invoice)
+  );
+
+  const cashierPayingUpfront = Boolean(
+    canCollectPayment &&
+      hasOpenShift &&
+      collectPaymentNow &&
+      visitPatient?.patient_type === 'self-pay' &&
+      willGenerateConsultInvoice
+  );
+
+  const visitWillAwaitPayment = Boolean(
+    visitPatient &&
+      visitPatient.patient_type === 'self-pay' &&
+      willGenerateConsultInvoice &&
+      visitForm.triage_priority !== 'emergency' &&
+      !cashierPayingUpfront
+  );
+
+  async function handleOpenQuickShift() {
+    setOpeningShiftInline(true);
+    try {
+      await apiFetch('/api/billing/shifts/open', {
+        method: 'POST',
+        body: JSON.stringify({ opening_float: 200 }),
+      });
+      setHasOpenShift(true);
+      setCollectPaymentNow(true);
+      onNotify('Cashier shift opened ($200.00 float). Ready to collect walk-in payments.', 'success');
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setOpeningShiftInline(false);
+    }
+  }
+
+  async function handleQuickCollectAndTriage(ticket: QueueTicket) {
+    if (!ticket.consultation_invoice_id) return;
+    if (!hasOpenShift) {
+      onNotify('Open a Cashier Shift first before collecting consultation payments.', 'error');
+      return;
+    }
+    const balance = Number(
+      (Number(ticket.consultation_total_amount || 45) - Number(ticket.consultation_paid_amount || 0)).toFixed(2)
+    );
+    try {
+      const res = await apiFetch<{ receiptNumber: string }>('/api/billing/payments', {
+        method: 'POST',
+        body: JSON.stringify({
+          invoice_id: ticket.consultation_invoice_id,
+          amount: balance > 0 ? balance : 45,
+          payment_method: 'cash',
+        }),
+      });
+      onNotify(
+        `Payment ${res.receiptNumber} collected · Ticket ${ticket.ticket_number} moved to TRIAGE queue`,
+        'success'
+      );
+      loadQueue();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleStartVisit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!visitPatient) {
+      onNotify('Please select a patient to create a visit.', 'error');
+      return;
+    }
+    setSubmittingVisit(true);
+    try {
+      const res = await apiFetch<{
+        visitNumber: string;
+        workflowStage: string;
+        queueDepartment: string;
+        consultationFee: number;
+        consultationInvoiceNumber: string | null;
+        consultationInvoiceStatus: string | null;
+        receiptNumber: string | null;
+        ticketNumber: string;
+      }>('/api/visits', {
+        method: 'POST',
+        body: JSON.stringify({
+          patient_id: visitPatient.id,
+          doctor_id: visitForm.doctor_id ? Number(visitForm.doctor_id) : null,
+          visit_type: visitForm.visit_type,
+          specialty: visitForm.specialty,
+          service_code: visitForm.service_code || undefined,
+          triage_priority: visitForm.triage_priority,
+          queue_department: visitWillAwaitPayment ? 'CSH' : visitForm.queue_department,
+          chief_complaint: visitForm.chief_complaint || `${visitForm.specialty} walk-in consultation`,
+          generate_consultation_invoice:
+            visitPatient.patient_type === 'exempt'
+              ? false
+              : visitForm.visit_type === 'walk_in'
+                ? true
+                : visitForm.generate_consultation_invoice,
+          collect_payment: cashierPayingUpfront,
+          payment_method: paymentMethod,
+          payment_reference: paymentReference.trim() || undefined,
+        }),
+      });
+      const assignedDept = res.queueDepartment || (res.workflowStage === 'awaiting_payment' ? 'CSH' : 'TRIAGE');
+      setLastCreatedVisit({
+        patientName: `${visitPatient.first_name} ${visitPatient.last_name}`,
+        mrn: visitPatient.mrn,
+        visitNumber: res.visitNumber,
+        ticketNumber: res.ticketNumber,
+        queueDepartment: assignedDept,
+        consultationInvoiceNumber: res.consultationInvoiceNumber,
+        consultationInvoiceStatus: res.consultationInvoiceStatus,
+        receiptNumber: res.receiptNumber || null,
+        consultationFee: res.consultationFee || Number(selectedConsultService?.unit_price || 45),
+        workflowStage: res.workflowStage,
+      });
+      onNotify(
+        `Created ${res.visitNumber} · Ticket ${res.ticketNumber} added to ${assignedDept} queue${
+          res.receiptNumber ? ` · Receipt ${res.receiptNumber}` : res.consultationInvoiceNumber ? ` · Invoice ${res.consultationInvoiceNumber}` : ''
+        }`,
+        'success'
+      );
+      setShowCreateVisit(false);
+      setVisitPatient(null);
+      setVisitForm((p) => ({ ...p, chief_complaint: '' }));
+      loadQueue();
+      loadPatients();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setSubmittingVisit(false);
     }
   }
 
@@ -205,7 +635,7 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
               subTab === 'patients' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Patient Registry ({patients.length})
+            Patient Registry ({patientTotal})
           </button>
           <button
             onClick={() => setSubTab('queue')}
@@ -217,7 +647,7 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {canMerge && patients.length >= 2 && (
             <button
               onClick={() => {
@@ -231,51 +661,225 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
               <span>Merge Duplicates</span>
             </button>
           )}
+          {canCreateVisit && (
+            <button
+              onClick={() => openCreateVisitModal()}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-teal-800 bg-teal-50 border border-teal-300 hover:bg-teal-100 rounded-md transition-colors whitespace-nowrap"
+            >
+              <Stethoscope className="w-3.5 h-3.5" />
+              <span>New Walk-in Visit</span>
+            </button>
+          )}
           {canCreate && (
             <button
-              onClick={() => setShowRegister(true)}
+              onClick={() => openCreatePatientFromLookup()}
               className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors whitespace-nowrap"
             >
               <UserPlus className="w-3.5 h-3.5" />
-              <span>Register Patient</span>
+              <span>Create New Patient</span>
             </button>
           )}
         </div>
       </div>
 
+      {lastCreatedVisit && (
+        <div className="p-3.5 bg-teal-50/90 border border-teal-200 rounded-lg flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-2.5">
+            <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-slate-900">
+                Walk-In Visit Created: <span className="font-mono text-teal-800">{lastCreatedVisit.visitNumber}</span> — {lastCreatedVisit.patientName}{' '}
+                <span className="font-mono text-slate-500">({lastCreatedVisit.mrn})</span>
+              </div>
+              <div className="text-slate-700 mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span>
+                  Queue Ticket: <strong className="font-mono">{lastCreatedVisit.ticketNumber}</strong> →{' '}
+                  <strong className="font-mono text-teal-800">{lastCreatedVisit.queueDepartment}</strong>
+                </span>
+                {lastCreatedVisit.consultationInvoiceNumber ? (
+                  <span>
+                    Consultation Invoice: <strong className="font-mono">{lastCreatedVisit.consultationInvoiceNumber}</strong>{' '}
+                    (<span className="font-mono tabular-nums">${lastCreatedVisit.consultationFee.toFixed(2)}</span> ·{' '}
+                    <span className="capitalize">{(lastCreatedVisit.consultationInvoiceStatus || 'unpaid').replace('_', ' ')}</span>)
+                    {lastCreatedVisit.receiptNumber && (
+                      <span> · Receipt <strong className="font-mono text-teal-800">{lastCreatedVisit.receiptNumber}</strong></span>
+                    )}
+                  </span>
+                ) : (
+                  <span>No consultation invoice generated (exempt/waived)</span>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setDeptFilter(lastCreatedVisit.queueDepartment || 'ALL');
+                setSubTab('queue');
+              }}
+              className="px-3 py-1.5 text-xs font-medium text-teal-800 bg-white border border-teal-300 hover:bg-teal-100 rounded-md whitespace-nowrap"
+            >
+              View in {lastCreatedVisit.queueDepartment} Queue
+            </button>
+            <button
+              onClick={() => setLastCreatedVisit(null)}
+              className="p-1 text-slate-400 hover:text-slate-700"
+              aria-label="Dismiss visit confirmation"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {subTab === 'patients' && (
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-          <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
-            <div className="relative flex-1 min-w-[260px] max-w-md">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search by MRN, patient name, or phone..."
-                className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
-              />
-            </div>
-            {clinicalMasked && (
-              <div className="text-xs text-slate-500">
-                Clinical fields (allergies, blood group) masked for your role
+          <div className="p-4 border-b border-slate-200 bg-slate-50/50 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">Patient Lookup</h2>
+                <p className="text-xs text-slate-500">
+                  Search existing patients by Name, Phone Number, or MRN before billing or visit check-in.
+                </p>
               </div>
-            )}
+              <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-md text-xs">
+                {(
+                  [
+                    { key: 'all', label: 'All Fields' },
+                    { key: 'name', label: 'Name' },
+                    { key: 'phone', label: 'Phone' },
+                    { key: 'mrn', label: 'MRN' },
+                  ] as const
+                ).map((mode) => (
+                  <button
+                    key={mode.key}
+                    type="button"
+                    onClick={() => {
+                      setLookupField(mode.key);
+                      setPatientPage(1);
+                    }}
+                    className={`px-2.5 py-1 rounded font-medium transition-colors ${
+                      lookupField === mode.key
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="relative flex-1 min-w-[260px] max-w-xl">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={search}
+                  onChange={(e) => {
+                    setSearch(e.target.value);
+                    setPatientPage(1);
+                  }}
+                  placeholder={
+                    lookupField === 'name'
+                      ? 'Lookup by patient first or last name (e.g. Elena Rostova)...'
+                      : lookupField === 'phone'
+                        ? 'Lookup by phone number (e.g. +1-555-0101 or 5550101)...'
+                        : lookupField === 'mrn'
+                          ? 'Lookup by MRN / Patient ID (e.g. C360-000100)...'
+                          : 'Lookup by Name, Phone Number, or MRN...'
+                  }
+                  className="w-full pl-9 pr-8 py-2 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                />
+                {search && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearch('');
+                      setDebouncedSearch('');
+                      setPatientPage(1);
+                    }}
+                    aria-label="Clear patient lookup"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-3 text-xs text-slate-500">
+                {clinicalMasked && <span>Clinical fields masked</span>}
+                <span className="font-mono">
+                  {debouncedSearch ? `${patientTotal} match${patientTotal === 1 ? '' : 'es'}` : `Page ${patientPage} · ${patientTotal} total`}
+                </span>
+                <button
+                  disabled={patientPage <= 1}
+                  onClick={() => setPatientPage((p) => Math.max(1, p - 1))}
+                  className="px-2.5 py-1 bg-white border border-slate-200 rounded disabled:opacity-40 hover:bg-slate-50"
+                >
+                  Prev
+                </button>
+                <button
+                  disabled={patientPage * 25 >= patientTotal}
+                  onClick={() => setPatientPage((p) => p + 1)}
+                  className="px-2.5 py-1 bg-white border border-slate-200 rounded disabled:opacity-40 hover:bg-slate-50"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           </div>
 
           {loading ? (
-            <div className="p-8 text-center text-sm text-slate-500">Loading patient records...</div>
+            <div className="p-8 text-center text-sm text-slate-500">Searching patient records...</div>
           ) : patients.length === 0 ? (
-            <div className="p-10 text-center">
-              <div className="text-sm text-slate-600 mb-3">No matching patient records found.</div>
-              {canCreate && (
-                <button
-                  onClick={() => setShowRegister(true)}
-                  className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
-                >
-                  Register New Patient
-                </button>
-              )}
+            <div className="p-10 text-center max-w-lg mx-auto space-y-3">
+              <div className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-slate-100 text-slate-500">
+                <Search className="w-5 h-5" />
+              </div>
+              <div className="text-sm font-semibold text-slate-900">
+                {debouncedSearch
+                  ? `No patient record found for "${debouncedSearch}"`
+                  : 'No patient records found'}
+              </div>
+              <p className="text-xs text-slate-500">
+                {debouncedSearch
+                  ? `Searched by ${
+                      lookupField === 'all'
+                        ? 'Name, Phone, and MRN'
+                        : lookupField === 'mrn'
+                          ? 'MRN'
+                          : lookupField === 'phone'
+                            ? 'Phone Number'
+                            : 'Patient Name'
+                    }. Verify the details or create a new patient chart to generate an MRN.`
+                  : 'Register a new patient to create an Electronic Medical Record (EMR) and issue an MRN.'}
+              </p>
+              <div className="pt-1 flex flex-wrap items-center justify-center gap-2.5">
+                {canCreate && (
+                  <button
+                    type="button"
+                    onClick={() => openCreatePatientFromLookup(debouncedSearch)}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>Create New Patient</span>
+                  </button>
+                )}
+                {search && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearch('');
+                      setDebouncedSearch('');
+                      setLookupField('all');
+                      setPatientPage(1);
+                    }}
+                    className="px-4 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md"
+                  >
+                    Clear Search
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -330,6 +934,24 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                           <Eye className="w-3 h-3" />
                           <span>360° Record</span>
                         </button>
+                        {canUpdatePatient && (
+                          <button
+                            onClick={() => openEditPatient(p)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 hover:text-slate-900 border border-slate-200 hover:border-slate-400 rounded"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                            <span>Edit</span>
+                          </button>
+                        )}
+                        {canCreateVisit && (
+                          <button
+                            onClick={() => openCreateVisitModal(p)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+                          >
+                            <Stethoscope className="w-3 h-3" />
+                            <span>New Walk-in Visit</span>
+                          </button>
+                        )}
                         {canQueue && (
                           <button
                             onClick={() => issueQuickTicket(p.id, 'OPD')}
@@ -352,8 +974,8 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
       {subTab === 'queue' && (
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
           <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-md">
-              {['ALL', 'OPD', 'LAB', 'PHA', 'CSH'].map((d) => (
+            <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-md">
+              {['ALL', 'CSH', 'TRIAGE', 'OPD', 'LAB', 'PHA'].map((d) => (
                 <button
                   key={d}
                   onClick={() => setDeptFilter(d)}
@@ -376,7 +998,7 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
                     <th className="py-2.5 px-4">Ticket</th>
-                    <th className="py-2.5 px-4">Department</th>
+                    <th className="py-2.5 px-4">Department &amp; Stage</th>
                     <th className="py-2.5 px-4">Patient</th>
                     <th className="py-2.5 px-4">Priority</th>
                     <th className="py-2.5 px-4">Status</th>
@@ -387,23 +1009,49 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   {tickets.map((t) => (
                     <tr key={t.id} className="hover:bg-slate-50/70">
                       <td className="py-2.5 px-4 font-mono text-xs font-semibold text-slate-900 tabular-nums">
-                        {t.ticket_number}
+                        <div>{t.ticket_number}</div>
+                        {t.visit_number && (
+                          <div className="text-[11px] font-normal text-slate-500">{t.visit_number}</div>
+                        )}
                       </td>
-                      <td className="py-2.5 px-4 font-mono text-xs text-slate-600">{t.department}</td>
+                      <td className="py-2.5 px-4 text-xs">
+                        <div className="font-mono font-semibold text-slate-700">{t.department}</div>
+                        {t.notes && <div className="text-[11px] text-teal-800">{t.notes}</div>}
+                        {t.consultation_invoice_number && (
+                          <div className="text-[11px] font-mono text-slate-500 mt-0.5">
+                            {t.consultation_invoice_number} ({(t.consultation_invoice_status || 'unpaid').replace('_', ' ')})
+                          </div>
+                        )}
+                      </td>
                       <td className="py-2.5 px-4">
                         <div className="font-medium text-slate-900">{t.first_name} {t.last_name}</div>
-                        <div className="text-xs font-mono text-slate-500">{t.mrn}</div>
+                        <div className="text-xs font-mono text-slate-500">
+                          {t.mrn}
+                          {t.doctor_name ? ` · ${t.doctor_name}` : ''}
+                        </div>
                       </td>
                       <td className="py-2.5 px-4 text-xs">
                         <span className={t.priority === 'emergency' ? 'text-red-700 font-semibold' : t.priority === 'urgent' ? 'text-amber-700 font-medium' : 'text-slate-600'}>
                           {t.priority}
                         </span>
                       </td>
-                      <td className="py-2.5 px-4 text-xs text-slate-700">
+                      <td className="py-2.5 px-4 text-xs text-slate-700 capitalize">
                         {t.status.replace('_', ' ')}
                       </td>
                       {canQueue && (
                         <td className="py-2.5 px-4 text-right space-x-1.5 whitespace-nowrap">
+                          {t.department === 'CSH' &&
+                            t.consultation_invoice_id &&
+                            t.consultation_invoice_status === 'unpaid' &&
+                            canCollectPayment && (
+                              <button
+                                onClick={() => handleQuickCollectAndTriage(t)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded"
+                              >
+                                <CreditCard className="w-3 h-3" />
+                                <span>Collect &amp; Send to Triage</span>
+                              </button>
+                            )}
                           {t.status === 'waiting' && (
                             <button
                               onClick={() => updateTicketStatus(t.id, 'called')}
@@ -578,6 +1226,24 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
                   />
                 </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Name</label>
+                  <input
+                    value={form.next_of_kin_name}
+                    onChange={(e) => setForm({ ...form, next_of_kin_name: e.target.value })}
+                    placeholder="Next of kin / guardian"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Phone</label>
+                  <input
+                    value={form.next_of_kin_phone}
+                    onChange={(e) => setForm({ ...form, next_of_kin_phone: e.target.value })}
+                    placeholder="+1-555-0191"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md font-mono"
+                  />
+                </div>
                 <div className="sm:col-span-2">
                   <label className="block text-xs font-medium text-slate-700 mb-1">Residential Address</label>
                   <input
@@ -593,9 +1259,10 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   <input
                     type="checkbox"
                     checked={form.issue_queue_ticket}
+                    disabled={openVisitAfterRegister}
                     onChange={(e) => setForm({ ...form, issue_queue_ticket: e.target.checked })}
                   />
-                  <span>Issue OPD queue ticket immediately</span>
+                  <span>Issue standalone OPD queue ticket immediately</span>
                 </label>
                 <label className="inline-flex items-center gap-2">
                   <input
@@ -605,6 +1272,16 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   />
                   <span>Generate $15.00 registration card invoice</span>
                 </label>
+                {canCreateVisit && (
+                  <label className="inline-flex items-center gap-2 font-medium text-teal-800">
+                    <input
+                      type="checkbox"
+                      checked={openVisitAfterRegister}
+                      onChange={(e) => setOpenVisitAfterRegister(e.target.checked)}
+                    />
+                    <span>Open Create Visit (Walk-In + Consultation Invoice) right after saving</span>
+                  </label>
+                )}
               </div>
 
               <div className="pt-4 border-t border-slate-200 flex justify-end gap-3">
@@ -619,7 +1296,7 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   type="submit"
                   className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
                 >
-                  Save Patient &amp; Generate MRN
+                  {openVisitAfterRegister ? 'Save Patient & New Walk-in Visit' : 'Save Patient & Generate MRN'}
                 </button>
               </div>
             </form>
@@ -640,12 +1317,36 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   {selectedDetail.patient.mrn} · {selectedDetail.patient.sex} · DOB {selectedDetail.patient.date_of_birth} · {selectedDetail.patient.phone}
                 </div>
               </div>
-              <button onClick={() => setSelectedDetail(null)} className="text-slate-400 hover:text-slate-700">
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2">
+                {canCreateVisit && (
+                  <button
+                    onClick={() => {
+                      const p = selectedDetail.patient;
+                      setSelectedDetail(null);
+                      openCreateVisitModal(p);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+                  >
+                    <Stethoscope className="w-3.5 h-3.5" />
+                    <span>New Walk-in Visit</span>
+                  </button>
+                )}
+                <button onClick={() => setSelectedDetail(null)} className="text-slate-400 hover:text-slate-700">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
             <div className="p-6 space-y-6">
+              {breakGlassCleared[selectedDetail.patient.id] && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-900 flex items-start gap-2">
+                  <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <div>
+                    <strong>Break-Glass Override Active:</strong> {breakGlassCleared[selectedDetail.patient.id]}
+                  </div>
+                </div>
+              )}
+
               {/* Summary Strip */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pb-5 border-b border-slate-200 text-xs">
                 <div>
@@ -825,6 +1526,568 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                 </button>
                 <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-md">
                   Execute Audited Merge
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* Break-Glass Clinical Override Modal */}
+      {breakGlassPending && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                <Lock className="w-4 h-4 text-amber-700" />
+                <span>Break-Glass Chart Access</span>
+              </h3>
+              <button onClick={() => setBreakGlassPending(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleConfirmBreakGlass} className="p-6 space-y-4">
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded text-xs text-amber-900">
+                <strong>Cross-Patient Access Notice:</strong> You are not currently listed as the active attending doctor for{' '}
+                <strong>
+                  {breakGlassPending.patient.first_name} {breakGlassPending.patient.last_name}
+                </strong>{' '}
+                (<span className="font-mono">{breakGlassPending.patient.mrn}</span>). Opening this clinical record triggers a high-priority audit alert to the Auditor &amp; Medical Director.
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Mandatory Clinical Justification (min 8 chars) *
+                </label>
+                <textarea
+                  required
+                  minLength={8}
+                  rows={3}
+                  value={breakGlassReason}
+                  onChange={(e) => setBreakGlassReason(e.target.value)}
+                  placeholder="e.g. Covering emergency night call / urgent cross-specialty consult..."
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setBreakGlassPending(null)}
+                  className="px-4 py-2 text-xs border border-slate-300 rounded-md"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-md"
+                >
+                  Log Override &amp; Open Chart
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Patient Demographics Modal */}
+      {editTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Edit Patient · {editTarget.mrn}
+              </h3>
+              <button onClick={() => setEditTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleUpdatePatient} className="p-6 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">First Name *</label>
+                  <input
+                    required
+                    value={editForm.first_name}
+                    onChange={(e) => setEditForm({ ...editForm, first_name: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Last Name *</label>
+                  <input
+                    required
+                    value={editForm.last_name}
+                    onChange={(e) => setEditForm({ ...editForm, last_name: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Sex *</label>
+                  <select
+                    value={editForm.sex}
+                    onChange={(e) => setEditForm({ ...editForm, sex: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="Female">Female</option>
+                    <option value="Male">Male</option>
+                    <option value="Other">Other</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Date of Birth *</label>
+                  <input
+                    type="date"
+                    required
+                    value={editForm.date_of_birth}
+                    onChange={(e) => setEditForm({ ...editForm, date_of_birth: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Phone *</label>
+                  <input
+                    required
+                    value={editForm.phone}
+                    onChange={(e) => setEditForm({ ...editForm, phone: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Patient Payer Type</label>
+                  <select
+                    value={editForm.patient_type}
+                    onChange={(e) => setEditForm({ ...editForm, patient_type: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="self-pay">Self-Pay</option>
+                    <option value="insurance">Insurance</option>
+                    <option value="credit">Credit (Company / NGO)</option>
+                    <option value="exempt">Exempt</option>
+                  </select>
+                </div>
+                {(editForm.patient_type === 'insurance' || editForm.patient_type === 'credit') && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">Insurer / Payer Name</label>
+                      <input
+                        value={editForm.payer_name}
+                        onChange={(e) => setEditForm({ ...editForm, payer_name: e.target.value })}
+                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                      />
+                    </div>
+                    {canClinicalRead && (
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">Policy / Member Number</label>
+                        <input
+                          value={editForm.insurance_number}
+                          onChange={(e) => setEditForm({ ...editForm, insurance_number: e.target.value })}
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md font-mono"
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+                {canClinicalRead && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">Blood Group</label>
+                      <select
+                        value={editForm.blood_group}
+                        onChange={(e) => setEditForm({ ...editForm, blood_group: e.target.value })}
+                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                      >
+                        {['O+', 'O-', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'Unknown'].map((bg) => (
+                          <option key={bg} value={bg}>{bg}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">Known Allergies</label>
+                      <input
+                        value={editForm.allergies}
+                        onChange={(e) => setEditForm({ ...editForm, allergies: e.target.value })}
+                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                      />
+                    </div>
+                  </>
+                )}
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Name</label>
+                  <input
+                    value={editForm.next_of_kin_name}
+                    onChange={(e) => setEditForm({ ...editForm, next_of_kin_name: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Phone</label>
+                  <input
+                    value={editForm.next_of_kin_phone}
+                    onChange={(e) => setEditForm({ ...editForm, next_of_kin_phone: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md font-mono"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Residential Address</label>
+                  <input
+                    value={editForm.address}
+                    onChange={(e) => setEditForm({ ...editForm, address: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+              </div>
+              <div className="pt-4 border-t border-slate-200 flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setEditTarget(null)}
+                  className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-md hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+                >
+                  Save Patient Changes
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Create Walk-In Visit & Consultation Invoice Modal */}
+      {showCreateVisit && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                  <Stethoscope className="w-4 h-4 text-teal-700" />
+                  <span>New Walk-in Visit</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Create a visit for the selected patient, assign the department queue, and generate the initial consultation invoice for Cash-Before-Service clearance.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowCreateVisit(false);
+                  setVisitPatient(null);
+                }}
+                className="text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleStartVisit} className="p-6 space-y-4">
+              {/* Patient Selector / Summary */}
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-md space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-slate-700">Patient *</label>
+                  {visitPatient && (
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700 capitalize">
+                      {visitPatient.patient_type}
+                      {visitPatient.payer_name ? ` · ${visitPatient.payer_name}` : ''}
+                    </span>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={visitPatientSearch}
+                  onChange={(e) => setVisitPatientSearch(e.target.value)}
+                  placeholder="Filter patient list by MRN, name, or phone..."
+                  className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
+                />
+                <select
+                  required
+                  value={visitPatient ? String(visitPatient.id) : ''}
+                  onChange={(e) => {
+                    const found = patients.find((p) => p.id === Number(e.target.value)) || null;
+                    setVisitPatient(found);
+                    if (found) {
+                      setVisitForm((prev) => ({
+                        ...prev,
+                        generate_consultation_invoice: found.patient_type !== 'exempt',
+                      }));
+                    }
+                  }}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                >
+                  <option value="">Select patient...</option>
+                  {filteredVisitPatients.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.mrn} — {p.first_name} {p.last_name} ({p.phone} · {p.patient_type})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Visit Type *</label>
+                  <select
+                    value={visitForm.visit_type}
+                    onChange={(e) => {
+                      const nextType = e.target.value;
+                      setVisitForm((prev) => ({
+                        ...prev,
+                        visit_type: nextType,
+                        service_code: defaultServiceCodeFor(prev.specialty, nextType),
+                      }));
+                    }}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="walk_in">Walk-In Consultation</option>
+                    <option value="follow_up">Follow-Up Review</option>
+                    <option value="scheduled">Scheduled Appointment</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Triage Priority *</label>
+                  <select
+                    value={visitForm.triage_priority}
+                    onChange={(e) => setVisitForm({ ...visitForm, triage_priority: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="routine">Routine</option>
+                    <option value="urgent">Urgent</option>
+                    <option value="emergency">Emergency (Immediate Triage)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Medical Specialty *</label>
+                  <select
+                    value={visitForm.specialty}
+                    onChange={(e) => {
+                      const nextSpec = e.target.value;
+                      const matchedDoc = doctors.find((d) =>
+                        (d.specialty || '').toLowerCase().includes(nextSpec.split(' ')[0].toLowerCase())
+                      );
+                      setVisitForm((prev) => ({
+                        ...prev,
+                        specialty: nextSpec,
+                        service_code: defaultServiceCodeFor(nextSpec, prev.visit_type),
+                        doctor_id: matchedDoc ? String(matchedDoc.id) : prev.doctor_id,
+                      }));
+                    }}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="General Medicine">General Medicine</option>
+                    <option value="Pediatrics">Pediatrics</option>
+                    <option value="Gynecology">Gynecology</option>
+                    <option value="Dermatology">Dermatology</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Assigned Clinician</label>
+                  <select
+                    value={visitForm.doctor_id}
+                    onChange={(e) => {
+                      const nextDocId = e.target.value;
+                      const doc = doctors.find((d) => String(d.id) === nextDocId);
+                      setVisitForm((prev) => {
+                        const nextSpec = doc?.specialty || prev.specialty;
+                        return {
+                          ...prev,
+                          doctor_id: nextDocId,
+                          specialty: nextSpec,
+                          service_code: defaultServiceCodeFor(nextSpec, prev.visit_type),
+                        };
+                      });
+                    }}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="">Any Available Doctor</option>
+                    {doctors.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.full_name}
+                        {d.specialty ? ` (${d.specialty})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Consultation Tariff / Service Item</label>
+                  <select
+                    value={visitForm.service_code}
+                    onChange={(e) => setVisitForm({ ...visitForm, service_code: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    {consultServices.length > 0 ? (
+                      consultServices.map((svc) => (
+                        <option key={svc.code} value={svc.code}>
+                          {svc.code} — {svc.name} (${Number(svc.unit_price).toFixed(2)})
+                        </option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="CON-GEN">CON-GEN — General Medicine Consultation ($45.00)</option>
+                        <option value="CON-PED">CON-PED — Pediatrics Consultation ($55.00)</option>
+                        <option value="CON-GYN">CON-GYN — Gynecology Consultation ($65.00)</option>
+                        <option value="CON-DERM">CON-DERM — Dermatology Consultation ($60.00)</option>
+                        <option value="OPD-FU">OPD-FU — Follow-up Consultation ($25.00)</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Chief Complaint / Reason for Visit</label>
+                  <input
+                    type="text"
+                    value={visitForm.chief_complaint}
+                    onChange={(e) => setVisitForm({ ...visitForm, chief_complaint: e.target.value })}
+                    placeholder="e.g. Fever and persistent cough x 3 days"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+                  />
+                </div>
+              </div>
+
+              {/* Billing & Queue Assignment Preview */}
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-md space-y-2.5 text-xs">
+                <label className="inline-flex items-center gap-2 font-medium text-slate-800">
+                  <input
+                    type="checkbox"
+                    checked={visitPatient?.patient_type === 'exempt' ? false : visitForm.visit_type === 'walk_in' ? true : visitForm.generate_consultation_invoice}
+                    disabled={visitPatient?.patient_type === 'exempt' || visitForm.visit_type === 'walk_in'}
+                    onChange={(e) =>
+                      setVisitForm({ ...visitForm, generate_consultation_invoice: e.target.checked })
+                    }
+                  />
+                  <Receipt className="w-3.5 h-3.5 text-teal-700" />
+                  <span>
+                    Generate initial consultation invoice
+                    {visitPatient?.patient_type === 'exempt'
+                      ? ' (Exempt patient — no charge)'
+                      : selectedConsultService
+                        ? ` ($${Number(selectedConsultService.unit_price).toFixed(2)} · Cash-Before-Service)`
+                        : ' (Cash-Before-Service)'}
+                  </span>
+                </label>
+
+                {canCollectPayment && visitPatient?.patient_type === 'self-pay' && willGenerateConsultInvoice && (
+                  <div className="p-3 bg-white border border-slate-200 rounded-md space-y-2.5">
+                    {!hasOpenShift ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-amber-800 font-medium">
+                          Open a Cashier Shift to collect payment now and add directly to TRIAGE queue.
+                        </span>
+                        {canManageShift && (
+                          <button
+                            type="button"
+                            disabled={openingShiftInline}
+                            onClick={handleOpenQuickShift}
+                            className="px-3 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded disabled:opacity-50"
+                          >
+                            {openingShiftInline ? 'Opening...' : 'Open Shift ($200.00)'}
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <label className="inline-flex items-center gap-2 font-medium text-teal-900">
+                          <input
+                            type="checkbox"
+                            checked={collectPaymentNow}
+                            onChange={(e) => setCollectPaymentNow(e.target.checked)}
+                          />
+                          <CreditCard className="w-3.5 h-3.5 text-teal-700" />
+                          <span>Collect consultation payment now &amp; add directly to TRIAGE queue</span>
+                        </label>
+                        {collectPaymentNow && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                            <div>
+                              <label className="block text-[11px] font-medium text-slate-600 mb-1">Payment Method</label>
+                              <select
+                                value={paymentMethod}
+                                onChange={(e) =>
+                                  setPaymentMethod(e.target.value as 'cash' | 'card' | 'mobile_money' | 'bank_transfer')
+                                }
+                                className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                              >
+                                <option value="cash">Cash</option>
+                                <option value="card">Card / POS</option>
+                                <option value="mobile_money">Mobile Money</option>
+                                <option value="bank_transfer">Bank Transfer</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-[11px] font-medium text-slate-600 mb-1">Reference (optional)</label>
+                              <input
+                                type="text"
+                                value={paymentReference}
+                                onChange={(e) => setPaymentReference(e.target.value)}
+                                placeholder="POS / Txn ref"
+                                className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded font-mono"
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {visitWillAwaitPayment ? (
+                  <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-amber-900">
+                    <strong>Queue Assignment: CSH (Cashier Payment Gate)</strong> — Self-pay walk-in patient will be queued at{' '}
+                    <span className="font-mono font-semibold">CSH</span> to clear consultation payment first, then automatically advance to{' '}
+                    <span className="font-mono font-semibold">TRIAGE</span> (Vital Room).
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium text-slate-700">Assigned Queue Department:</span>
+                      <select
+                        value={visitForm.queue_department}
+                        onChange={(e) => setVisitForm({ ...visitForm, queue_department: e.target.value })}
+                        className="px-2.5 py-1 text-xs border border-slate-300 rounded bg-white font-medium"
+                      >
+                        <option value="TRIAGE">TRIAGE — Vital Room (Triage Queue)</option>
+                        <option value="OPD">OPD — Outpatient Desk</option>
+                      </select>
+                    </div>
+                    <div className="p-2.5 bg-teal-50 border border-teal-200 rounded text-teal-900">
+                      Ticket number will be generated automatically and added to{' '}
+                      <span className="font-mono font-semibold">{visitForm.queue_department}</span> (
+                      {cashierPayingUpfront
+                        ? 'Payment collected at Cashier check-in'
+                        : visitForm.triage_priority === 'emergency'
+                          ? 'Emergency Priority'
+                          : visitPatient?.patient_type === 'insurance' || visitPatient?.patient_type === 'credit'
+                            ? `${visitPatient.patient_type} credit-billed`
+                            : 'Exempt / No upfront charge'}
+                      ).
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCreateVisit(false);
+                    setVisitPatient(null);
+                  }}
+                  className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-md hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingVisit || !visitPatient}
+                  className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 disabled:opacity-50 rounded-md"
+                >
+                  {submittingVisit
+                    ? 'Creating Walk-in Visit...'
+                    : cashierPayingUpfront
+                      ? 'Collect Fee, Issue Ticket & Add to Triage'
+                      : 'Create Walk-in Visit & Invoice'}
                 </button>
               </div>
             </form>

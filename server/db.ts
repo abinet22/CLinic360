@@ -2,7 +2,9 @@ import mysql from 'mysql2/promise';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 export type DbDialect = 'mysql' | 'sqlite';
 
@@ -10,14 +12,29 @@ let mysqlPool: mysql.Pool | null = null;
 let sqliteDb: Database.Database | null = null;
 let activeDialect: DbDialect = 'sqlite';
 
+interface TxContext {
+  dialect: DbDialect;
+  mysqlConn?: mysql.PoolConnection;
+}
+
+const txStorage = new AsyncLocalStorage<TxContext>();
+let sqliteTxMutex: Promise<void> = Promise.resolve();
+
 export function getDialect(): DbDialect {
   return activeDialect;
 }
 
 export async function query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
-  if (activeDialect === 'mysql' && mysqlPool) {
-    const [rows] = await mysqlPool.query(sql, params as never);
-    return rows as T[];
+  const ctx = txStorage.getStore();
+  if (activeDialect === 'mysql') {
+    if (ctx?.mysqlConn) {
+      const [rows] = await ctx.mysqlConn.query(sql, params as never);
+      return rows as T[];
+    }
+    if (mysqlPool) {
+      const [rows] = await mysqlPool.query(sql, params as never);
+      return rows as T[];
+    }
   }
   if (!sqliteDb) throw new Error('Database not initialized');
   const stmt = sqliteDb.prepare(sql);
@@ -30,9 +47,22 @@ export async function queryOne<T = Record<string, unknown>>(sql: string, params:
 }
 
 export async function execute(sql: string, params: unknown[] = []): Promise<{ insertId: number; affectedRows: number }> {
-  if (activeDialect === 'mysql' && mysqlPool) {
-    const [result] = await mysqlPool.query(sql, params as never) as unknown as [{ insertId: number; affectedRows: number }, unknown];
-    return { insertId: Number(result.insertId || 0), affectedRows: Number(result.affectedRows || 0) };
+  const ctx = txStorage.getStore();
+  if (activeDialect === 'mysql') {
+    if (ctx?.mysqlConn) {
+      const [result] = (await ctx.mysqlConn.query(sql, params as never)) as unknown as [
+        { insertId: number; affectedRows: number },
+        unknown,
+      ];
+      return { insertId: Number(result.insertId || 0), affectedRows: Number(result.affectedRows || 0) };
+    }
+    if (mysqlPool) {
+      const [result] = (await mysqlPool.query(sql, params as never)) as unknown as [
+        { insertId: number; affectedRows: number },
+        unknown,
+      ];
+      return { insertId: Number(result.insertId || 0), affectedRows: Number(result.affectedRows || 0) };
+    }
   }
   if (!sqliteDb) throw new Error('Database not initialized');
   const stmt = sqliteDb.prepare(sql);
@@ -40,17 +70,70 @@ export async function execute(sql: string, params: unknown[] = []): Promise<{ in
   return { insertId: Number(info.lastInsertRowid || 0), affectedRows: Number(info.changes || 0) };
 }
 
-export async function nextSequence(seqKey: string): Promise<string> {
-  const row = await queryOne<{ prefix: string; current_value: number }>(
-    'SELECT prefix, current_value FROM sequences WHERE seq_key = ?',
-    [seqKey]
-  );
-  if (!row) {
-    throw new Error(`Missing sequence key: ${seqKey}`);
+export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const existing = txStorage.getStore();
+  if (existing) {
+    return fn();
   }
-  const nextVal = row.current_value + 1;
-  await execute('UPDATE sequences SET current_value = ? WHERE seq_key = ?', [nextVal, seqKey]);
-  return `${row.prefix}${String(nextVal).padStart(6, '0')}`;
+
+  if (activeDialect === 'mysql' && mysqlPool) {
+    const conn = await mysqlPool.getConnection();
+    await conn.beginTransaction();
+    try {
+      const result = await txStorage.run({ dialect: 'mysql', mysqlConn: conn }, fn);
+      await conn.commit();
+      return result;
+    } catch (err) {
+      await conn.rollback().catch(() => {});
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  if (!sqliteDb) throw new Error('Database not initialized');
+
+  let releaseMutex!: () => void;
+  const prevMutex = sqliteTxMutex;
+  sqliteTxMutex = new Promise<void>((resolve) => {
+    releaseMutex = resolve;
+  });
+
+  await prevMutex;
+  try {
+    sqliteDb.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await txStorage.run({ dialect: 'sqlite' }, fn);
+      sqliteDb.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        sqliteDb.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  } finally {
+    releaseMutex();
+  }
+}
+
+export async function nextSequence(seqKey: string): Promise<string> {
+  return withTransaction(async () => {
+    const row = await queryOne<{ prefix: string; current_value: number }>(
+      activeDialect === 'mysql'
+        ? 'SELECT prefix, current_value FROM sequences WHERE seq_key = ? FOR UPDATE'
+        : 'SELECT prefix, current_value FROM sequences WHERE seq_key = ?',
+      [seqKey]
+    );
+    if (!row) {
+      throw new Error(`Missing sequence key: ${seqKey}`);
+    }
+    const nextVal = row.current_value + 1;
+    await execute('UPDATE sequences SET current_value = ? WHERE seq_key = ?', [nextVal, seqKey]);
+    return `${row.prefix}${String(nextVal).padStart(6, '0')}`;
+  });
 }
 
 function safeAddColumn(db: Database.Database, table: string, columnDef: string) {
@@ -118,6 +201,7 @@ async function initSqliteSchema(db: Database.Database) {
       specialty TEXT NULL,
       active INTEGER NOT NULL DEFAULT 1,
       must_change_password INTEGER NOT NULL DEFAULT 0,
+      two_fa_enabled INTEGER NOT NULL DEFAULT 0,
       failed_attempts INTEGER NOT NULL DEFAULT 0,
       locked_until TEXT NULL,
       last_login_at TEXT NULL,
@@ -213,6 +297,10 @@ async function initSqliteSchema(db: Database.Database) {
       patient_id INTEGER NOT NULL,
       doctor_id INTEGER NULL,
       appointment_id INTEGER NULL,
+      visit_type TEXT NOT NULL DEFAULT 'walk_in',
+      specialty TEXT NULL,
+      consultation_invoice_id INTEGER NULL,
+      workflow_stage TEXT NOT NULL DEFAULT 'paid_awaiting_vitals',
       triage_priority TEXT NOT NULL DEFAULT 'routine',
       chief_complaint TEXT NULL,
       history_notes TEXT NULL,
@@ -270,7 +358,8 @@ async function initSqliteSchema(db: Database.Database) {
       unit TEXT NULL,
       reference_range TEXT NULL,
       price REAL NOT NULL,
-      turnaround_mins INTEGER NOT NULL DEFAULT 60
+      turnaround_mins INTEGER NOT NULL DEFAULT 60,
+      analyte_template_json TEXT NULL
     );
 
     CREATE TABLE IF NOT EXISTS imaging_catalog (
@@ -402,6 +491,7 @@ async function initSqliteSchema(db: Database.Database) {
       previous_result_value TEXT NULL,
       abnormal_flag TEXT NULL,
       result_notes TEXT NULL,
+      panel_results_json TEXT NULL,
       rejection_reason TEXT NULL,
       amend_reason TEXT NULL,
       status TEXT NOT NULL DEFAULT 'ordered',
@@ -462,7 +552,10 @@ async function initSqliteSchema(db: Database.Database) {
       frequency TEXT NOT NULL,
       duration_days INTEGER NOT NULL DEFAULT 5,
       quantity INTEGER NOT NULL,
+      selected_qty INTEGER NULL,
       dispensed_qty INTEGER NOT NULL DEFAULT 0,
+      external_qty INTEGER NOT NULL DEFAULT 0,
+      unit_price REAL NOT NULL DEFAULT 0,
       instructions TEXT NULL,
       FOREIGN KEY (prescription_id) REFERENCES prescriptions(id),
       FOREIGN KEY (medicine_id) REFERENCES medicines(id)
@@ -494,6 +587,8 @@ async function initSqliteSchema(db: Database.Database) {
       bed_id INTEGER NULL,
       admission_diagnosis TEXT NOT NULL,
       deposit_paid REAL NOT NULL DEFAULT 0,
+      bed_days_billed INTEGER NOT NULL DEFAULT 0,
+      last_bed_billed_at TEXT NULL,
       discharge_summary TEXT NULL,
       discharge_cleared INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'ordered',
@@ -515,6 +610,96 @@ async function initSqliteSchema(db: Database.Database) {
       administered_by_name TEXT NULL,
       administered_at TEXT NULL,
       FOREIGN KEY (admission_id) REFERENCES admissions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS store_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'medicine',
+      unit TEXT NOT NULL DEFAULT 'unit',
+      medicine_id INTEGER NULL,
+      reorder_level INTEGER NOT NULL DEFAULT 25,
+      unit_cost REAL NOT NULL DEFAULT 0,
+      selling_price REAL NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (medicine_id) REFERENCES medicines(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_batches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id INTEGER NOT NULL,
+      location TEXT NOT NULL DEFAULT 'main_store',
+      batch_number TEXT NOT NULL,
+      expiry_date TEXT NOT NULL,
+      qty_on_hand INTEGER NOT NULL DEFAULT 0,
+      unit_cost REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      block_reason TEXT NULL,
+      received_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (item_id) REFERENCES store_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS goods_receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      grn_number TEXT NOT NULL UNIQUE,
+      supplier_name TEXT NOT NULL,
+      invoice_ref TEXT NULL,
+      total_cost REAL NOT NULL DEFAULT 0,
+      notes TEXT NULL,
+      received_by INTEGER NOT NULL,
+      received_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS grn_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      grn_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      batch_number TEXT NOT NULL,
+      expiry_date TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      unit_cost REAL NOT NULL,
+      FOREIGN KEY (grn_id) REFERENCES goods_receipts(id),
+      FOREIGN KEY (item_id) REFERENCES store_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_requisitions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      req_number TEXT NOT NULL UNIQUE,
+      from_location TEXT NOT NULL DEFAULT 'main_store',
+      to_location TEXT NOT NULL DEFAULT 'dispensary',
+      status TEXT NOT NULL DEFAULT 'pending',
+      notes TEXT NULL,
+      requested_by INTEGER NOT NULL,
+      issued_by INTEGER NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      issued_at TEXT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_requisition_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      requisition_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      requested_qty INTEGER NOT NULL,
+      issued_qty INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (requisition_id) REFERENCES stock_requisitions(id),
+      FOREIGN KEY (item_id) REFERENCES store_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS patient_deposits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      deposit_number TEXT NOT NULL UNIQUE,
+      patient_id INTEGER NOT NULL,
+      admission_id INTEGER NULL,
+      shift_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      remaining_amount REAL NOT NULL,
+      payment_method TEXT NOT NULL DEFAULT 'cash',
+      reference_number TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      collected_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (patient_id) REFERENCES patients(id)
     );
 
     CREATE TABLE IF NOT EXISTS notifications (
@@ -548,6 +733,215 @@ async function initSqliteSchema(db: Database.Database) {
       prev_hash TEXT NOT NULL,
       row_hash TEXT NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS idx_patients_status ON patients(status);
+    CREATE INDEX IF NOT EXISTS idx_appt_doc_date ON appointments(doctor_id, appointment_date);
+    CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id);
+    CREATE INDEX IF NOT EXISTS idx_visits_patient_status ON visits(patient_id, status);
+    CREATE INDEX IF NOT EXISTS idx_invoices_patient_status ON invoices(patient_id, status);
+    CREATE INDEX IF NOT EXISTS idx_payments_invoice_shift ON payments(invoice_id, shift_id);
+    CREATE INDEX IF NOT EXISTS idx_lab_orders_visit_status ON lab_orders(visit_id, status);
+    CREATE INDEX IF NOT EXISTS idx_imaging_orders_visit_status ON imaging_orders(visit_id, status);
+    CREATE INDEX IF NOT EXISTS idx_prescriptions_visit_status ON prescriptions(visit_id, status);
+    CREATE INDEX IF NOT EXISTS idx_admissions_patient_status ON admissions(patient_id, status);
+    CREATE INDEX IF NOT EXISTS idx_batches_fefo ON stock_batches(item_id, location, status, expiry_date);
+    CREATE INDEX IF NOT EXISTS idx_deposits_patient ON patient_deposits(patient_id, status);
+    CREATE INDEX IF NOT EXISTS idx_notif_role_read ON notifications(target_role, is_read);
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_patient ON audit_logs(patient_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_occurred ON audit_logs(occurred_at);
+
+    CREATE TABLE IF NOT EXISTS doctor_blocks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doctor_id INTEGER NOT NULL,
+      block_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      block_type TEXT NOT NULL DEFAULT 'unavailable',
+      reason TEXT NULL,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (doctor_id) REFERENCES users(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_doc_blocks_date ON doctor_blocks(doctor_id, block_date);
+
+    CREATE TABLE IF NOT EXISTS nursing_procedures (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      visit_id INTEGER NOT NULL,
+      patient_id INTEGER NOT NULL,
+      service_id INTEGER NOT NULL,
+      service_code TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      invoice_id INTEGER NULL,
+      ordered_by INTEGER NOT NULL,
+      performed_by INTEGER NULL,
+      notes TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'ordered',
+      performed_at TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (visit_id) REFERENCES visits(id),
+      FOREIGN KEY (patient_id) REFERENCES patients(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS imaging_attachments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      imaging_order_id INTEGER NOT NULL,
+      file_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      data_url TEXT NOT NULL,
+      caption TEXT NULL,
+      uploaded_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (imaging_order_id) REFERENCES imaging_orders(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS chart_of_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      account_type TEXT NOT NULL,
+      normal_balance TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS journal_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entry_number TEXT NOT NULL UNIQUE,
+      entry_date TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source_id INTEGER NULL,
+      description TEXT NOT NULL,
+      total_debit REAL NOT NULL,
+      total_credit REAL NOT NULL,
+      posted_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_je_date_source ON journal_entries(entry_date, source_type);
+
+    CREATE TABLE IF NOT EXISTS journal_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      entry_id INTEGER NOT NULL,
+      account_id INTEGER NOT NULL,
+      debit REAL NOT NULL DEFAULT 0,
+      credit REAL NOT NULL DEFAULT 0,
+      memo TEXT NULL,
+      FOREIGN KEY (entry_id) REFERENCES journal_entries(id),
+      FOREIGN KEY (account_id) REFERENCES chart_of_accounts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS supplier_bills (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bill_number TEXT NOT NULL UNIQUE,
+      grn_id INTEGER NULL,
+      supplier_name TEXT NOT NULL,
+      invoice_ref TEXT NULL,
+      bill_date TEXT NOT NULL,
+      due_date TEXT NOT NULL,
+      total_amount REAL NOT NULL,
+      paid_amount REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'open',
+      notes TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS expense_vouchers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      voucher_number TEXT NOT NULL UNIQUE,
+      expense_date TEXT NOT NULL,
+      category TEXT NOT NULL,
+      account_id INTEGER NOT NULL,
+      payee_name TEXT NOT NULL,
+      amount REAL NOT NULL,
+      payment_method TEXT NOT NULL DEFAULT 'bank_transfer',
+      description TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_by INTEGER NOT NULL,
+      approved_by INTEGER NULL,
+      paid_at TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (account_id) REFERENCES chart_of_accounts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS insurance_claims (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      claim_number TEXT NOT NULL UNIQUE,
+      payer_name TEXT NOT NULL,
+      invoice_id INTEGER NOT NULL,
+      patient_id INTEGER NOT NULL,
+      billed_amount REAL NOT NULL,
+      settled_amount REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      submitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+      settled_at TEXT NULL,
+      notes TEXT NULL,
+      FOREIGN KEY (invoice_id) REFERENCES invoices(id),
+      FOREIGN KEY (patient_id) REFERENCES patients(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS staff_contracts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL UNIQUE,
+      employee_code TEXT NOT NULL UNIQUE,
+      department_name TEXT NOT NULL,
+      contract_type TEXT NOT NULL DEFAULT 'full_time',
+      base_salary REAL NOT NULL DEFAULT 0,
+      housing_allowance REAL NOT NULL DEFAULT 0,
+      licence_number TEXT NULL,
+      licence_expiry TEXT NULL,
+      contract_start TEXT NOT NULL,
+      contract_end TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS leave_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      leave_type TEXT NOT NULL DEFAULT 'annual',
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      days_count INTEGER NOT NULL DEFAULT 1,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      decided_by INTEGER NULL,
+      decided_at TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS payroll_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_number TEXT NOT NULL UNIQUE,
+      pay_month TEXT NOT NULL,
+      total_gross REAL NOT NULL DEFAULT 0,
+      total_deductions REAL NOT NULL DEFAULT 0,
+      total_net REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'draft',
+      journal_entry_id INTEGER NULL,
+      created_by INTEGER NOT NULL,
+      posted_at TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS payroll_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payroll_run_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      staff_name TEXT NOT NULL,
+      role_code TEXT NOT NULL,
+      base_salary REAL NOT NULL,
+      allowances REAL NOT NULL,
+      tax_deduction REAL NOT NULL,
+      net_pay REAL NOT NULL,
+      FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_invoices_patient ON invoices(patient_id, status);
+    CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id, workflow_stage);
+    CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_queue_dept_status ON queue_tickets(department, status);
   `);
 
   // Safe migrations for pre-existing clinic360.db files
@@ -558,6 +952,18 @@ async function initSqliteSchema(db: Database.Database) {
   safeAddColumn(db, 'lab_orders', 'amend_reason TEXT NULL');
   safeAddColumn(db, 'lab_orders', 'critical_ack_by INTEGER NULL');
   safeAddColumn(db, 'lab_orders', 'critical_ack_at TEXT NULL');
+  safeAddColumn(db, 'lab_orders', 'panel_results_json TEXT NULL');
+  safeAddColumn(db, 'lab_tests', 'analyte_template_json TEXT NULL');
+  safeAddColumn(db, 'admissions', 'bed_days_billed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'admissions', 'last_bed_billed_at TEXT NULL');
+  safeAddColumn(db, 'users', 'two_fa_enabled INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'visits', "visit_type TEXT NOT NULL DEFAULT 'walk_in'");
+  safeAddColumn(db, 'visits', 'specialty TEXT NULL');
+  safeAddColumn(db, 'visits', 'consultation_invoice_id INTEGER NULL');
+  safeAddColumn(db, 'visits', "workflow_stage TEXT NOT NULL DEFAULT 'paid_awaiting_vitals'");
+  safeAddColumn(db, 'prescription_items', 'selected_qty INTEGER NULL');
+  safeAddColumn(db, 'prescription_items', 'external_qty INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'prescription_items', 'unit_price REAL NOT NULL DEFAULT 0');
 }
 
 async function ensureExtraPermissionsAndSeeds() {
@@ -572,8 +978,23 @@ async function ensureExtraPermissionsAndSeeds() {
     ['ipd.mar.give', 'Inpatient', 'Administer scheduled inpatient medications (MAR)'],
     ['ipd.discharge.create', 'Inpatient', 'Write discharge summary and order discharge'],
     ['ipd.discharge.clear', 'Inpatient', 'Clear final inpatient bill for discharge'],
+    ['ipd.bed.bill', 'Inpatient', 'Post daily ward bed charges to inpatient statement'],
     ['billing.shift.reconcile', 'Finance', 'Reconcile closed cashier shifts'],
+    ['billing.deposit.create', 'Cashier', 'Collect and apply patient advance deposits'],
+    ['store.item.read', 'Store', 'View main store, sub-store batches, and expiry alerts'],
+    ['store.grn.create', 'Store', 'Receive supplier stock via Goods Received Note (GRN)'],
+    ['store.requisition.create', 'Store', 'Submit internal stock requisitions to Main Store'],
+    ['store.requisition.issue', 'Store', 'Issue stock from Main Store to departments using FEFO'],
+    ['store.expiry.manage', 'Store', 'Quarantine or block expired/damaged stock batches'],
     ['audit.trace', 'Audit', 'Run end-to-end patient and user audit traces'],
+    ['accounting.ledger.manage', 'Finance', 'Post journal entries, manage supplier AP, AR claims, and expense vouchers'],
+    ['accounting.expense.create', 'Finance', 'Record operational expense vouchers and post to general ledger'],
+    ['nursing.procedure.perform', 'Triage', 'Order and perform billable OPD nursing procedures'],
+    ['hr.manage', 'HR', 'Manage staff contracts, licence expiry alerts, leave approvals, and payroll'],
+    ['hr.leave.request', 'HR', 'Submit personal staff leave request'],
+    ['appointment.block.manage', 'Appointments', 'Manage clinician availability and leave blocks'],
+    ['payment.gate.bypass', 'Cashier', 'Emergency bypass of self-pay payment gates with audit reason'],
+    ['billing.receipt.print', 'Cashier', 'View and reprint official payment receipts'],
   ];
 
   for (const [code, module, description] of extraPerms) {
@@ -584,15 +1005,20 @@ async function ensureExtraPermissionsAndSeeds() {
   }
 
   const extraRoleBindings: Record<string, string[]> = {
-    DOC: ['order.imaging.create', 'imaging.order.read', 'ipd.admission.read', 'ipd.admission.create', 'ipd.discharge.create'],
-    WRD: ['ipd.admission.read', 'ipd.bed.assign', 'ipd.mar.give', 'imaging.order.read'],
-    IMG: ['imaging.order.read', 'imaging.exam.perform', 'imaging.report.finalise'],
-    REC: ['ipd.admission.read'],
-    CSH: ['ipd.admission.read', 'ipd.discharge.clear'],
-    NUR: ['imaging.order.read'],
-    ACC: ['billing.shift.reconcile', 'ipd.admission.read'],
-    MGR: ['imaging.order.read', 'ipd.admission.read', 'audit.trace'],
-    AUD: ['imaging.order.read', 'ipd.admission.read', 'audit.trace'],
+    DOC: ['order.imaging.create', 'imaging.order.read', 'ipd.admission.read', 'ipd.admission.create', 'ipd.discharge.create', 'nursing.procedure.perform', 'appointment.block.manage', 'hr.leave.request', 'payment.gate.bypass'],
+    WRD: ['ipd.admission.read', 'ipd.bed.assign', 'ipd.mar.give', 'ipd.bed.bill', 'imaging.order.read', 'store.item.read', 'store.requisition.create', 'hr.leave.request'],
+    IMG: ['imaging.order.read', 'imaging.exam.perform', 'imaging.report.finalise', 'hr.leave.request'],
+    REC: ['ipd.admission.read', 'appointment.block.manage', 'billing.invoice.create', 'hr.leave.request'],
+    CSH: ['patient.create', 'patient.update', 'visit.create', 'visit.read', 'queue.manage', 'appointment.read', 'appointment.update', 'ipd.admission.read', 'ipd.discharge.clear', 'ipd.bed.bill', 'billing.deposit.create', 'billing.receipt.print', 'hr.leave.request'],
+    NUR: ['imaging.order.read', 'nursing.procedure.perform', 'hr.leave.request'],
+    PHA: ['store.item.read', 'store.requisition.create', 'hr.leave.request'],
+    LAB: ['store.item.read', 'store.requisition.create', 'hr.leave.request'],
+    STO: ['store.item.read', 'store.grn.create', 'store.requisition.create', 'store.requisition.issue', 'store.expiry.manage', 'hr.leave.request'],
+    ACC: ['billing.shift.reconcile', 'ipd.admission.read', 'ipd.bed.bill', 'store.item.read', 'accounting.ledger.manage', 'accounting.expense.create', 'billing.receipt.print', 'hr.leave.request'],
+    MGR: ['imaging.order.read', 'ipd.admission.read', 'store.item.read', 'audit.trace', 'accounting.ledger.manage', 'accounting.expense.create', 'hr.manage', 'appointment.block.manage', 'payment.gate.bypass', 'billing.receipt.print', 'hr.leave.request'],
+    HRO: ['hr.manage', 'appointment.block.manage', 'hr.leave.request'],
+    ADM: ['accounting.expense.create', 'hr.leave.request'],
+    AUD: ['imaging.order.read', 'ipd.admission.read', 'store.item.read', 'audit.trace', 'hr.leave.request'],
   };
 
   for (const [roleCode, permCodes] of Object.entries(extraRoleBindings)) {
@@ -615,18 +1041,43 @@ async function ensureExtraPermissionsAndSeeds() {
     }
   }
 
-  // Ensure ADM sequence for IPD exists
-  const admSeq = await queryOne('SELECT seq_key FROM sequences WHERE seq_key = ?', ['ADM']);
-  if (!admSeq) {
-    await execute('INSERT INTO sequences (seq_key, prefix, current_value) VALUES (?, ?, ?)', ['ADM', 'ADM-26-', 10]);
+  // Enforce least-privilege cleanup on existing DBs: remove HRO user-admin escalation and REC full invoice read
+  await execute(
+    `DELETE FROM role_permissions
+     WHERE role_id = (SELECT id FROM roles WHERE code = 'HRO')
+       AND permission_id = (SELECT id FROM permissions WHERE code = 'admin.user.manage')`
+  );
+  await execute(
+    `DELETE FROM role_permissions
+     WHERE role_id = (SELECT id FROM roles WHERE code = 'REC')
+       AND permission_id = (SELECT id FROM permissions WHERE code = 'billing.invoice.read')`
+  );
+
+  const extraSeqs: Array<[string, string, number]> = [
+    ['ADM', 'ADM-26-', 10],
+    ['GRN', 'GRN-26-', 10],
+    ['REQ', 'REQ-26-', 10],
+    ['DEP', 'DEP-26-', 10],
+    ['JE', 'JE-26-', 10],
+    ['AP', 'AP-26-', 10],
+    ['EXP', 'EXP-26-', 10],
+    ['CLM', 'CLM-26-', 10],
+    ['PAY', 'PAY-26-', 10],
+  ];
+  for (const [seqKey, prefix, curVal] of extraSeqs) {
+    const seqRow = await queryOne('SELECT seq_key FROM sequences WHERE seq_key = ?', [seqKey]);
+    if (!seqRow) {
+      await execute('INSERT INTO sequences (seq_key, prefix, current_value) VALUES (?, ?, ?)', [seqKey, prefix, curVal]);
+    }
   }
 
-  // Ensure WRD and IMG demo accounts exist
   const demoPasswordHash = await bcrypt.hash('Clinic360!', 10);
   const newUsers = [
     { name: 'Grace Okonkwo, RN', email: 'wrd@clinic360.local', role: 'WRD', specialty: 'Medical & Surgical Wards' },
     { name: 'Dr. Kenji Sato', email: 'img@clinic360.local', role: 'IMG', specialty: 'Diagnostic Radiology' },
     { name: 'Dr. Leyla Farah (Lead Lab)', email: 'lab2@clinic360.local', role: 'LAB', specialty: 'Senior Lab Verifier' },
+    { name: 'Samuel Osei', email: 'sto@clinic360.local', role: 'STO', specialty: 'Central Medical Store & Cold Chain' },
+    { name: 'Elena Rostova', email: 'hro@clinic360.local', role: 'HRO', specialty: 'People Operations & Medical Credentialing' },
   ];
   for (const nu of newUsers) {
     const existing = await queryOne<{ id: number }>('SELECT id FROM users WHERE email = ?', [nu.email]);
@@ -641,6 +1092,16 @@ async function ensureExtraPermissionsAndSeeds() {
       }
     }
   }
+
+  // Enforce 2FA flag on ADM, ACC, MGR users
+  await execute(
+    `UPDATE users SET two_fa_enabled = 1
+     WHERE id IN (
+       SELECT ur.user_id FROM user_roles ur
+       INNER JOIN roles r ON r.id = ur.role_id
+       WHERE r.code IN ('ADM', 'ACC', 'MGR')
+     )`
+  );
 
   // Seed Imaging Catalog
   const imgCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM imaging_catalog');
@@ -738,6 +1199,367 @@ async function ensureExtraPermissionsAndSeeds() {
     await execute(
       "INSERT INTO notifications (target_role, title, message, severity, entity_type) VALUES ('WRD', 'Inpatient Medication Due', 'Evelyn Chen (GEN-101) has Lisinopril 10mg due at 20:00.', 'info', 'admission')"
     );
+  }
+
+  // Seed Store Items, Multi-Batch FEFO stock, GRN & Requisition if empty
+  const storeCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM store_items');
+  if (Number(storeCount?.cnt || 0) === 0) {
+    const meds = await query<{
+      id: number;
+      code: string;
+      generic_name: string;
+      strength: string;
+      form: string;
+      unit_price: number;
+      stock_qty: number;
+      reorder_level: number;
+      batch_number: string;
+      expiry_date: string;
+    }>('SELECT * FROM medicines ORDER BY id ASC');
+
+    const nearExpiry20d = new Date(Date.now() + 20 * 86400000).toISOString().slice(0, 10);
+    const expiry75d = new Date(Date.now() + 75 * 86400000).toISOString().slice(0, 10);
+    const expired10d = new Date(Date.now() - 10 * 86400000).toISOString().slice(0, 10);
+
+    const itemByCode: Record<string, number> = {};
+    for (const m of meds) {
+      const itemRes = await execute(
+        'INSERT INTO store_items (code, name, category, unit, medicine_id, reorder_level, unit_cost, selling_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [m.code, `${m.generic_name} ${m.strength}`, 'medicine', m.form, m.id, m.reorder_level, Number((m.unit_price * 0.55).toFixed(2)), m.unit_price]
+      );
+      itemByCode[m.code] = itemRes.insertId;
+
+      // Dispensary batch matching existing medicine stock
+      await execute(
+        'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [itemRes.insertId, 'dispensary', m.batch_number, m.expiry_date, m.stock_qty, Number((m.unit_price * 0.55).toFixed(2)), 'active']
+      );
+
+      // Additional Main Store reserve batches for FEFO replenishment
+      await execute(
+        'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [itemRes.insertId, 'main_store', `${m.batch_number}-MS1`, expiry75d, 250, Number((m.unit_price * 0.52).toFixed(2)), 'active']
+      );
+    }
+
+    // Add a near-expiry batch in Dispensary for Azithromycin (so FEFO picks it first!) and an expired batch in Main Store for quarantine demo
+    if (itemByCode['MED-AZIT']) {
+      await execute(
+        'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [itemByCode['MED-AZIT'], 'dispensary', 'BCH-AZIT-FEFO', nearExpiry20d, 12, 11.5, 'active']
+      );
+      await execute('UPDATE medicines SET stock_qty = stock_qty + 12, batch_number = ?, expiry_date = ? WHERE code = ?', [
+        'BCH-AZIT-FEFO',
+        nearExpiry20d,
+        'MED-AZIT',
+      ]);
+    }
+    if (itemByCode['MED-PARA']) {
+      await execute(
+        'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [itemByCode['MED-PARA'], 'main_store', 'BCH-OLD-EXP', expired10d, 40, 2.1, 'active']
+      );
+    }
+
+    // Lab & Clinical consumables
+    const consumables: Array<[string, string, string, string, number, number, number, string, string]> = [
+      ['LAB-EDTA', 'EDTA Blood Tubes (100s)', 'reagent', 'Box', 10, 18.0, 0, 'LOT-LAB-901', '2027-06-30'],
+      ['LAB-CBC-RG', 'Hematology Analyzer Lyse Reagent', 'reagent', 'Bottle', 5, 95.0, 0, 'LOT-HEM-44', expiry75d],
+      ['CON-GLOV', 'Nitrile Exam Gloves (M, 100s)', 'consumable', 'Box', 30, 8.5, 0, 'LOT-GLV-21', '2028-01-15'],
+      ['CON-SYR5', 'Sterile 5ml Syringes (100s)', 'consumable', 'Box', 20, 11.0, 0, 'LOT-SYR-18', '2028-04-30'],
+    ];
+    for (const [code, name, cat, unit, reorder, cost, sell, batch, exp] of consumables) {
+      const res = await execute(
+        'INSERT INTO store_items (code, name, category, unit, reorder_level, unit_cost, selling_price) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [code, name, cat, unit, reorder, cost, sell]
+      );
+      await execute(
+        'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [res.insertId, cat === 'reagent' ? 'lab' : 'main_store', batch, exp, 45, cost, 'active']
+      );
+      if (cat === 'reagent') {
+        await execute(
+          'INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [res.insertId, 'main_store', `${batch}-RES`, '2028-03-01', 60, cost, 'active']
+        );
+      }
+    }
+
+    const stoUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'sto@clinic360.local'");
+    const phaUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'pha@clinic360.local'");
+    if (stoUser) {
+      const grnRes = await execute(
+        "INSERT INTO goods_receipts (grn_number, supplier_name, invoice_ref, total_cost, notes, received_by) VALUES ('GRN-26-000010', 'MedSupply East Africa Ltd', 'SUP-INV-7741', 1480.00, 'Initial central warehouse replenishment', ?)",
+        [stoUser.id]
+      );
+      if (itemByCode['MED-AMOX']) {
+        await execute(
+          'INSERT INTO grn_items (grn_id, item_id, batch_number, expiry_date, quantity, unit_cost) VALUES (?, ?, ?, ?, 250, 6.88)',
+          [grnRes.insertId, itemByCode['MED-AMOX'], 'BCH-2604A-MS1', expiry75d]
+        );
+      }
+    }
+    if (phaUser && itemByCode['MED-AZIT']) {
+      const reqRes = await execute(
+        "INSERT INTO stock_requisitions (req_number, from_location, to_location, status, notes, requested_by) VALUES ('REQ-26-000010', 'main_store', 'dispensary', 'pending', 'Weekly dispensary Azithromycin replenishment', ?)",
+        [phaUser.id]
+      );
+      await execute(
+        'INSERT INTO stock_requisition_items (requisition_id, item_id, requested_qty, issued_qty) VALUES (?, ?, 60, 0)',
+        [reqRes.insertId, itemByCode['MED-AZIT']]
+      );
+    }
+  }
+
+  // Seed initial IPD advance deposit for Evelyn Chen if none exist
+  const depCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM patient_deposits');
+  if (Number(depCount?.cnt || 0) === 0) {
+    const evelynAdm = await queryOne<{ id: number; patient_id: number; deposit_paid: number }>(
+      "SELECT id, patient_id, deposit_paid FROM admissions WHERE admission_number = 'ADM-26-000010'"
+    );
+    const cshUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'csh@clinic360.local'");
+    const shiftRow = await queryOne<{ id: number }>('SELECT id FROM cashier_shifts ORDER BY id ASC LIMIT 1');
+    if (evelynAdm && cshUser && shiftRow) {
+      const depAmt = Number(evelynAdm.deposit_paid || 250);
+      await execute(
+        `INSERT INTO patient_deposits (deposit_number, patient_id, admission_id, shift_id, amount, remaining_amount, payment_method, reference_number, status, collected_by)
+         VALUES ('DEP-26-000010', ?, ?, ?, ?, ?, 'cash', 'IPD-ADV-10', 'active', ?)`,
+        [evelynAdm.patient_id, evelynAdm.id, shiftRow.id, depAmt, depAmt, cshUser.id]
+      );
+    }
+  }
+
+  // Seed multi-analyte panel templates on LAB-CBC, LAB-BMP, LAB-LFT
+  const panelTemplates: Record<string, Array<{ code: string; name: string; unit: string; refRange: string }>> = {
+    'LAB-CBC': [
+      { code: 'WBC', name: 'White Blood Cell Count', unit: '10^9/L', refRange: '4.0 - 11.0' },
+      { code: 'HGB', name: 'Hemoglobin', unit: 'g/dL', refRange: '12.0 - 17.5' },
+      { code: 'PLT', name: 'Platelets', unit: '10^9/L', refRange: '150 - 400' },
+      { code: 'NEUT', name: 'Neutrophils', unit: '%', refRange: '40 - 75' },
+    ],
+    'LAB-BMP': [
+      { code: 'GLU', name: 'Fasting Glucose', unit: 'mmol/L', refRange: '3.9 - 5.5' },
+      { code: 'NA', name: 'Sodium (Na+)', unit: 'mmol/L', refRange: '135 - 145' },
+      { code: 'K', name: 'Potassium (K+)', unit: 'mmol/L', refRange: '3.5 - 5.0' },
+      { code: 'CREA', name: 'Serum Creatinine', unit: 'mg/dL', refRange: '0.6 - 1.3' },
+    ],
+    'LAB-LFT': [
+      { code: 'ALT', name: 'Alanine Aminotransferase (ALT)', unit: 'U/L', refRange: '7 - 56' },
+      { code: 'AST', name: 'Aspartate Aminotransferase (AST)', unit: 'U/L', refRange: '10 - 40' },
+      { code: 'ALP', name: 'Alkaline Phosphatase (ALP)', unit: 'U/L', refRange: '44 - 147' },
+      { code: 'TBIL', name: 'Total Bilirubin', unit: 'mg/dL', refRange: '0.1 - 1.2' },
+    ],
+  };
+  for (const [code, tmpl] of Object.entries(panelTemplates)) {
+    await execute('UPDATE lab_tests SET analyte_template_json = ? WHERE code = ? AND analyte_template_json IS NULL', [
+      JSON.stringify(tmpl),
+      code,
+    ]);
+  }
+
+  const nursingSeeds: Array<[string, string, string, number]> = [
+    ['NUR-INJ', 'Intramuscular Injection & Dressing', 'procedure', 18.0],
+    ['NUR-NEB', 'Nebulization Therapy', 'procedure', 22.0],
+    ['CON-GEN', 'General Medicine Consultation', 'consultation', 45.0],
+    ['CON-PED', 'Pediatrics Consultation', 'consultation', 55.0],
+    ['CON-GYN', 'Gynecology Consultation', 'consultation', 65.0],
+    ['CON-DERM', 'Dermatology Consultation', 'consultation', 60.0],
+  ];
+  for (const [code, name, cat, price] of nursingSeeds) {
+    const exists = await queryOne<{ id: number }>('SELECT id FROM services WHERE code = ?', [code]);
+    if (!exists) {
+      await execute('INSERT INTO services (code, name, category, unit_price) VALUES (?, ?, ?, ?)', [code, name, cat, price]);
+    }
+  }
+
+  // Seed sample doctor availability block (tomorrow afternoon surgery/leave block for Dr. Bekele)
+  const blockCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM doctor_blocks');
+  if (Number(blockCount?.cnt || 0) === 0) {
+    const doc2 = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'doc2@clinic360.local'");
+    const admUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'adm@clinic360.local'");
+    const todayStr = new Date().toISOString().slice(0, 10);
+    if (doc2 && admUser) {
+      await execute(
+        `INSERT INTO doctor_blocks (doctor_id, block_date, start_time, end_time, block_type, reason, created_by)
+         VALUES (?, ?, '14:00', '16:30', 'off_duty', 'Pediatric ward rounds & CME conference', ?)`,
+        [doc2.id, todayStr, admUser.id]
+      );
+    }
+  }
+
+  // Seed sample vector Chest X-Ray schematic attachment for imaging order #1 if none exist
+  const imgAttCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM imaging_attachments');
+  if (Number(imgAttCount?.cnt || 0) === 0) {
+    const imgOrd = await queryOne<{ id: number }>('SELECT id FROM imaging_orders ORDER BY id ASC LIMIT 1');
+    const imgUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'img@clinic360.local'");
+    if (imgOrd && imgUser) {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 320" width="400" height="320"><rect width="400" height="320" fill="#0f172a"/><ellipse cx="145" cy="155" rx="58" ry="96" fill="#1e293b" stroke="#64748b" stroke-width="2"/><ellipse cx="255" cy="155" rx="58" ry="96" fill="#1e293b" stroke="#64748b" stroke-width="2"/><rect x="192" y="38" width="16" height="240" rx="6" fill="#94a3b8" opacity="0.55"/><path d="M100 100 Q200 72 300 100 M95 130 Q200 104 305 130 M95 162 Q200 138 305 162 M100 194 Q200 172 300 194" stroke="#cbd5e1" stroke-width="2.5" fill="none" opacity="0.45"/><circle cx="132" cy="195" r="22" fill="#e2e8f0" opacity="0.22"/><text x="16" y="24" fill="#94a3b8" font-family="monospace" font-size="11">PA CHEST · CLINIC360 PACS PREVIEW</text><text x="16" y="304" fill="#64748b" font-family="monospace" font-size="10">R                                    L</text></svg>`;
+      const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+      await execute(
+        'INSERT INTO imaging_attachments (imaging_order_id, file_name, mime_type, data_url, caption, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)',
+        [imgOrd.id, 'cxr_pa_baseline_preview.svg', 'image/svg+xml', dataUrl, 'PA Chest Radiograph Reference Study', imgUser.id]
+      );
+    }
+  }
+
+  // Seed Chart of Accounts & initial Accounting Ledger (ACC)
+  const extraCoa: Array<[string, string, string, string]> = [
+    ['5300', 'Medical Equipment Maintenance & Repairs', 'expense', 'debit'],
+    ['5400', 'Office, IT & Operational Admin Expense', 'expense', 'debit'],
+  ];
+  const coaCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM chart_of_accounts');
+  if (Number(coaCount?.cnt || 0) > 0) {
+    for (const [code, name, type, normal] of extraCoa) {
+      const exists = await queryOne<{ id: number }>('SELECT id FROM chart_of_accounts WHERE code = ?', [code]);
+      if (!exists) {
+        await execute(
+          'INSERT INTO chart_of_accounts (code, name, account_type, normal_balance) VALUES (?, ?, ?, ?)',
+          [code, name, type, normal]
+        );
+      }
+    }
+  }
+  if (Number(coaCount?.cnt || 0) === 0) {
+    const accounts: Array<[string, string, string, string]> = [
+      ['1010', 'Cash on Hand & Till Drawer', 'asset', 'debit'],
+      ['1020', 'Operating Bank & Card Settlement', 'asset', 'debit'],
+      ['1100', 'Insurance & Corporate Accounts Receivable', 'asset', 'debit'],
+      ['1200', 'Medical Store & Pharmacy Inventory', 'asset', 'debit'],
+      ['2010', 'Patient Advance Deposits Liability', 'liability', 'credit'],
+      ['2100', 'Supplier Accounts Payable', 'liability', 'credit'],
+      ['2200', 'Payroll & Statutory Payables', 'liability', 'credit'],
+      ['4010', 'Consultation & OPD Revenue', 'revenue', 'credit'],
+      ['4020', 'Laboratory & Diagnostic Imaging Revenue', 'revenue', 'credit'],
+      ['4030', 'Dispensary Pharmacy Sales Revenue', 'revenue', 'credit'],
+      ['4040', 'Inpatient Ward & Nursing Procedures Revenue', 'revenue', 'credit'],
+      ['5010', 'Cost of Medical Supplies & Drugs', 'expense', 'debit'],
+      ['5100', 'Staff Salaries & Benefits Expense', 'expense', 'debit'],
+      ['5200', 'Clinic Utilities, Maintenance & Admin Expense', 'expense', 'debit'],
+      ['5300', 'Medical Equipment Maintenance & Repairs', 'expense', 'debit'],
+      ['5400', 'Office, IT & Operational Admin Expense', 'expense', 'debit'],
+    ];
+    for (const [code, name, type, normal] of accounts) {
+      await execute(
+        'INSERT INTO chart_of_accounts (code, name, account_type, normal_balance) VALUES (?, ?, ?, ?)',
+        [code, name, type, normal]
+      );
+    }
+
+    const coaByCode: Record<string, number> = {};
+    const coaRows = await query<{ id: number; code: string }>('SELECT id, code FROM chart_of_accounts');
+    for (const r of coaRows) coaByCode[r.code] = r.id;
+
+    const accUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'acc@clinic360.local'");
+    const cshUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'csh@clinic360.local'");
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const due30 = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+
+    if (accUser) {
+      // Seed JE-26-000009 (cash consultation INV-26-000099) & JE-26-000010 (GRN-26-000010 Inventory/AP)
+      const je1 = await execute(
+        `INSERT INTO journal_entries (entry_number, entry_date, source_type, source_id, description, total_debit, total_credit, posted_by)
+         VALUES ('JE-26-000009', ?, 'cashier_payment', 1, 'Cash collection INV-26-000099 (OPD Consultation)', 45.00, 45.00, ?)`,
+        [todayStr, cshUser?.id || accUser.id]
+      );
+      await execute('INSERT INTO journal_lines (entry_id, account_id, debit, credit, memo) VALUES (?, ?, 45.00, 0, ?)', [
+        je1.insertId, coaByCode['1010'], 'Cash drawer receipt RCP-26-000099'
+      ]);
+      await execute('INSERT INTO journal_lines (entry_id, account_id, debit, credit, memo) VALUES (?, ?, 0, 45.00, ?)', [
+        je1.insertId, coaByCode['4010'], 'OPD consultation fee earned'
+      ]);
+
+      const grnRow = await queryOne<{ id: number; total_cost: number }>("SELECT id, total_cost FROM goods_receipts WHERE grn_number = 'GRN-26-000010'");
+      if (grnRow) {
+        const je2 = await execute(
+          `INSERT INTO journal_entries (entry_number, entry_date, source_type, source_id, description, total_debit, total_credit, posted_by)
+           VALUES ('JE-26-000010', ?, 'grn_receipt', ?, 'GRN-26-000010 stock receipt from MedSupply East Africa Ltd', ?, ?, ?)`,
+          [todayStr, grnRow.id, grnRow.total_cost, grnRow.total_cost, accUser.id]
+        );
+        await execute('INSERT INTO journal_lines (entry_id, account_id, debit, credit, memo) VALUES (?, ?, ?, 0, ?)', [
+          je2.insertId, coaByCode['1200'], grnRow.total_cost, 'Medical inventory received into Main Store'
+        ]);
+        await execute('INSERT INTO journal_lines (entry_id, account_id, debit, credit, memo) VALUES (?, ?, 0, ?, ?)', [
+          je2.insertId, coaByCode['2100'], grnRow.total_cost, 'Supplier payable SUP-INV-7741'
+        ]);
+
+        await execute(
+          `INSERT INTO supplier_bills (bill_number, grn_id, supplier_name, invoice_ref, bill_date, due_date, total_amount, paid_amount, status, notes)
+           VALUES ('AP-26-000010', ?, 'MedSupply East Africa Ltd', 'SUP-INV-7741', ?, ?, ?, 0.00, 'open', 'Net-30 warehouse replenishment invoice')`,
+          [grnRow.id, todayStr, due30, grnRow.total_cost]
+        );
+      }
+
+      // Seed 1 pending Expense Voucher
+      await execute(
+        `INSERT INTO expense_vouchers (voucher_number, expense_date, category, account_id, payee_name, amount, payment_method, description, status, requested_by)
+         VALUES ('EXP-26-000010', ?, 'Utilities & Power', ?, 'City Power & Water Utility', 320.00, 'bank_transfer', 'Monthly clinic electricity & medical cold-chain generator fuel', 'pending', ?)`,
+        [todayStr, coaByCode['5200'], accUser.id]
+      );
+
+      // Seed 1 Insurance Credit Invoice + Insurance Claim AR (submitted 38 days ago to show ageing buckets!)
+      const marcus = await queryOne<{ id: number; payer_name: string | null }>("SELECT id, payer_name FROM patients WHERE mrn = 'C360-000097'");
+      if (marcus) {
+        const invIns = await execute(
+          `INSERT INTO invoices (invoice_number, patient_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
+           VALUES ('INV-26-000098', ?, 'insurance', ?, 140.00, 0.00, 140.00, 0.00, 'credit_billed', 'Aetna Health Plan outpatient specialist & echo claim', ?)`,
+          [marcus.id, marcus.payer_name || 'Aetna Health Plan', accUser.id]
+        );
+        await execute(
+          'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, 140.00, 140.00)',
+          [invIns.insertId, 'IMG-ECHO', 'Transthoracic Echocardiogram', 'imaging']
+        );
+        const daysAgo38 = new Date(Date.now() - 38 * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+        await execute(
+          `INSERT INTO insurance_claims (claim_number, payer_name, invoice_id, patient_id, billed_amount, settled_amount, status, submitted_at, notes)
+           VALUES ('CLM-26-000010', ?, ?, ?, 140.00, 0.00, 'submitted', ?, 'Awaiting Aetna batch remittance')`,
+          [marcus.payer_name || 'Aetna Health Plan', invIns.insertId, marcus.id, daysAgo38]
+        );
+      }
+    }
+  }
+
+  // Seed HR Contracts & Leave Requests
+  const contractCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM staff_contracts');
+  if (Number(contractCount?.cnt || 0) === 0) {
+    const allUsers = await query<{ id: number; email: string; full_name: string }>(
+      'SELECT id, email, full_name FROM users ORDER BY id ASC'
+    );
+    const expiringSoon = new Date(Date.now() + 18 * 86400000).toISOString().slice(0, 10);
+    const valid2028 = '2028-06-30';
+    const salaryMap: Record<string, { dept: string; base: number; allow: number; lic?: string; exp?: string }> = {
+      'doc@clinic360.local': { dept: 'Internal Medicine', base: 4800, allow: 600, lic: 'MD-88412', exp: valid2028 },
+      'doc2@clinic360.local': { dept: 'Pediatrics', base: 4600, allow: 600, lic: 'MD-91024', exp: expiringSoon },
+      'nur@clinic360.local': { dept: 'Triage & Nursing', base: 2400, allow: 300, lic: 'RN-44109', exp: valid2028 },
+      'wrd@clinic360.local': { dept: 'Inpatient Wards', base: 2550, allow: 350, lic: 'RN-55210', exp: valid2028 },
+      'pha@clinic360.local': { dept: 'Dispensary Pharmacy', base: 3100, allow: 400, lic: 'RPH-2190', exp: valid2028 },
+      'lab@clinic360.local': { dept: 'Clinical Laboratory', base: 2600, allow: 300, lic: 'MLS-7721', exp: valid2028 },
+      'img@clinic360.local': { dept: 'Diagnostic Imaging', base: 3400, allow: 400, lic: 'RAD-3019', exp: valid2028 },
+      'acc@clinic360.local': { dept: 'Finance & Ledger', base: 3200, allow: 350 },
+      'hro@clinic360.local': { dept: 'Human Resources', base: 2900, allow: 300 },
+      'csh@clinic360.local': { dept: 'Cashier Desk', base: 1800, allow: 200 },
+      'rec@clinic360.local': { dept: 'Front Desk', base: 1650, allow: 200 },
+      'sto@clinic360.local': { dept: 'Central Medical Store', base: 2100, allow: 250 },
+    };
+    let empSeq = 101;
+    for (const u of allUsers) {
+      const cfg = salaryMap[u.email] || { dept: 'Administration', base: 2200, allow: 250 };
+      await execute(
+        `INSERT INTO staff_contracts (user_id, employee_code, department_name, contract_type, base_salary, housing_allowance, licence_number, licence_expiry, contract_start, status)
+         VALUES (?, ?, ?, 'full_time', ?, ?, ?, ?, '2025-01-01', 'active')`,
+        [u.id, `EMP-${empSeq++}`, cfg.dept, cfg.base, cfg.allow, cfg.lic || null, cfg.exp || null]
+      );
+    }
+
+    const nurUser = allUsers.find((u) => u.email === 'nur@clinic360.local');
+    if (nurUser) {
+      const nextMon = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+      const nextWed = new Date(Date.now() + 9 * 86400000).toISOString().slice(0, 10);
+      await execute(
+        `INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, days_count, reason, status)
+         VALUES (?, 'annual', ?, ?, 3, 'Annual family leave (coverage arranged with WRD)', 'pending')`,
+        [nurUser.id, nextMon, nextWed]
+      );
+    }
   }
 }
 
@@ -838,7 +1660,7 @@ async function seedInitialData() {
     ],
     REC: [
       'patient.create', 'patient.read', 'patient.update', 'queue.manage',
-      'appointment.create', 'appointment.read', 'appointment.update', 'billing.invoice.read', 'visit.create'
+      'appointment.create', 'appointment.read', 'appointment.update', 'visit.create'
     ],
     CSH: [
       'patient.read', 'billing.invoice.create', 'billing.invoice.read', 'billing.payment.create',
@@ -859,7 +1681,7 @@ async function seedInitialData() {
     PHA: ['patient.read', 'patient.clinical.read', 'pharmacy.prescription.read', 'pharmacy.dispense', 'visit.read'],
     STO: ['pharmacy.prescription.read'],
     ACC: ['billing.invoice.read', 'billing.approval.decide', 'finance.report.view'],
-    HRO: ['admin.user.manage'],
+    HRO: [],
     AUD: [
       'patient.read', 'appointment.read', 'vitals.read', 'visit.read', 'lab.order.read',
       'pharmacy.prescription.read', 'billing.invoice.read', 'finance.report.view', 'audit.read'
@@ -997,8 +1819,8 @@ async function seedInitialData() {
   );
 
   const v1 = await execute(
-    `INSERT INTO visits (visit_number, patient_id, doctor_id, triage_priority, chief_complaint, history_notes, exam_notes, diagnosis_code, diagnosis_text, treatment_plan, status, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO visits (visit_number, patient_id, doctor_id, visit_type, specialty, workflow_stage, triage_priority, chief_complaint, history_notes, exam_notes, diagnosis_code, diagnosis_text, treatment_plan, status, created_by)
+     VALUES (?, ?, ?, 'scheduled', 'Internal Medicine', 'awaiting_diagnostics', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       'VIS-26-000099', patientIds[0], userIds['doc@clinic360.local'], 'urgent',
       'Productive cough x 4 days, mild dyspnea',
@@ -1016,8 +1838,8 @@ async function seedInitialData() {
   );
 
   const v2 = await execute(
-    `INSERT INTO visits (visit_number, patient_id, doctor_id, triage_priority, chief_complaint, status, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO visits (visit_number, patient_id, doctor_id, visit_type, specialty, workflow_stage, triage_priority, chief_complaint, status, created_by)
+     VALUES (?, ?, ?, 'scheduled', 'Internal Medicine', 'ready_for_doctor', ?, ?, ?, ?)`,
     ['VIS-26-000100', patientIds[1], userIds['doc@clinic360.local'], 'routine', 'BP check and metabolic lab follow-up', 'triage', userIds['rec@clinic360.local']]
   );
 
@@ -1045,6 +1867,7 @@ async function seedInitialData() {
      VALUES (?, ?, ?, 'self-pay', 45.00, 0.00, 45.00, 45.00, 'paid', ?)`,
     ['INV-26-000099', patientIds[0], v1.insertId, userIds['csh@clinic360.local']]
   );
+  await execute('UPDATE visits SET consultation_invoice_id = ? WHERE id = ?', [inv1.insertId, v1.insertId]);
   await execute(
     'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, 45.00, 45.00)',
     [inv1.insertId, 'OPD-CONS', 'General Outpatient Consultation', 'consultation']
@@ -1100,48 +1923,112 @@ async function seedInitialData() {
     [inv2.insertId, userIds['csh@clinic360.local']]
   );
 
+  const genesisOccurredAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const genesisAfterJson = JSON.stringify({ roles: 14, users: demoUsers.length });
   const genesisPayload = JSON.stringify({
-    occurred_at: new Date().toISOString(),
-    user_id: userIds['adm@clinic360.local'],
+    occurredAt: genesisOccurredAt,
+    userId: userIds['adm@clinic360.local'],
+    userName: 'Hannah Brooks',
+    roleAtTime: 'ADM',
     action: 'system.bootstrap',
-    entity_type: 'system',
-    entity_id: 'clinic360',
-    prev_hash: 'GENESIS',
+    entityType: 'system',
+    entityId: 'clinic360',
+    patientId: null,
+    beforeJson: null,
+    afterJson: genesisAfterJson,
+    reason: 'Initial Clinic360 database seed',
+    prevHash: 'GENESIS',
   });
   const rowHash = crypto.createHash('sha256').update(genesisPayload).digest('hex');
   await execute(
-    `INSERT INTO audit_logs (user_id, user_name, role_at_time, action, entity_type, entity_id, after_json, reason, ip_address, prev_hash, row_hash)
-     VALUES (?, 'Hannah Brooks', 'ADM', 'system.bootstrap', 'system', 'clinic360', ?, 'Initial Clinic360 database seed', '127.0.0.1', 'GENESIS', ?)`,
-    [userIds['adm@clinic360.local'], JSON.stringify({ roles: 14, users: demoUsers.length }), rowHash]
+    `INSERT INTO audit_logs (occurred_at, user_id, user_name, role_at_time, action, entity_type, entity_id, after_json, reason, ip_address, prev_hash, row_hash)
+     VALUES (?, ?, 'Hannah Brooks', 'ADM', 'system.bootstrap', 'system', 'clinic360', ?, 'Initial Clinic360 database seed', '127.0.0.1', 'GENESIS', ?)`,
+    [genesisOccurredAt, userIds['adm@clinic360.local'], genesisAfterJson, rowHash]
   );
 
   await ensureExtraPermissionsAndSeeds();
 }
 
+async function initMysqlSchema(pool: mysql.Pool) {
+  const [rows] = (await pool.query("SHOW TABLES LIKE 'branches'")) as unknown as [Array<Record<string, unknown>>, unknown];
+  if (rows.length > 0) return;
+  const schemaPath = path.resolve(process.cwd(), 'server', 'schema.mysql.sql');
+  if (!fs.existsSync(schemaPath)) return;
+  const raw = fs.readFileSync(schemaPath, 'utf8');
+  const cleaned = raw
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n');
+  const statements = cleaned
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  for (const stmt of statements) {
+    await pool.query(stmt);
+  }
+}
+
+export function getDbConfigSummary() {
+  return {
+    dialect: activeDialect,
+    dbClientMode: process.env.DB_CLIENT || 'auto',
+    mysqlConfigured: Boolean(
+      process.env.MYSQL_URL ||
+        (process.env.MYSQL_HOST && process.env.MYSQL_HOST !== '127.0.0.1' && process.env.MYSQL_PASSWORD !== 'change_me')
+    ),
+    mysqlHost: process.env.MYSQL_HOST || '127.0.0.1',
+    mysqlPort: Number(process.env.MYSQL_PORT || 3306),
+    mysqlDatabase: process.env.MYSQL_DATABASE || 'clinic360',
+    sslEnabled: process.env.MYSQL_SSL === 'true',
+  };
+}
+
 export async function initDatabase(): Promise<{ dialect: DbDialect }> {
+  const mode = (process.env.DB_CLIENT || 'auto').toLowerCase();
+  const mysqlUrl = process.env.MYSQL_URL?.trim();
   const host = process.env.MYSQL_HOST;
   const user = process.env.MYSQL_USER;
   const password = process.env.MYSQL_PASSWORD;
   const database = process.env.MYSQL_DATABASE;
   const port = Number(process.env.MYSQL_PORT || 3306);
+  const useSsl = process.env.MYSQL_SSL === 'true';
 
-  if (host && user && database && host !== '127.0.0.1' && password !== 'change_me') {
+  const shouldTryMysql =
+    mode !== 'sqlite' &&
+    (Boolean(mysqlUrl) ||
+      (Boolean(host && user && database) && (mode === 'mysql' || (host !== '127.0.0.1' && password !== 'change_me'))));
+
+  if (shouldTryMysql) {
     try {
-      mysqlPool = mysql.createPool({
-        host,
-        port,
-        user,
-        password,
-        database,
-        waitForConnections: true,
-        connectionLimit: 10,
-      });
+      mysqlPool = mysqlUrl
+        ? mysql.createPool({
+            uri: mysqlUrl,
+            waitForConnections: true,
+            connectionLimit: 10,
+            dateStrings: true,
+            ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+          })
+        : mysql.createPool({
+            host,
+            port,
+            user,
+            password,
+            database,
+            waitForConnections: true,
+            connectionLimit: 10,
+            dateStrings: true,
+            ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+          });
       await mysqlPool.query('SELECT 1');
       activeDialect = 'mysql';
-      console.log(`[Clinic360] Connected to MySQL (${host}:${port}/${database})`);
+      await initMysqlSchema(mysqlPool);
+      console.log(`[Clinic360] Connected to MySQL 8 (${mysqlUrl ? 'MYSQL_URL' : `${host}:${port}/${database}`})`);
       await seedInitialData();
       return { dialect: 'mysql' };
     } catch (err) {
+      if (mode === 'mysql') {
+        throw err;
+      }
       console.warn('[Clinic360] MySQL connection unavailable, falling back to embedded SQLite:', (err as Error).message);
       mysqlPool = null;
     }

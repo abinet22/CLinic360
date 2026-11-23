@@ -5,6 +5,8 @@ export interface UserContext {
   branchId: number;
   roles: string[];
   permissions: string[];
+  mustChangePassword?: boolean;
+  twoFaEnabled?: boolean;
 }
 
 export interface DemoAccount {
@@ -50,6 +52,15 @@ export interface QueueTicket {
   first_name: string;
   last_name: string;
   patient_type: string;
+  visit_number?: string | null;
+  specialty?: string | null;
+  workflow_stage?: string | null;
+  doctor_name?: string | null;
+  consultation_invoice_id?: number | null;
+  consultation_invoice_number?: string | null;
+  consultation_invoice_status?: string | null;
+  consultation_total_amount?: number | null;
+  consultation_paid_amount?: number | null;
 }
 
 export interface Appointment {
@@ -76,6 +87,30 @@ export interface Visit {
   visit_number: string;
   patient_id: number;
   doctor_id: number | null;
+  appointment_id?: number | null;
+  visit_type?: string | null;
+  specialty?: string | null;
+  consultation_invoice_id?: number | null;
+  consultation_invoice_number?: string | null;
+  consultation_invoice_status?: string | null;
+  consultation_cleared?: boolean;
+  workflow_stage?:
+    | 'awaiting_payment'
+    | 'paid_awaiting_vitals'
+    | 'ready_for_doctor'
+    | 'in_consultation'
+    | 'awaiting_diagnostics'
+    | 'results_ready'
+    | 'awaiting_pharmacy'
+    | 'completed'
+    | string;
+  results_ready?: boolean;
+  vitals_count?: number;
+  pending_lab_count?: number;
+  verified_lab_count?: number;
+  pending_imaging_count?: number;
+  final_imaging_count?: number;
+  rx_count?: number;
   triage_priority: 'emergency' | 'urgent' | 'routine';
   chief_complaint: string | null;
   history_notes: string | null;
@@ -116,6 +151,23 @@ export interface VitalsRecord {
   recorded_at: string;
 }
 
+export interface LabAnalyteTemplate {
+  code: string;
+  name: string;
+  unit: string;
+  refRange: string;
+}
+
+export interface LabPanelResultItem {
+  code?: string;
+  analyte: string;
+  value: string;
+  unit: string;
+  refRange: string;
+  reference_range?: string;
+  flag: 'normal' | 'high' | 'low' | 'critical';
+}
+
 export interface LabOrder {
   id: number;
   visit_id: number;
@@ -125,6 +177,8 @@ export interface LabOrder {
   sample_type: string;
   unit: string | null;
   reference_range: string | null;
+  analyte_template_json?: string | null;
+  panel_results_json?: string | null;
   sample_barcode: string | null;
   result_value: string | null;
   previous_result_value: string | null;
@@ -155,6 +209,17 @@ export interface ImagingCatalogItem {
   price: number;
 }
 
+export interface ImagingAttachment {
+  id: number;
+  imaging_order_id: number;
+  file_name: string;
+  mime_type: string;
+  data_url: string;
+  caption: string | null;
+  uploaded_by_name?: string | null;
+  created_at: string;
+}
+
 export interface ImagingOrder {
   id: number;
   visit_id: number;
@@ -170,6 +235,7 @@ export interface ImagingOrder {
   findings: string | null;
   impression: string | null;
   addendum: string | null;
+  attachment_count?: number;
   status: 'ordered' | 'scheduled' | 'performed' | 'reported_draft' | 'reported_final';
   invoice_number: string | null;
   invoice_status: string | null;
@@ -218,10 +284,19 @@ export interface Admission {
   status: 'ordered' | 'admitted' | 'discharge_ordered' | 'cleared' | 'discharged';
   admitted_at: string;
   discharged_at: string | null;
+  bed_days_billed?: number;
+  last_bed_billed_at?: string | null;
+  daily_tariff?: number;
+  days_stayed?: number;
+  unbilled_days?: number;
+  unbilled_bed_estimate?: number;
+  deposit_balance?: number;
+  outstanding_invoices?: number;
   mrn: string;
   first_name: string;
   last_name: string;
   sex: string;
+  patient_type?: string;
   allergies: string | null;
   ward_name: string;
   bed_number: string | null;
@@ -258,6 +333,13 @@ export interface AppNotification {
   created_at: string;
 }
 
+export interface FefoBatchOption {
+  id: number;
+  batch_number: string;
+  expiry_date: string;
+  qty_on_hand: number;
+}
+
 export interface PrescriptionItem {
   id: number;
   medicine_id: number;
@@ -269,16 +351,24 @@ export interface PrescriptionItem {
   frequency: string;
   duration_days: number;
   quantity: number;
+  selected_qty?: number | null;
+  external_qty?: number | null;
+  unit_price?: number;
   dispensed_qty: number;
   stock_qty: number;
   batch_number: string;
   expiry_date: string;
   instructions: string | null;
+  store_item_id?: number | null;
+  fefo_batches?: FefoBatchOption[];
 }
 
 export interface Prescription {
   id: number;
   visit_id: number;
+  visit_number?: string | null;
+  workflow_stage?: string | null;
+  visit_status?: string | null;
   patient_id: number;
   mrn: string;
   first_name: string;
@@ -286,9 +376,17 @@ export interface Prescription {
   allergies: string | null;
   patient_type: string;
   doctor_name: string;
+  invoice_id?: number | null;
   invoice_number: string | null;
   invoice_status: string | null;
-  status: 'pending' | 'dispensed' | 'cancelled';
+  status:
+    | 'awaiting_stock_check'
+    | 'pending_payment'
+    | 'paid_ready_to_dispense'
+    | 'pending'
+    | 'partial'
+    | 'dispensed'
+    | 'cancelled';
   notes: string | null;
   created_at: string;
   items: PrescriptionItem[];
@@ -386,4 +484,300 @@ export interface AuditLog {
   prev_hash: string;
   row_hash: string;
 }
+
+export interface StoreItem {
+  id: number;
+  code: string;
+  name: string;
+  category: 'medicine' | 'reagent' | 'consumable';
+  unit: string;
+  reorder_level: number;
+  medicine_id: number | null;
+  main_store_qty: number;
+  dispensary_qty: number;
+  lab_qty: number;
+  total_qty: number;
+  earliest_expiry: string | null;
+}
+
+export interface StockBatch {
+  id: number;
+  item_id: number;
+  item_code: string;
+  item_name: string;
+  unit: string;
+  category: string;
+  location: 'main_store' | 'dispensary' | 'lab' | 'ward';
+  batch_number: string;
+  expiry_date: string;
+  qty_on_hand: number;
+  unit_cost: number;
+  status: 'active' | 'depleted' | 'blocked_expired';
+  block_reason: string | null;
+  received_at: string;
+}
+
+export interface ExpiryAlert extends StockBatch {
+  alert_band: 'expired' | 'critical_30d' | 'warning_90d';
+}
+
+export interface GoodsReceipt {
+  id: number;
+  grn_number: string;
+  supplier_name: string;
+  invoice_ref: string | null;
+  total_cost: number;
+  notes: string | null;
+  received_by_name: string | null;
+  received_at: string;
+}
+
+export interface StockRequisitionItem {
+  id: number;
+  requisition_id: number;
+  item_id: number;
+  item_code: string;
+  item_name: string;
+  unit: string;
+  requested_qty: number;
+  issued_qty: number;
+}
+
+export interface StockRequisition {
+  id: number;
+  req_number: string;
+  from_location: string;
+  to_location: 'dispensary' | 'lab' | 'ward';
+  status: 'pending' | 'issued' | 'cancelled';
+  notes: string | null;
+  requested_by_name: string | null;
+  issued_by_name: string | null;
+  requested_at: string;
+  issued_at: string | null;
+  items: StockRequisitionItem[];
+}
+
+export interface PatientDeposit {
+  id: number;
+  deposit_number: string;
+  patient_id: number;
+  admission_id: number | null;
+  admission_number: string | null;
+  mrn: string;
+  first_name: string;
+  last_name: string;
+  amount: number;
+  remaining_amount: number;
+  payment_method: string;
+  reference_number: string | null;
+  status: 'active' | 'applied' | 'refunded';
+  collected_by_name: string | null;
+  created_at: string;
+}
+
+export interface IpdStatement {
+  admission: Admission & {
+    date_of_birth?: string;
+    phone?: string;
+    payer_name?: string | null;
+  };
+  invoices: Invoice[];
+  deposits: PatientDeposit[];
+  marHistory: MedicationAdministration[];
+}
+
+export interface DoctorBlock {
+  id: number;
+  doctor_id: number;
+  doctor_name: string;
+  specialty: string | null;
+  block_date: string;
+  start_time: string;
+  end_time: string;
+  block_type: 'leave' | 'off_duty' | 'surgery' | 'unavailable';
+  reason: string | null;
+}
+
+export interface ServiceItem {
+  id: number;
+  code: string;
+  name: string;
+  category: string;
+  unit_price: number;
+  active: number;
+}
+
+export interface NursingProcedure {
+  id: number;
+  visit_id: number;
+  patient_id: number;
+  service_id: number;
+  service_code: string;
+  service_name: string;
+  unit_price?: number;
+  invoice_id: number | null;
+  invoice_number: string | null;
+  invoice_status: string | null;
+  ordered_by_name: string | null;
+  performed_by_name: string | null;
+  notes: string | null;
+  status: 'ordered' | 'completed';
+  performed_at: string | null;
+  created_at: string;
+}
+
+export interface ChartAccount {
+  id: number;
+  code: string;
+  name: string;
+  account_type: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+  normal_balance: 'debit' | 'credit';
+  active: number;
+  debit_total?: number;
+  credit_total?: number;
+  net_balance?: number;
+}
+
+export interface JournalLine {
+  entry_id: number;
+  account_id: number;
+  code: string;
+  name: string;
+  debit: number;
+  credit: number;
+  memo: string | null;
+}
+
+export interface JournalEntry {
+  id: number;
+  entry_number: string;
+  entry_date: string;
+  source_type: string;
+  source_id: number | null;
+  description: string;
+  total_debit: number;
+  total_credit: number;
+  posted_by_name: string | null;
+  created_at: string;
+  lines: JournalLine[];
+}
+
+export interface SupplierBill {
+  id: number;
+  bill_number: string;
+  grn_id: number | null;
+  grn_number: string | null;
+  supplier_name: string;
+  invoice_ref: string | null;
+  bill_date: string;
+  due_date: string;
+  total_amount: number;
+  paid_amount: number;
+  status: 'open' | 'partial' | 'paid';
+  notes: string | null;
+}
+
+export interface ExpenseVoucher {
+  id: number;
+  voucher_number: string;
+  expense_date: string;
+  category: string;
+  account_id: number;
+  account_code: string;
+  account_name: string;
+  payee_name: string;
+  amount: number;
+  payment_method: string;
+  description: string;
+  status: 'pending' | 'paid' | 'rejected';
+  requested_by_name: string | null;
+  approved_by_name: string | null;
+  paid_at: string | null;
+  journal_entry_number?: string | null;
+}
+
+export interface InsuranceClaim {
+  id: number;
+  claim_number: string;
+  payer_name: string;
+  invoice_id: number;
+  invoice_number: string;
+  patient_id: number;
+  mrn: string;
+  first_name: string;
+  last_name: string;
+  billed_amount: number;
+  settled_amount: number;
+  status: 'submitted' | 'partial' | 'settled' | 'rejected';
+  submitted_at: string;
+  settled_at: string | null;
+  notes: string | null;
+  age_days?: number;
+  age_bucket?: string;
+}
+
+export interface StaffContract {
+  id: number;
+  user_id: number;
+  employee_code: string;
+  full_name: string;
+  email: string;
+  specialty: string | null;
+  role_code: string;
+  role_name: string;
+  department_name: string;
+  contract_type: 'full_time' | 'part_time' | 'locum';
+  base_salary: number;
+  housing_allowance: number;
+  licence_number: string | null;
+  licence_expiry: string | null;
+  licence_days_remaining?: number | null;
+  licence_alert?: 'none' | 'expired' | 'expiring_soon' | 'valid';
+  contract_start: string;
+  status: string;
+}
+
+export interface LeaveRequest {
+  id: number;
+  user_id: number;
+  staff_name: string;
+  role_code: string;
+  leave_type: 'annual' | 'sick' | 'study' | 'emergency';
+  start_date: string;
+  end_date: string;
+  days_count: number;
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  decided_by_name: string | null;
+  created_at: string;
+}
+
+export interface PayrollItem {
+  id: number;
+  payroll_run_id: number;
+  user_id: number;
+  staff_name: string;
+  role_code: string;
+  base_salary: number;
+  allowances: number;
+  tax_deduction: number;
+  net_pay: number;
+}
+
+export interface PayrollRun {
+  id: number;
+  run_number: string;
+  pay_month: string;
+  total_gross: number;
+  total_deductions: number;
+  total_net: number;
+  status: 'draft' | 'posted';
+  journal_entry_id: number | null;
+  journal_entry_number: string | null;
+  created_by_name: string | null;
+  posted_at: string | null;
+  items: PayrollItem[];
+}
+
+
 

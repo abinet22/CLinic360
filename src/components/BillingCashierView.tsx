@@ -1,7 +1,16 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Check, DollarSign, FileText, Lock, Printer, ShieldAlert, X } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { Check, DollarSign, FileText, Lock, Printer, Search, ShieldAlert, UserCheck, UserPlus, Wallet, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
-import type { ApprovalRequest, CashierShift, Invoice, Patient, UserContext } from '../types';
+import { useRealtimeSync } from '../lib/useRealtimeSync';
+import type { Admission, ApprovalRequest, CashierShift, Invoice, Patient, PatientDeposit, UserContext } from '../types';
+
+interface DoctorOption {
+  id: number;
+  full_name: string;
+  email: string;
+  specialty: string | null;
+}
 
 interface ServiceCatalog {
   id: number;
@@ -36,12 +45,42 @@ interface BillingCashierViewProps {
 }
 
 export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, onNotify }) => {
-  const [subTab, setSubTab] = useState<'invoices' | 'approvals' | 'shifts'>('invoices');
+  const [subTab, setSubTab] = useState<'invoices' | 'deposits' | 'approvals' | 'shifts'>('invoices');
   const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [invTotal, setInvTotal] = useState(0);
+  const [invPage, setInvPage] = useState(1);
+  const [invSearch, setInvSearch] = useState('');
+  const [invStatus, setInvStatus] = useState('all');
+
+  const [deposits, setDeposits] = useState<PatientDeposit[]>([]);
   const [shifts, setShifts] = useState<CashierShift[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [patients, setPatients] = useState<Patient[]>([]);
+  const [doctors, setDoctors] = useState<DoctorOption[]>([]);
+  const [admissions, setAdmissions] = useState<Admission[]>([]);
   const [services, setServices] = useState<ServiceCatalog[]>([]);
+
+  const [showCheckIn, setShowCheckIn] = useState(false);
+  const [checkInMode, setCheckInMode] = useState<'existing' | 'new'>('existing');
+  const [checkInSearch, setCheckInSearch] = useState('');
+  const [checkInPatientId, setCheckInPatientId] = useState('');
+  const [checkInVisitType, setCheckInVisitType] = useState<'walk_in' | 'scheduled' | 'follow_up'>('walk_in');
+  const [checkInSpecialty, setCheckInSpecialty] = useState('General Medicine');
+  const [checkInDoctorId, setCheckInDoctorId] = useState('');
+  const [checkInPriority, setCheckInPriority] = useState<'routine' | 'urgent' | 'emergency'>('routine');
+  const [checkInComplaint, setCheckInComplaint] = useState('');
+  const [newPatientForm, setNewPatientForm] = useState({
+    first_name: '',
+    last_name: '',
+    sex: 'Female',
+    date_of_birth: '1993-04-12',
+    phone: '',
+    next_of_kin_name: '',
+    next_of_kin_phone: '',
+    patient_type: 'self-pay',
+    payer_name: '',
+    insurance_number: '',
+  });
 
   const [openingFloat, setOpeningFloat] = useState('200.00');
   const [countedCash, setCountedCash] = useState('');
@@ -56,6 +95,18 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
   const [newInvPatientId, setNewInvPatientId] = useState('');
   const [newInvServiceCode, setNewInvServiceCode] = useState('');
 
+  const [showNewDeposit, setShowNewDeposit] = useState(false);
+  const [depForm, setDepForm] = useState({
+    patient_id: '',
+    admission_id: '',
+    amount: '250.00',
+    payment_method: 'cash',
+    reference_number: '',
+  });
+
+  const [applyDepTarget, setApplyDepTarget] = useState<PatientDeposit | null>(null);
+  const [applyInvoiceId, setApplyInvoiceId] = useState('');
+
   const [approvalTarget, setApprovalTarget] = useState<Invoice | null>(null);
   const [approvalType, setApprovalType] = useState<'discount' | 'refund' | 'void_invoice'>('discount');
   const [approvalAmount, setApprovalAmount] = useState('10.00');
@@ -65,42 +116,175 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
 
   const canCreateInvoice = user.permissions.includes('billing.invoice.create');
   const canTakePayment = user.permissions.includes('billing.payment.create');
+  const canCreateDeposit = user.permissions.includes('billing.deposit.create');
   const canManageShift = user.permissions.includes('billing.shift.manage');
   const canReconcileShift = user.permissions.includes('billing.shift.reconcile');
   const canRequestApproval = user.permissions.includes('billing.approval.request');
   const canDecideApproval = user.permissions.includes('billing.approval.decide');
+  const canPrintReceipt =
+    user.permissions.includes('billing.receipt.print') || user.permissions.includes('finance.report.view');
+
+  useEffect(() => {
+    if (!receiptPreview) return;
+    document.body.classList.add('has-print-modal');
+    return () => {
+      document.body.classList.remove('has-print-modal');
+    };
+  }, [receiptPreview]);
 
   const loadBilling = useCallback(async () => {
     try {
-      const [invRes, shfRes, appRes] = await Promise.all([
-        apiFetch<{ invoices: Invoice[] }>('/api/billing/invoices'),
+      const qs = new URLSearchParams({
+        page: String(invPage),
+        limit: '25',
+        status: invStatus,
+      });
+      if (invSearch.trim()) qs.set('q', invSearch.trim());
+
+      const [invRes, depRes, shfRes, appRes] = await Promise.all([
+        apiFetch<{ invoices: Invoice[]; total?: number }>(`/api/billing/invoices?${qs}`),
+        apiFetch<{ deposits: PatientDeposit[] }>('/api/billing/deposits'),
         apiFetch<{ shifts: CashierShift[] }>('/api/billing/shifts'),
         apiFetch<{ approvals: ApprovalRequest[] }>('/api/billing/approvals'),
       ]);
-      setInvoices(invRes.invoices);
-      setShifts(shfRes.shifts);
-      setApprovals(appRes.approvals);
+      setInvoices(invRes.invoices || []);
+      setInvTotal(typeof invRes.total === 'number' ? invRes.total : (invRes.invoices || []).length);
+      setDeposits(depRes.deposits || []);
+      setShifts(shfRes.shifts || []);
+      setApprovals(appRes.approvals || []);
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
-  }, [onNotify]);
+  }, [onNotify, invPage, invStatus, invSearch]);
 
   useEffect(() => {
     loadBilling();
-    if (canCreateInvoice) {
-      Promise.all([
-        apiFetch<{ patients: Patient[] }>('/api/patients'),
-        apiFetch<{ services: ServiceCatalog[] }>('/api/catalog/services'),
-      ])
-        .then(([pRes, sRes]) => {
-          setPatients(pRes.patients);
-          setServices(sRes.services);
-          if (pRes.patients[0]) setNewInvPatientId(String(pRes.patients[0].id));
-          if (sRes.services[0]) setNewInvServiceCode(sRes.services[0].code);
-        })
-        .catch(() => {});
+  }, [loadBilling]);
+
+  useRealtimeSync(
+    ['payment:confirmed', 'visit:updated', 'lab:updated', 'imaging:updated', 'pharmacy:updated'],
+    () => {
+      loadBilling();
     }
-  }, [loadBilling, canCreateInvoice]);
+  );
+
+  const loadReferenceData = useCallback(async () => {
+    if (!(canCreateInvoice || canCreateDeposit || user.permissions.includes('visit.create'))) return;
+    try {
+      const [pRes, sRes, dRes, ipdRes] = await Promise.all([
+        apiFetch<{ patients: Patient[] }>('/api/patients?limit=80'),
+        apiFetch<{ services: ServiceCatalog[] }>('/api/catalog/services'),
+        apiFetch<{ doctors: DoctorOption[] }>('/api/doctors').catch(() => ({ doctors: [] as DoctorOption[] })),
+        user.permissions.includes('ipd.admission.read')
+          ? apiFetch<{ admissions: Admission[] }>('/api/ipd/overview')
+          : Promise.resolve({ admissions: [] as Admission[] }),
+      ]);
+      setPatients(pRes.patients || []);
+      setServices(sRes.services || []);
+      setDoctors(dRes.doctors || []);
+      setAdmissions(ipdRes.admissions || []);
+      if (pRes.patients[0]) {
+        setNewInvPatientId((prev) => prev || String(pRes.patients[0].id));
+        setCheckInPatientId((prev) => prev || String(pRes.patients[0].id));
+        setDepForm((prev) => (prev.patient_id ? prev : { ...prev, patient_id: String(pRes.patients[0].id) }));
+      }
+      if (dRes.doctors[0]) {
+        setCheckInDoctorId((prev) => prev || String(dRes.doctors[0].id));
+      }
+      if (sRes.services[0]) setNewInvServiceCode((prev) => prev || sRes.services[0].code);
+    } catch {
+      // ignore
+    }
+  }, [canCreateInvoice, canCreateDeposit, user.permissions]);
+
+  useEffect(() => {
+    loadReferenceData();
+  }, [loadReferenceData]);
+
+  async function handleFrontDeskCheckIn(e: React.FormEvent) {
+    e.preventDefault();
+    try {
+      let targetPatientId = Number(checkInPatientId);
+      if (checkInMode === 'new') {
+        if (!newPatientForm.first_name.trim() || !newPatientForm.last_name.trim() || !newPatientForm.phone.trim()) {
+          onNotify('First name, last name, and phone are required for new EMR registration.', 'error');
+          return;
+        }
+        const created = await apiFetch<{ patient: Patient }>('/api/patients', {
+          method: 'POST',
+          body: JSON.stringify({
+            ...newPatientForm,
+            issue_queue_ticket: false,
+            charge_registration_card: false,
+          }),
+        });
+        targetPatientId = created.patient.id;
+      }
+
+      if (!targetPatientId) {
+        onNotify('Select or register a patient first.', 'error');
+        return;
+      }
+
+      const visitRes = await apiFetch<{
+        id: number;
+        visitNumber: string;
+        workflowStage: string;
+        consultationInvoiceId: number | null;
+        consultationInvoiceNumber: string | null;
+        consultationInvoiceStatus: string | null;
+        ticketNumber: string;
+      }>('/api/visits', {
+        method: 'POST',
+        body: JSON.stringify({
+          patient_id: targetPatientId,
+          doctor_id: checkInDoctorId ? Number(checkInDoctorId) : null,
+          visit_type: checkInVisitType,
+          specialty: checkInSpecialty,
+          triage_priority: checkInPriority,
+          chief_complaint: checkInComplaint || `${checkInSpecialty} consultation`,
+          generate_consultation_invoice: true,
+        }),
+      });
+
+      onNotify(
+        `Visit ${visitRes.visitNumber} (${visitRes.ticketNumber}) started · ${
+          visitRes.workflowStage === 'awaiting_payment'
+            ? `Invoice ${visitRes.consultationInvoiceNumber} awaiting payment`
+            : 'Paid / Cleared — Awaiting Vitals'
+        }`,
+        'success'
+      );
+      setShowCheckIn(false);
+      setCheckInComplaint('');
+      setNewPatientForm({
+        first_name: '',
+        last_name: '',
+        sex: 'Female',
+        date_of_birth: '1993-04-12',
+        phone: '',
+        next_of_kin_name: '',
+        next_of_kin_phone: '',
+        patient_type: 'self-pay',
+        payer_name: '',
+        insurance_number: '',
+      });
+      await loadReferenceData();
+      const invRes = await apiFetch<{ invoices: Invoice[]; total?: number }>('/api/billing/invoices?page=1&limit=25&status=all');
+      setInvoices(invRes.invoices || []);
+      setInvTotal(typeof invRes.total === 'number' ? invRes.total : (invRes.invoices || []).length);
+
+      if (visitRes.consultationInvoiceId && visitRes.consultationInvoiceStatus === 'unpaid' && canTakePayment) {
+        const createdInv = (invRes.invoices || []).find((i) => i.id === visitRes.consultationInvoiceId);
+        if (createdInv) {
+          setPayTarget(createdInv);
+          setPayAmount(Number(createdInv.total_amount).toFixed(2));
+        }
+      }
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
 
   const myOpenShift = shifts.find((s) => s.cashier_id === user.id && s.status === 'open');
 
@@ -191,7 +375,9 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
       setPayTarget(null);
       setPayRef('');
       loadBilling();
-      openReceipt(res.receiptNumber);
+      if (canPrintReceipt) {
+        openReceipt(res.receiptNumber);
+      }
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -250,6 +436,48 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
         body: JSON.stringify({ decision, decision_note: `${decision} via Finance queue` }),
       });
       onNotify(`Request ${decision}`, 'success');
+      loadBilling();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleCollectDeposit(e: React.FormEvent) {
+    e.preventDefault();
+    try {
+      const res = await apiFetch<{ depositNumber: string }>('/api/billing/deposits', {
+        method: 'POST',
+        body: JSON.stringify({
+          patient_id: Number(depForm.patient_id),
+          admission_id: depForm.admission_id ? Number(depForm.admission_id) : null,
+          amount: Number(depForm.amount),
+          payment_method: depForm.payment_method,
+          reference_number: depForm.reference_number || null,
+        }),
+      });
+      onNotify(`Advance deposit ${res.depositNumber} recorded`, 'success');
+      setShowNewDeposit(false);
+      setDepForm((p) => ({ ...p, reference_number: '' }));
+      loadBilling();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleApplyDeposit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!applyDepTarget || !applyInvoiceId) return;
+    try {
+      const res = await apiFetch<{ appliedAmount: number; invoiceStatus: string }>(
+        `/api/billing/deposits/${applyDepTarget.id}/apply`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ invoice_id: Number(applyInvoiceId) }),
+        }
+      );
+      onNotify(`Applied $${res.appliedAmount.toFixed(2)} from ${applyDepTarget.deposit_number} (${res.invoiceStatus})`, 'success');
+      setApplyDepTarget(null);
+      setApplyInvoiceId('');
       loadBilling();
     } catch (err) {
       onNotify((err as Error).message, 'error');
@@ -324,14 +552,23 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
 
       {/* Navigation & Actions */}
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
+        <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
           <button
             onClick={() => setSubTab('invoices')}
             className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
               subTab === 'invoices' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Invoices &amp; Receipts ({invoices.length})
+            Invoices &amp; Receipts ({invTotal})
+          </button>
+          <button
+            onClick={() => setSubTab('deposits')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md ${
+              subTab === 'deposits' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Wallet className="w-3.5 h-3.5" />
+            <span>Patient Deposits ({deposits.filter((d) => d.status === 'active').length})</span>
           </button>
           <button
             onClick={() => setSubTab('approvals')}
@@ -351,19 +588,87 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
           </button>
         </div>
 
-        {canCreateInvoice && (
-          <button
-            onClick={() => setShowNewInvoice(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
-          >
-            <FileText className="w-3.5 h-3.5" />
-            <span>Create Invoice</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {user.permissions.includes('visit.create') && (
+            <button
+              onClick={() => setShowCheckIn(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
+            >
+              <UserCheck className="w-3.5 h-3.5" />
+              <span>Front Desk Check-In</span>
+            </button>
+          )}
+          {canCreateDeposit && (
+            <button
+              onClick={() => setShowNewDeposit(true)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-teal-800 bg-white border border-teal-300 hover:bg-teal-50 rounded-md whitespace-nowrap"
+            >
+              <Wallet className="w-3.5 h-3.5" />
+              <span>Collect Deposit</span>
+            </button>
+          )}
+          {canCreateInvoice && (
+            <button
+              onClick={() => setShowNewInvoice(true)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md whitespace-nowrap"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Create Invoice</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {subTab === 'invoices' && (
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+            <div className="relative flex-1 min-w-[220px] max-w-sm">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                value={invSearch}
+                onChange={(e) => {
+                  setInvSearch(e.target.value);
+                  setInvPage(1);
+                }}
+                placeholder="Search invoice #, MRN, or patient..."
+                className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-md"
+              />
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <select
+                value={invStatus}
+                onChange={(e) => {
+                  setInvStatus(e.target.value);
+                  setInvPage(1);
+                }}
+                className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+              >
+                <option value="all">All Statuses</option>
+                <option value="unpaid">Unpaid</option>
+                <option value="partial">Partial</option>
+                <option value="paid">Paid</option>
+                <option value="credit_billed">Credit / Insurance</option>
+                <option value="voided">Voided</option>
+              </select>
+              <span className="font-mono text-slate-500">
+                Page {invPage} · {invTotal} total
+              </span>
+              <button
+                disabled={invPage <= 1}
+                onClick={() => setInvPage((p) => Math.max(1, p - 1))}
+                className="px-2.5 py-1 border border-slate-200 rounded disabled:opacity-40 hover:bg-slate-50"
+              >
+                Prev
+              </button>
+              <button
+                disabled={invPage * 25 >= invTotal}
+                onClick={() => setInvPage((p) => p + 1)}
+                className="px-2.5 py-1 border border-slate-200 rounded disabled:opacity-40 hover:bg-slate-50"
+              >
+                Next
+              </button>
+            </div>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
@@ -439,7 +744,7 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
                             {inv.status === 'paid' ? 'Refund' : 'Waive / Void'}
                           </button>
                         )}
-                        {inv.payments[0]?.receipt_number && (
+                        {inv.payments[0]?.receipt_number && canPrintReceipt && (
                           <button
                             onClick={() => openReceipt(inv.payments[0].receipt_number!)}
                             className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
@@ -455,6 +760,76 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {subTab === 'deposits' && (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 text-xs text-slate-600 flex items-center justify-between">
+            <span>Advance Patient Deposits &amp; Inpatient Wallet Credits (automatically offset bed tariffs or apply manually to unpaid invoices)</span>
+          </div>
+          {deposits.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No advance deposits recorded yet.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Deposit No</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4">Linked Admission</th>
+                    <th className="py-2.5 px-4 text-right">Deposited</th>
+                    <th className="py-2.5 px-4 text-right">Remaining Credit</th>
+                    <th className="py-2.5 px-4">Method &amp; Status</th>
+                    {canCreateDeposit && <th className="py-2.5 px-4 text-right">Action</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs">
+                  {deposits.map((d) => (
+                    <tr key={d.id} className="hover:bg-slate-50/70">
+                      <td className="py-3 px-4 font-mono font-semibold text-slate-900">
+                        <div>{d.deposit_number}</div>
+                        <div className="text-[11px] font-normal text-slate-400">{d.created_at}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-slate-900">{d.first_name} {d.last_name}</div>
+                        <div className="font-mono text-slate-500">{d.mrn}</div>
+                      </td>
+                      <td className="py-3 px-4 font-mono text-slate-600">{d.admission_number || 'General Wallet'}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums">${Number(d.amount).toFixed(2)}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-teal-800">
+                        ${Number(d.remaining_amount).toFixed(2)}
+                      </td>
+                      <td className="py-3 px-4 capitalize">
+                        <span className={d.status === 'active' ? 'text-emerald-700 font-semibold' : 'text-slate-500'}>
+                          {d.status}
+                        </span>
+                        <span className="text-slate-400"> · {d.payment_method.replace('_', ' ')}</span>
+                      </td>
+                      {canCreateDeposit && (
+                        <td className="py-3 px-4 text-right">
+                          {d.status === 'active' && Number(d.remaining_amount) > 0 && (
+                            <button
+                              onClick={() => {
+                                setApplyDepTarget(d);
+                                const candidate = invoices.find(
+                                  (inv) => inv.patient_id === d.patient_id && (inv.status === 'unpaid' || inv.status === 'partial')
+                                );
+                                setApplyInvoiceId(candidate ? String(candidate.id) : '');
+                              }}
+                              className="px-2.5 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+                            >
+                              Apply to Invoice
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
@@ -757,80 +1132,484 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
         </div>
       )}
 
-      {/* Printable Immutable Receipt Modal */}
-      {receiptPreview && (
+      {/* Collect Advance Deposit Modal */}
+      {showNewDeposit && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full p-6 space-y-4">
-            <div className="flex items-start justify-between border-b border-slate-200 pb-3">
-              <div>
-                <div className="font-display font-bold text-base text-slate-900">Clinic360 Central Medical</div>
-                <div className="text-xs text-slate-500">
-                  Official Payment Receipt
-                  {Number(receiptPreview.receipt.reprint_count || 0) > 0 && (
-                    <span className="ml-2 font-mono font-semibold text-amber-800">
-                      · REPRINT COPY #{receiptPreview.receipt.reprint_count}
-                    </span>
-                  )}
-                </div>
-              </div>
-              <button onClick={() => setReceiptPreview(null)} className="no-print text-slate-400 hover:text-slate-700">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">Collect Patient Advance Deposit</h3>
+              <button onClick={() => setShowNewDeposit(false)} className="text-slate-400 hover:text-slate-700">
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <div className="text-xs space-y-1.5 font-mono">
-              <div className="flex justify-between">
-                <span className="text-slate-500">Receipt No:</span>
-                <span className="font-semibold text-slate-900">{receiptPreview.receipt.receipt_number}</span>
+            <form onSubmit={handleCollectDeposit} className="p-6 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Patient *</label>
+                <select
+                  required
+                  value={depForm.patient_id}
+                  onChange={(e) => setDepForm({ ...depForm, patient_id: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                >
+                  {patients.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.mrn} — {p.first_name} {p.last_name}
+                    </option>
+                  ))}
+                </select>
               </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Invoice No:</span>
-                <span>{receiptPreview.receipt.invoice_number}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Patient:</span>
-                <span>{receiptPreview.receipt.first_name} {receiptPreview.receipt.last_name} ({receiptPreview.receipt.mrn})</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Method:</span>
-                <span className="uppercase">{receiptPreview.receipt.payment_method.replace('_', ' ')}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Issued At:</span>
-                <span>{receiptPreview.receipt.issued_at}</span>
-              </div>
-            </div>
-            <div className="border-t border-b border-slate-200 py-3 space-y-1.5 text-xs">
-              {receiptPreview.items.map((it, idx) => (
-                <div key={idx} className="flex justify-between">
-                  <span>{it.description} × {it.quantity}</span>
-                  <span className="font-mono tabular-nums">${Number(it.line_total).toFixed(2)}</span>
+              {admissions.length > 0 && (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Link to IPD Admission (Optional)</label>
+                  <select
+                    value={depForm.admission_id}
+                    onChange={(e) => setDepForm({ ...depForm, admission_id: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="">General Patient Wallet</option>
+                    {admissions
+                      .filter((a) => a.status !== 'discharged')
+                      .map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.admission_number} — {a.first_name} {a.last_name}
+                        </option>
+                      ))}
+                  </select>
                 </div>
-              ))}
-            </div>
-            <div className="flex justify-between items-center font-mono text-sm font-bold text-slate-900">
-              <span>Amount Paid</span>
-              <span className="tabular-nums">${Number(receiptPreview.receipt.amount).toFixed(2)}</span>
-            </div>
-            <div className="text-xs text-slate-500 flex items-center gap-1.5">
-              <Lock className="w-3.5 h-3.5" />
-              <span>Cashier: {receiptPreview.receipt.cashier_name} · Immutable sequential receipt</span>
-            </div>
-            <div className="no-print pt-2 flex justify-end gap-2">
-              <button
-                onClick={() => handleReprintReceipt(receiptPreview.receipt.receipt_number)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-md"
-              >
-                <Printer className="w-3.5 h-3.5" />
-                <span>Log Reprint (Copy)</span>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Deposit Amount ($) *</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="1"
+                    required
+                    value={depForm.amount}
+                    onChange={(e) => setDepForm({ ...depForm, amount: e.target.value })}
+                    className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-md"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Method</label>
+                  <select
+                    value={depForm.payment_method}
+                    onChange={(e) => setDepForm({ ...depForm, payment_method: e.target.value })}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="cash">Cash</option>
+                    <option value="card">Card / POS</option>
+                    <option value="mobile_money">Mobile Money</option>
+                    <option value="bank_transfer">Bank Transfer</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Reference Number (Optional)</label>
+                <input
+                  value={depForm.reference_number}
+                  onChange={(e) => setDepForm({ ...depForm, reference_number: e.target.value })}
+                  className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setShowNewDeposit(false)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
+                  Cancel
+                </button>
+                <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
+                  Record Deposit
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Apply Deposit to Invoice Modal */}
+      {applyDepTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Apply Deposit · {applyDepTarget.deposit_number}
+              </h3>
+              <button onClick={() => setApplyDepTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
               </button>
-              <button
-                onClick={() => window.print()}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
-              >
-                <Printer className="w-3.5 h-3.5" />
-                <span>Print Original</span>
+            </div>
+            <form onSubmit={handleApplyDeposit} className="p-6 space-y-4">
+              <div className="text-xs text-slate-600">
+                Available Credit: <strong className="font-mono text-teal-800">${Number(applyDepTarget.remaining_amount).toFixed(2)}</strong> for{' '}
+                <strong className="text-slate-900">{applyDepTarget.first_name} {applyDepTarget.last_name}</strong>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Select Patient Invoice to Offset *</label>
+                <select
+                  required
+                  value={applyInvoiceId}
+                  onChange={(e) => setApplyInvoiceId(e.target.value)}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white"
+                >
+                  <option value="">-- Choose unpaid/partial invoice --</option>
+                  {invoices
+                    .filter(
+                      (inv) =>
+                        inv.patient_id === applyDepTarget.patient_id &&
+                        (inv.status === 'unpaid' || inv.status === 'partial')
+                    )
+                    .map((inv) => (
+                      <option key={inv.id} value={inv.id}>
+                        {inv.invoice_number} — Balance ${(Number(inv.total_amount) - Number(inv.paid_amount)).toFixed(2)}
+                      </option>
+                    ))}
+                </select>
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setApplyDepTarget(null)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
+                  Cancel
+                </button>
+                <button type="submit" disabled={!applyInvoiceId} className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md disabled:opacity-40">
+                  Apply Deposit Credit
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Printable Immutable Receipt Modal */}
+      {receiptPreview &&
+        createPortal(
+          <div className="print-modal-backdrop fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+            <div className="print-modal-card bg-white border border-slate-200 rounded-lg max-w-md w-full p-6 space-y-4">
+              <div className="flex items-start justify-between border-b border-slate-200 pb-3">
+                <div>
+                  <div className="font-display font-bold text-base text-slate-900">Clinic360 Central Medical</div>
+                  <div className="text-xs text-slate-500">
+                    Official Payment Receipt
+                    {Number(receiptPreview.receipt.reprint_count || 0) > 0 && (
+                      <span className="ml-2 font-mono font-semibold text-amber-800">
+                        · REPRINT COPY #{receiptPreview.receipt.reprint_count}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <button onClick={() => setReceiptPreview(null)} className="no-print text-slate-400 hover:text-slate-700">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="text-xs space-y-1.5 font-mono">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Receipt No:</span>
+                  <span className="font-semibold text-slate-900">{receiptPreview.receipt.receipt_number}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Invoice No:</span>
+                  <span>{receiptPreview.receipt.invoice_number}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Patient:</span>
+                  <span>{receiptPreview.receipt.first_name} {receiptPreview.receipt.last_name} ({receiptPreview.receipt.mrn})</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Method:</span>
+                  <span className="uppercase">{receiptPreview.receipt.payment_method.replace('_', ' ')}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Issued At:</span>
+                  <span>{receiptPreview.receipt.issued_at}</span>
+                </div>
+              </div>
+              <div className="border-t border-b border-slate-200 py-3 space-y-1.5 text-xs">
+                {receiptPreview.items.map((it, idx) => (
+                  <div key={idx} className="flex justify-between">
+                    <span>{it.description} × {it.quantity}</span>
+                    <span className="font-mono tabular-nums">${Number(it.line_total).toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-between items-center font-mono text-sm font-bold text-slate-900">
+                <span>Amount Paid</span>
+                <span className="tabular-nums">${Number(receiptPreview.receipt.amount).toFixed(2)}</span>
+              </div>
+              <div className="text-xs text-slate-500 flex items-center gap-1.5">
+                <Lock className="w-3.5 h-3.5" />
+                <span>Cashier: {receiptPreview.receipt.cashier_name} · Immutable sequential receipt</span>
+              </div>
+              <div className="no-print pt-2 flex justify-end gap-2">
+                <button
+                  onClick={() => handleReprintReceipt(receiptPreview.receipt.receipt_number)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-md"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>Log Reprint (Copy)</span>
+                </button>
+                <button
+                  onClick={() => window.print()}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>Print Original</span>
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {/* Stage 1: Front Desk Check-In & Consultation Billing Modal */}
+      {showCheckIn && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900">
+                  Front Desk Registration &amp; Consultation Check-In
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Lookup patient or create new EMR, select specialty &amp; doctor, and generate consultation fee invoice.
+                </p>
+              </div>
+              <button onClick={() => setShowCheckIn(false)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
               </button>
             </div>
+            <form onSubmit={handleFrontDeskCheckIn} className="p-6 space-y-5">
+              <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-md w-fit">
+                <button
+                  type="button"
+                  onClick={() => setCheckInMode('existing')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded ${
+                    checkInMode === 'existing' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                  }`}
+                >
+                  Existing Patient Lookup
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCheckInMode('new')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded ${
+                    checkInMode === 'new' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                  }`}
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>New Patient EMR</span>
+                </button>
+              </div>
+
+              {checkInMode === 'existing' ? (
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Search Patient (Name, Phone, or MRN)
+                    </label>
+                    <input
+                      value={checkInSearch}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCheckInSearch(val);
+                        const match = patients.find((p) => {
+                          const q = val.toLowerCase();
+                          return (
+                            p.mrn.toLowerCase().includes(q) ||
+                            `${p.first_name} ${p.last_name}`.toLowerCase().includes(q) ||
+                            p.phone.toLowerCase().includes(q)
+                          );
+                        });
+                        if (match) setCheckInPatientId(String(match.id));
+                      }}
+                      placeholder="Type MRN, phone number, or full name..."
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Selected Patient *</label>
+                    <select
+                      required
+                      value={checkInPatientId}
+                      onChange={(e) => setCheckInPatientId(e.target.value)}
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
+                    >
+                      {patients
+                        .filter((p) => {
+                          if (!checkInSearch.trim()) return true;
+                          const q = checkInSearch.toLowerCase();
+                          return (
+                            p.mrn.toLowerCase().includes(q) ||
+                            `${p.first_name} ${p.last_name}`.toLowerCase().includes(q) ||
+                            p.phone.toLowerCase().includes(q)
+                          );
+                        })
+                        .map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.mrn} — {p.first_name} {p.last_name} · {p.phone} ({p.patient_type})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3.5 bg-slate-50 border border-slate-200 rounded-md">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">First Name *</label>
+                    <input
+                      required
+                      value={newPatientForm.first_name}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, first_name: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Last Name *</label>
+                    <input
+                      required
+                      value={newPatientForm.last_name}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, last_name: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Sex *</label>
+                    <select
+                      value={newPatientForm.sex}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, sex: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                    >
+                      <option value="Female">Female</option>
+                      <option value="Male">Male</option>
+                      <option value="Other">Other</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Date of Birth *</label>
+                    <input
+                      type="date"
+                      required
+                      value={newPatientForm.date_of_birth}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, date_of_birth: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Phone *</label>
+                    <input
+                      required
+                      value={newPatientForm.phone}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, phone: e.target.value })}
+                      placeholder="+1-555-0199"
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Payer Type</label>
+                    <select
+                      value={newPatientForm.patient_type}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, patient_type: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                    >
+                      <option value="self-pay">Self-Pay (Cash-Before-Service)</option>
+                      <option value="insurance">Insurance</option>
+                      <option value="credit">Corporate Credit</option>
+                      <option value="exempt">Exempt</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Name</label>
+                    <input
+                      value={newPatientForm.next_of_kin_name}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, next_of_kin_name: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Emergency Contact Phone</label>
+                    <input
+                      value={newPatientForm.next_of_kin_phone}
+                      onChange={(e) => setNewPatientForm({ ...newPatientForm, next_of_kin_phone: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white font-mono"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Visit Type</label>
+                  <select
+                    value={checkInVisitType}
+                    onChange={(e) => setCheckInVisitType(e.target.value as 'walk_in' | 'scheduled' | 'follow_up')}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="walk_in">Walk-In Consultation</option>
+                    <option value="scheduled">Scheduled Appointment</option>
+                    <option value="follow_up">OPD Follow-up Review</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Medical Specialty</label>
+                  <select
+                    value={checkInSpecialty}
+                    onChange={(e) => {
+                      const nextSpec = e.target.value;
+                      setCheckInSpecialty(nextSpec);
+                      const matchingDoc = doctors.find((d) => (d.specialty || '').toLowerCase().includes(nextSpec.toLowerCase().split(' ')[0]));
+                      if (matchingDoc) setCheckInDoctorId(String(matchingDoc.id));
+                    }}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="General Medicine">General Medicine ($45.00)</option>
+                    <option value="Pediatrics">Pediatrics ($55.00)</option>
+                    <option value="Gynecology">Gynecology ($65.00)</option>
+                    <option value="Dermatology">Dermatology ($60.00)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Assigned Doctor</label>
+                  <select
+                    value={checkInDoctorId}
+                    onChange={(e) => setCheckInDoctorId(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="">Any Available Doctor</option>
+                    {doctors.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.full_name} {d.specialty ? `(${d.specialty})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Triage Priority</label>
+                  <select
+                    value={checkInPriority}
+                    onChange={(e) => setCheckInPriority(e.target.value as 'routine' | 'urgent' | 'emergency')}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
+                  >
+                    <option value="routine">Routine (Cash-Before-Service)</option>
+                    <option value="urgent">Urgent (Cash-Before-Service)</option>
+                    <option value="emergency">Emergency (Immediate Triage Override)</option>
+                  </select>
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Reason for Visit / Chief Complaint</label>
+                  <input
+                    value={checkInComplaint}
+                    onChange={(e) => setCheckInComplaint(e.target.value)}
+                    placeholder="e.g. Persistent fever & cough for 3 days"
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setShowCheckIn(false)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
+                  Cancel
+                </button>
+                <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
+                  Generate Consultation Bill &amp; Check In
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

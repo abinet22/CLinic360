@@ -29,6 +29,23 @@
   .print-only {
     display: block !important;
   }
+  body.has-print-modal .print-hide-when-modal {
+    display: none !important;
+  }
+  .print-modal-backdrop {
+    position: static !important;
+    background: transparent !important;
+    padding: 0 !important;
+    display: block !important;
+  }
+  .print-modal-card {
+    max-width: none !important;
+    width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
   body {
     background: #ffffff !important;
   }

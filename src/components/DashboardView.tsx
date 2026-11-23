@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
-import { ArrowRight, BedDouble, Calendar, ClipboardList, CreditCard, FlaskConical, Pill, Scan, Users } from 'lucide-react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { ArrowRight, BedDouble, BookOpen, Briefcase, Calendar, ClipboardList, CreditCard, FlaskConical, Package, Pill, Scan, Users } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { useRealtimeSync } from '../lib/useRealtimeSync';
 import type { UserContext } from '../types';
 
 interface DashboardData {
@@ -51,13 +52,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    setLoading(true);
+  const loadDashboard = useCallback(() => {
     apiFetch<DashboardData>('/api/dashboard')
       .then(setData)
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    loadDashboard();
+  }, [loadDashboard]);
+
+  useRealtimeSync(
+    ['visit:updated', 'queue:updated', 'payment:confirmed', 'lab:updated', 'imaging:updated', 'pharmacy:updated'],
+    () => {
+      loadDashboard();
+    }
+  );
 
   if (loading) {
     return (
@@ -192,6 +204,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
             <div className="text-xs text-slate-500 mt-0.5">Dispense &amp; FEFO</div>
           </button>
         )}
+        {user.permissions.includes('store.item.read') && (
+          <button
+            onClick={() => onNavigate('store')}
+            className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
+          >
+            <Package className="w-4 h-4 text-teal-700 mb-2" />
+            <div className="text-sm font-medium text-slate-900">Store &amp; FEFO</div>
+            <div className="text-xs text-slate-500 mt-0.5">GRN, batches &amp; expiry</div>
+          </button>
+        )}
         {user.permissions.includes('ipd.admission.read') && (
           <button
             onClick={() => onNavigate('ipd')}
@@ -210,6 +232,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
             <CreditCard className="w-4 h-4 text-teal-700 mb-2" />
             <div className="text-sm font-medium text-slate-900">Cashier &amp; Billing</div>
             <div className="text-xs text-slate-500 mt-0.5">Shifts &amp; receipts</div>
+          </button>
+        )}
+        {(user.permissions.includes('finance.report.view') || user.permissions.includes('accounting.ledger.manage')) && (
+          <button
+            onClick={() => onNavigate('accounting')}
+            className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
+          >
+            <BookOpen className="w-4 h-4 text-teal-700 mb-2" />
+            <div className="text-sm font-medium text-slate-900">Finance &amp; Reports</div>
+            <div className="text-xs text-slate-500 mt-0.5">Ledger, P&amp;L &amp; CSV</div>
+          </button>
+        )}
+        {(user.permissions.includes('hr.manage') || user.permissions.includes('hr.leave.request')) && (
+          <button
+            onClick={() => onNavigate('hr')}
+            className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
+          >
+            <Briefcase className="w-4 h-4 text-teal-700 mb-2" />
+            <div className="text-sm font-medium text-slate-900">HR &amp; Payroll</div>
+            <div className="text-xs text-slate-500 mt-0.5">Licences, leave &amp; pay</div>
           </button>
         )}
       </div>

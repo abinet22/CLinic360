@@ -13,6 +13,12 @@ export const LoginView: React.FC<LoginViewProps> = ({ onSuccess }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accounts, setAccounts] = useState<DemoAccount[]>([]);
+  const [twoFaChallenge, setTwoFaChallenge] = useState<{
+    challengeId: string;
+    maskedEmail: string;
+    devVerificationCode?: string;
+  } | null>(null);
+  const [twoFaCode, setTwoFaCode] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -41,9 +47,49 @@ export const LoginView: React.FC<LoginViewProps> = ({ onSuccess }) => {
     setLoading(true);
     try {
       const targetEmail = overrideEmail ?? email;
-      const res = await apiFetch<{ token: string; user: UserContext; dialect: string }>('/api/auth/login', {
+      const res = await apiFetch<{
+        token?: string;
+        user?: UserContext;
+        dialect?: string;
+        requires2fa?: boolean;
+        challengeId?: string;
+        maskedEmail?: string;
+        devVerificationCode?: string;
+      }>('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email: targetEmail, password }),
+      });
+
+      if (res.requires2fa && res.challengeId) {
+        setTwoFaChallenge({
+          challengeId: res.challengeId,
+          maskedEmail: res.maskedEmail || targetEmail,
+          devVerificationCode: res.devVerificationCode,
+        });
+        setTwoFaCode(res.devVerificationCode || '');
+        return;
+      }
+
+      if (res.token && res.user) {
+        setAuthToken(res.token);
+        onSuccess(res.user, res.dialect || 'sqlite');
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleVerify2fa(e: React.FormEvent) {
+    e.preventDefault();
+    if (!twoFaChallenge) return;
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await apiFetch<{ token: string; user: UserContext; dialect: string }>('/api/auth/verify-2fa', {
+        method: 'POST',
+        body: JSON.stringify({ challengeId: twoFaChallenge.challengeId, code: twoFaCode }),
       });
       setAuthToken(res.token);
       onSuccess(res.user, res.dialect);
@@ -70,10 +116,12 @@ export const LoginView: React.FC<LoginViewProps> = ({ onSuccess }) => {
             </div>
 
             <h1 className="font-display text-2xl font-semibold text-slate-900 tracking-tight mb-2">
-              Staff Sign In
+              {twoFaChallenge ? 'Two-Factor Verification' : 'Staff Sign In'}
             </h1>
             <p className="text-sm text-slate-600 mb-6 leading-relaxed">
-              Role-based clinical operations, patient records, appointment scheduling, and audited billing.
+              {twoFaChallenge
+                ? `Enter the 6-digit authenticator code dispatched for ${twoFaChallenge.maskedEmail} (enforced for ADM, ACC, and MGR accounts).`
+                : 'Role-based clinical operations, patient records, appointment scheduling, and audited billing.'}
             </p>
 
             {error && (
@@ -83,43 +131,87 @@ export const LoginView: React.FC<LoginViewProps> = ({ onSuccess }) => {
               </div>
             )}
 
-            <form onSubmit={(e) => handleLogin(e)} className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Staff Email
-                </label>
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
-                  placeholder="name@clinic360.local"
-                />
-              </div>
+            {twoFaChallenge ? (
+              <form onSubmit={handleVerify2fa} className="space-y-4">
+                {twoFaChallenge.devVerificationCode && (
+                  <div className="p-3 bg-teal-50 border border-teal-200 rounded-md text-xs text-teal-900">
+                    Demo Authenticator Code:{' '}
+                    <span className="font-mono font-bold tracking-widest">{twoFaChallenge.devVerificationCode}</span>
+                  </div>
+                )}
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    6-Digit Verification Code
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    value={twoFaCode}
+                    onChange={(e) => setTwoFaCode(e.target.value)}
+                    placeholder="000000"
+                    className="w-full px-3 py-2 text-base tracking-[0.35em] text-center border border-slate-300 rounded-md bg-white text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors disabled:opacity-60 whitespace-nowrap"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>{loading ? 'Verifying Code...' : 'Verify & Open Workspace'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTwoFaChallenge(null);
+                    setTwoFaCode('');
+                    setError(null);
+                  }}
+                  className="w-full px-3 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 border border-slate-200 rounded-md"
+                >
+                  Back to Sign In
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={(e) => handleLogin(e)} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Staff Email
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
+                    placeholder="name@clinic360.local"
+                  />
+                </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Password
-                </label>
-                <input
-                  type="password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700 font-mono"
-                />
-              </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Password
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700 font-mono"
+                  />
+                </div>
 
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors disabled:opacity-60 whitespace-nowrap"
-              >
-                <Lock className="w-4 h-4" />
-                <span>{loading ? 'Authenticating...' : 'Sign In to Workspace'}</span>
-              </button>
-            </form>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md transition-colors disabled:opacity-60 whitespace-nowrap"
+                >
+                  <Lock className="w-4 h-4" />
+                  <span>{loading ? 'Authenticating...' : 'Sign In to Workspace'}</span>
+                </button>
+              </form>
+            )}
           </div>
 
           <div className="mt-8 pt-6 border-t border-slate-200 flex items-center gap-2 text-xs text-slate-500">

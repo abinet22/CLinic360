@@ -8,17 +8,22 @@ import {
   Activity,
   BedDouble,
   Bell,
+  BookOpen,
+  Briefcase,
   Calendar,
   CreditCard,
   FlaskConical,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   Menu,
+  Package,
   ShieldCheck,
   Users,
   X,
 } from 'lucide-react';
 import { apiFetch, getAuthToken, setAuthToken } from './lib/api';
+import { resetRealtimeStream, useRealtimeSync } from './lib/useRealtimeSync';
 import type { AppNotification, UserContext } from './types';
 import { LoginView } from './components/LoginView';
 import { DashboardView } from './components/DashboardView';
@@ -29,8 +34,22 @@ import { DiagnosticsPharmacyView } from './components/DiagnosticsPharmacyView';
 import { InpatientView } from './components/InpatientView';
 import { BillingCashierView } from './components/BillingCashierView';
 import { AdminAuditView } from './components/AdminAuditView';
+import { StoreInventoryView } from './components/StoreInventoryView';
+import { AccountingReportsView } from './components/AccountingReportsView';
+import { HrPayrollView } from './components/HrPayrollView';
 
-type TabKey = 'dashboard' | 'patients' | 'appointments' | 'clinical' | 'diagnostics' | 'ipd' | 'billing' | 'governance';
+type TabKey =
+  | 'dashboard'
+  | 'patients'
+  | 'appointments'
+  | 'clinical'
+  | 'diagnostics'
+  | 'store'
+  | 'ipd'
+  | 'billing'
+  | 'accounting'
+  | 'hr'
+  | 'governance';
 
 export default function App() {
   const [user, setUser] = useState<UserContext | null>(null);
@@ -87,6 +106,14 @@ export default function App() {
     }
   }, [user, activeTab, loadNotifications]);
 
+  useRealtimeSync(
+    ['notification:created'],
+    () => {
+      loadNotifications();
+    },
+    Boolean(user)
+  );
+
   async function markNotificationRead(id: number) {
     await apiFetch(`/api/notifications/${id}/read`, { method: 'POST' }).catch(() => {});
     loadNotifications();
@@ -100,6 +127,7 @@ export default function App() {
   async function handleLogout() {
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setAuthToken(null);
+    resetRealtimeStream();
     setUser(null);
     setNotifications([]);
     setUnreadCount(0);
@@ -121,6 +149,7 @@ export default function App() {
         onSuccess={(u, d) => {
           setUser(u);
           setDialect(d);
+          resetRealtimeStream();
           setActiveTab('dashboard');
         }}
       />
@@ -148,6 +177,12 @@ export default function App() {
         perms.includes('pharmacy.prescription.read'),
     },
     {
+      key: 'store',
+      label: 'Store & FEFO',
+      icon: Package,
+      visible: perms.includes('store.item.read'),
+    },
+    {
       key: 'ipd',
       label: 'Inpatient & Beds',
       icon: BedDouble,
@@ -160,6 +195,21 @@ export default function App() {
       visible: perms.includes('billing.invoice.read') || perms.includes('billing.shift.manage'),
     },
     {
+      key: 'accounting',
+      label: 'Finance & Reports',
+      icon: BookOpen,
+      visible:
+        perms.includes('finance.report.view') ||
+        perms.includes('accounting.ledger.manage') ||
+        perms.includes('accounting.expense.create'),
+    },
+    {
+      key: 'hr',
+      label: 'HR & Payroll',
+      icon: Briefcase,
+      visible: perms.includes('hr.manage') || perms.includes('hr.leave.request'),
+    },
+    {
       key: 'governance',
       label: 'Users & Audit Log',
       icon: ShieldCheck,
@@ -170,8 +220,21 @@ export default function App() {
 
   const currentNav = navItems.find((i) => i.key === activeTab) || navItems[0];
 
+  if (user.mustChangePassword) {
+    return (
+      <ForcePasswordChangeGate
+        user={user}
+        onUpdated={(updated) => {
+          setUser(updated);
+          notify('Password updated. Welcome to Clinic360.');
+        }}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-slate-50 flex">
+    <div className="min-h-screen bg-slate-50 flex print-hide-when-modal">
       {/* Mobile Sidebar Backdrop */}
       {mobileNavOpen && (
         <div
@@ -360,10 +423,124 @@ export default function App() {
           {activeTab === 'appointments' && <AppointmentsView user={user} onNotify={notify} />}
           {activeTab === 'clinical' && <ClinicalOpdView user={user} onNotify={notify} />}
           {activeTab === 'diagnostics' && <DiagnosticsPharmacyView user={user} onNotify={notify} />}
+          {activeTab === 'store' && <StoreInventoryView user={user} onNotify={notify} />}
           {activeTab === 'ipd' && <InpatientView user={user} onNotify={notify} />}
           {activeTab === 'billing' && <BillingCashierView user={user} onNotify={notify} />}
+          {activeTab === 'accounting' && <AccountingReportsView user={user} onNotify={notify} />}
+          {activeTab === 'hr' && <HrPayrollView user={user} onNotify={notify} />}
           {activeTab === 'governance' && <AdminAuditView user={user} onNotify={notify} />}
         </main>
+      </div>
+    </div>
+  );
+}
+
+function ForcePasswordChangeGate({
+  user,
+  onUpdated,
+  onLogout,
+}: {
+  user: UserContext;
+  onUpdated: (u: UserContext) => void;
+  onLogout: () => void;
+}) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (newPassword.length < 8) {
+      setError('New password must be at least 8 characters long.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError('New password and confirmation do not match.');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch<{ ok: boolean; user: UserContext }>('/api/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      if (res.user) {
+        onUpdated(res.user);
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+      <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full p-7 space-y-5">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-md bg-teal-700 text-white flex items-center justify-center">
+            <KeyRound className="w-4 h-4" />
+          </div>
+          <div>
+            <h1 className="font-display text-lg font-semibold text-slate-900">Password Change Required</h1>
+            <p className="text-xs text-slate-500">
+              {user.fullName} ({user.email})
+            </p>
+          </div>
+        </div>
+        <p className="text-xs text-slate-600 leading-relaxed">
+          Security policy requires replacing your administrator-issued temporary password before accessing clinical or financial records.
+        </p>
+        {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-xs text-red-800">{error}</div>}
+        <form onSubmit={handleSubmit} className="space-y-3 text-xs">
+          <div>
+            <label className="block font-medium text-slate-700 mb-1">Temporary / Current Password</label>
+            <input
+              type="password"
+              required
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              className="w-full px-3 py-2 border border-slate-300 rounded-md font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-medium text-slate-700 mb-1">New Password (min 8 chars)</label>
+            <input
+              type="password"
+              required
+              minLength={8}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              className="w-full px-3 py-2 border border-slate-300 rounded-md font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-medium text-slate-700 mb-1">Confirm New Password</label>
+            <input
+              type="password"
+              required
+              minLength={8}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              className="w-full px-3 py-2 border border-slate-300 rounded-md font-mono"
+            />
+          </div>
+          <div className="flex items-center justify-between pt-2">
+            <button type="button" onClick={onLogout} className="text-xs text-slate-500 hover:text-slate-800">
+              Sign out
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white rounded-md font-medium disabled:opacity-60"
+            >
+              {saving ? 'Updating...' : 'Save New Password'}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );

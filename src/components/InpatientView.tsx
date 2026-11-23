@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BedDouble, CheckCircle2, ClipboardCheck, Plus, Sparkles, X } from 'lucide-react';
+import { BedDouble, CheckCircle2, ClipboardCheck, DollarSign, Plus, Printer, Sparkles, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type {
   Admission,
@@ -9,6 +9,8 @@ import type {
   UserContext,
   Ward,
 } from '../types';
+import { PrintDocumentModal, type PrintDocRequest } from './PrintDocumentModal';
+import { WardOccupancyChart } from './WardOccupancyChart';
 
 interface InpatientViewProps {
   user: UserContext;
@@ -22,6 +24,7 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
   const [admissions, setAdmissions] = useState<Admission[]>([]);
   const [mar, setMar] = useState<MedicationAdministration[]>([]);
   const [patients, setPatients] = useState<Patient[]>([]);
+  const [loading, setLoading] = useState(true);
 
   const [showAdmitModal, setShowAdmitModal] = useState(false);
   const [admitForm, setAdmitForm] = useState({
@@ -41,13 +44,19 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
   const [withholdTarget, setWithholdTarget] = useState<MedicationAdministration | null>(null);
   const [withholdReason, setWithholdReason] = useState('');
 
+  const [printRequest, setPrintRequest] = useState<PrintDocRequest | null>(null);
+  const [forceClearTarget, setForceClearTarget] = useState<{ adm: Admission; reasonNeededMsg: string } | null>(null);
+  const [forceReason, setForceReason] = useState('');
+
   const canCreateAdmission = user.permissions.includes('ipd.admission.create');
   const canAssignBed = user.permissions.includes('ipd.bed.assign');
   const canGiveMar = user.permissions.includes('ipd.mar.give');
   const canOrderDischarge = user.permissions.includes('ipd.discharge.create');
   const canClearDischarge = user.permissions.includes('ipd.discharge.clear');
+  const canBillBed = user.permissions.includes('ipd.bed.bill');
 
   const loadIpd = useCallback(async () => {
+    setLoading(true);
     try {
       const res = await apiFetch<{
         wards: Ward[];
@@ -64,6 +73,8 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
       }
     } catch (err) {
       onNotify((err as Error).message, 'error');
+    } finally {
+      setLoading(false);
     }
   }, [onNotify]);
 
@@ -170,13 +181,38 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
     }
   }
 
-  async function handleClearDischarge(adm: Admission) {
+  async function handleAccrueBed(adm: Admission) {
     try {
-      await apiFetch(`/api/ipd/admissions/${adm.id}/clear`, { method: 'POST' });
-      onNotify(`Financial clearance complete · ${adm.admission_number} discharged`, 'success');
+      const res = await apiFetch<{ invoiceNumber: string; daysToBill: number; total: number; depositApplied: number }>(
+        `/api/ipd/admissions/${adm.id}/accrue-bed`,
+        { method: 'POST', body: JSON.stringify({}) }
+      );
+      onNotify(
+        `Posted ${res.daysToBill} bed day(s) → ${res.invoiceNumber} ($${res.total.toFixed(2)}${res.depositApplied > 0 ? `, $${res.depositApplied.toFixed(2)} auto-applied from deposit` : ''})`,
+        'success'
+      );
       loadIpd();
     } catch (err) {
       onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleClearDischarge(adm: Admission, overrideReason?: string) {
+    try {
+      await apiFetch(`/api/ipd/admissions/${adm.id}/clear`, {
+        method: 'POST',
+        body: JSON.stringify(overrideReason ? { force_clearance_reason: overrideReason } : {}),
+      });
+      onNotify(`Financial clearance complete · ${adm.admission_number} discharged`, 'success');
+      setForceClearTarget(null);
+      setForceReason('');
+      loadIpd();
+    } catch (err) {
+      const msg = (err as Error).message;
+      onNotify(msg, 'error');
+      if (!overrideReason && (msg.includes('Unbilled') || msg.includes('Outstanding balance'))) {
+        setForceClearTarget({ adm, reasonNeededMsg: msg });
+      }
     }
   }
 
@@ -185,6 +221,8 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
 
   return (
     <div className="space-y-5">
+      <WardOccupancyChart wards={wards} beds={beds} admissions={admissions} loading={loading} />
+
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
           <button
@@ -340,6 +378,7 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                     <th className="py-2.5 px-4">Admission</th>
                     <th className="py-2.5 px-4">Patient</th>
                     <th className="py-2.5 px-4">Ward &amp; Bed</th>
+                    <th className="py-2.5 px-4">Stay &amp; Billing</th>
                     <th className="py-2.5 px-4">Diagnosis / Summary</th>
                     <th className="py-2.5 px-4">State</th>
                     <th className="py-2.5 px-4 text-right">Workflow</th>
@@ -364,7 +403,23 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                         <div className="font-medium text-slate-900">{adm.ward_name}</div>
                         <div className="font-mono text-slate-500">{adm.bed_number || 'Unassigned'}</div>
                       </td>
-                      <td className="py-3 px-4 text-xs text-slate-700 max-w-[260px]">
+                      <td className="py-3 px-4 text-xs font-mono tabular-nums space-y-0.5">
+                        <div className="text-slate-900">
+                          Stay {adm.days_stayed ?? 1}d · Billed {adm.bed_days_billed ?? 0}d
+                        </div>
+                        {(adm.unbilled_days ?? 0) > 0 && (
+                          <div className="text-amber-700 font-semibold">
+                            Unbilled: {adm.unbilled_days}d (${Number(adm.unbilled_bed_estimate || 0).toFixed(2)})
+                          </div>
+                        )}
+                        <div className="text-slate-500">
+                          Dep ${Number(adm.deposit_balance || 0).toFixed(2)} · Due{' '}
+                          <span className={(adm.outstanding_invoices || 0) > 0 ? 'text-red-700 font-semibold' : 'text-emerald-700'}>
+                            ${Number(adm.outstanding_invoices || 0).toFixed(2)}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-xs text-slate-700 max-w-[230px]">
                         <div>{adm.admission_diagnosis}</div>
                         {adm.discharge_summary && (
                           <div className="mt-1 text-slate-500 truncate">Summary: {adm.discharge_summary}</div>
@@ -386,6 +441,22 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap space-x-1.5">
+                        <button
+                          onClick={() => setPrintRequest({ type: 'ipd_statement', admissionId: adm.id })}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
+                        >
+                          <Printer className="w-3 h-3" />
+                          <span>Statement</span>
+                        </button>
+                        {canBillBed && adm.status !== 'discharged' && (
+                          <button
+                            onClick={() => handleAccrueBed(adm)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+                          >
+                            <DollarSign className="w-3 h-3" />
+                            <span>Post Bed Charge</span>
+                          </button>
+                        )}
                         {canAssignBed && (adm.status === 'ordered' || !adm.bed_id) && (
                           <button
                             onClick={() => {
@@ -724,6 +795,55 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
           </div>
         </div>
       )}
+      {/* Discharge Financial Override Modal */}
+      {forceClearTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Financial Clearance Hold · {forceClearTarget.adm.admission_number}
+              </h3>
+              <button onClick={() => setForceClearTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleClearDischarge(forceClearTarget.adm, forceReason);
+              }}
+              className="p-6 space-y-4"
+            >
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded text-xs text-amber-900">
+                {forceClearTarget.reasonNeededMsg}
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Exceptional Manager / Credit Override Reason (if discharging before settlement)
+                </label>
+                <textarea
+                  required
+                  rows={2}
+                  value={forceReason}
+                  onChange={(e) => setForceReason(e.target.value)}
+                  placeholder="e.g. Approved deferred payment arrangement by Finance Manager"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setForceClearTarget(null)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
+                  Go Back &amp; Settle
+                </button>
+                <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-md">
+                  Audit Override &amp; Discharge
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <PrintDocumentModal request={printRequest} onClose={() => setPrintRequest(null)} />
     </div>
   );
 };

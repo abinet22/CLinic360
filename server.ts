@@ -12,7 +12,39 @@ async function startServer() {
 
   await initDatabase();
 
-  app.use(cors());
+  const allowedOrigins = (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
+    allowedOrigins.push(process.env.APP_URL.trim());
+  }
+
+  app.use(
+    cors({
+      origin(origin, callback) {
+        if (!origin) return callback(null, true);
+        if (
+          allowedOrigins.includes(origin) ||
+          /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin) ||
+          /^https:\/\/[a-z0-9-]+\.[a-z0-9.-]*run\.app$/i.test(origin)
+        ) {
+          return callback(null, true);
+        }
+        return callback(new Error('Origin not allowed by CORS'));
+      },
+      credentials: true,
+    })
+  );
+
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+
   app.use(express.json({ limit: '2mb' }));
 
   app.use('/api', apiRoutes);
