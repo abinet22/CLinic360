@@ -1,14 +1,15 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
-import { initDatabase } from './server/db.ts';
+import { closeDatabase, initDatabase } from './server/db.ts';
 import apiRoutes from './server/routes.ts';
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
+  app.set('trust proxy', 1);
 
   await initDatabase();
 
@@ -45,7 +46,7 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '5mb' }));
 
   app.use('/api', apiRoutes);
 
@@ -63,10 +64,39 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.type === 'entity.too.large' ? 413 : err.status || 500;
+    console.error('[Clinic360] Unhandled request error:', err.message);
+    if (res.headersSent) return;
+    res.status(status).json({
+      error: status >= 500 ? 'Internal server error processing request.' : err.message || 'Request failed.',
+    });
+  });
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Clinic360] Server listening on http://localhost:${PORT}`);
   });
+
+  const shutdown = async (signal: string) => {
+    console.log(`[Clinic360] Received ${signal}, shutting down gracefully...`);
+    server.close(async () => {
+      await closeDatabase().catch(() => {});
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Clinic360] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Clinic360] Uncaught exception:', err);
+});
 
 startServer().catch((err) => {
   console.error('[Clinic360] Fatal startup error:', err);

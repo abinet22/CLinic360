@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertTriangle, BedDouble, Check, CheckCircle2, Eye, FlaskConical, Lock, Pill, Plus, Printer, Scan, Syringe, Trash2, Unlock, X } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { Activity, AlertTriangle, BedDouble, Check, CheckCircle2, Edit3, Eye, FlaskConical, Lock, Pill, Plus, Printer, Scan, Syringe, Trash2, Unlock, X } from 'lucide-react';
+import { ApiError, apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
 import type {
   ImagingAttachment,
@@ -144,10 +144,35 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
     },
   ]);
   const [rxNotes, setRxNotes] = useState('');
+  const [rxAllergyOverride, setRxAllergyOverride] = useState('');
+  const [rxOverrideRequired, setRxOverrideRequired] = useState(false);
   const [reopenReason, setReopenReason] = useState('');
   const [showAdmitModal, setShowAdmitModal] = useState(false);
   const [admitWardId, setAdmitWardId] = useState('');
   const [admitDx, setAdmitDx] = useState('');
+
+  // 24h vitals correction modal
+  const [correctVitalTarget, setCorrectVitalTarget] = useState<VitalsRecord | null>(null);
+  const [correctVitalForm, setCorrectVitalForm] = useState({
+    bp_systolic: '',
+    bp_diastolic: '',
+    temperature: '',
+    pulse: '',
+    respiratory_rate: '',
+    spo2: '',
+    weight_kg: '',
+    height_cm: '',
+    notes: '',
+    correction_reason: '',
+  });
+
+  // Order cancellation modal
+  const [cancelOrderTarget, setCancelOrderTarget] = useState<{
+    type: 'lab' | 'imaging' | 'nursing';
+    id: number;
+    label: string;
+  } | null>(null);
+  const [cancelOrderReason, setCancelOrderReason] = useState('');
 
   const canVitals = user.permissions.includes('vitals.create');
   const canBypassGate = user.permissions.includes('payment.gate.bypass');
@@ -232,6 +257,8 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
     if (selectedVisitId) {
       setVitalsBypassGate(false);
       setVitalsBypassReason('');
+      setRxAllergyOverride('');
+      setRxOverrideRequired(false);
       loadVisitDetail(selectedVisitId);
     }
   }, [selectedVisitId, loadVisitDetail]);
@@ -273,6 +300,67 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
       );
       setVitalsBypassGate(false);
       setVitalsBypassReason('');
+      loadVisitDetail(selectedVisitId);
+      loadVisits();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  function openCorrectVital(vt: VitalsRecord) {
+    setCorrectVitalTarget(vt);
+    setCorrectVitalForm({
+      bp_systolic: vt.bp_systolic != null ? String(vt.bp_systolic) : '',
+      bp_diastolic: vt.bp_diastolic != null ? String(vt.bp_diastolic) : '',
+      temperature: vt.temperature != null ? String(vt.temperature) : '',
+      pulse: vt.pulse != null ? String(vt.pulse) : '',
+      respiratory_rate: vt.respiratory_rate != null ? String(vt.respiratory_rate) : '',
+      spo2: vt.spo2 != null ? String(vt.spo2) : '',
+      weight_kg: vt.weight_kg != null ? String(vt.weight_kg) : '',
+      height_cm: vt.height_cm != null ? String(vt.height_cm) : '',
+      notes: vt.notes || '',
+      correction_reason: '',
+    });
+  }
+
+  async function handleSubmitCorrectVital(e: React.FormEvent) {
+    e.preventDefault();
+    if (!correctVitalTarget || !selectedVisitId) return;
+    try {
+      await apiFetch(`/api/vitals/${correctVitalTarget.id}/correct`, {
+        method: 'POST',
+        body: JSON.stringify({
+          bp_systolic: correctVitalForm.bp_systolic ? Number(correctVitalForm.bp_systolic) : undefined,
+          bp_diastolic: correctVitalForm.bp_diastolic ? Number(correctVitalForm.bp_diastolic) : undefined,
+          temperature: correctVitalForm.temperature ? Number(correctVitalForm.temperature) : undefined,
+          pulse: correctVitalForm.pulse ? Number(correctVitalForm.pulse) : undefined,
+          respiratory_rate: correctVitalForm.respiratory_rate ? Number(correctVitalForm.respiratory_rate) : undefined,
+          spo2: correctVitalForm.spo2 ? Number(correctVitalForm.spo2) : undefined,
+          weight_kg: correctVitalForm.weight_kg ? Number(correctVitalForm.weight_kg) : undefined,
+          height_cm: correctVitalForm.height_cm ? Number(correctVitalForm.height_cm) : undefined,
+          notes: correctVitalForm.notes || undefined,
+          correction_reason: correctVitalForm.correction_reason,
+        }),
+      });
+      onNotify(`Vitals amendment recorded for entry #${correctVitalTarget.id}`, 'success');
+      setCorrectVitalTarget(null);
+      loadVisitDetail(selectedVisitId);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleCancelOrderSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!cancelOrderTarget || !selectedVisitId) return;
+    try {
+      await apiFetch(`/api/orders/${cancelOrderTarget.type}/${cancelOrderTarget.id}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: cancelOrderReason }),
+      });
+      onNotify(`Cancelled ${cancelOrderTarget.label} and voided unpaid invoice`, 'success');
+      setCancelOrderTarget(null);
+      setCancelOrderReason('');
       loadVisitDetail(selectedVisitId);
       loadVisits();
     } catch (err) {
@@ -425,6 +513,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
           method: 'POST',
           body: JSON.stringify({
             notes: rxNotes.trim() || undefined,
+            overrideAllergyReason: rxAllergyOverride.trim() || undefined,
             items: validItems.map((it) => ({
               medicine_id: Number(it.medicine_id),
               dosage: it.dosage,
@@ -441,6 +530,8 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
         'success'
       );
       setRxNotes('');
+      setRxAllergyOverride('');
+      setRxOverrideRequired(false);
       setRxItems([
         {
           medicine_id: medCatalog[0] ? String(medCatalog[0].id) : '',
@@ -454,6 +545,9 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
       loadVisitDetail(selectedVisitId);
       loadVisits();
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409 && Array.isArray(err.data?.allergyConflicts)) {
+        setRxOverrideRequired(true);
+      }
       onNotify((err as Error).message, 'error');
     }
   }
@@ -719,6 +813,11 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                         <strong>{vt.pulse}</strong> · SpO2{' '}
                         <strong className={Number(vt.spo2) < 92 ? 'text-red-700' : 'text-slate-900'}>{vt.spo2}%</strong> · BMI{' '}
                         <strong>{vt.bmi ?? '-'}</strong>
+                        {vt.corrected_of_id && (
+                          <span className="ml-2 font-sans text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded">
+                            Amended #{vt.corrected_of_id}: {vt.correction_reason}
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2">
                         {vt.early_warning_flag === 1 && (
@@ -726,6 +825,17 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                             <AlertTriangle className="w-3.5 h-3.5" />
                             <span>Early Warning</span>
                           </span>
+                        )}
+                        {canVitals && !isClosed && (
+                          <button
+                            type="button"
+                            onClick={() => openCorrectVital(vt)}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-slate-700 border border-slate-300 hover:bg-slate-50 rounded"
+                            title="Amend vitals within 24h window"
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>Amend</span>
+                          </button>
                         )}
                         <span className="font-mono text-slate-400">{vt.recorded_at}</span>
                       </div>
@@ -890,15 +1000,27 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                     />
                   </div>
                 </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Treatment Plan</label>
-                  <textarea
-                    rows={2}
-                    disabled={!canUpdateVisit || isClosed}
-                    value={consultForm.treatment_plan}
-                    onChange={(e) => setConsultForm({ ...consultForm, treatment_plan: e.target.value })}
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md disabled:bg-slate-50"
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Treatment Plan</label>
+                    <textarea
+                      rows={2}
+                      disabled={!canUpdateVisit || isClosed}
+                      value={consultForm.treatment_plan}
+                      onChange={(e) => setConsultForm({ ...consultForm, treatment_plan: e.target.value })}
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md disabled:bg-slate-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">Follow-Up Date</label>
+                    <input
+                      type="date"
+                      disabled={!canUpdateVisit || isClosed}
+                      value={consultForm.follow_up_date}
+                      onChange={(e) => setConsultForm({ ...consultForm, follow_up_date: e.target.value })}
+                      className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-md disabled:bg-slate-50"
+                    />
+                  </div>
                 </div>
                 {canUpdateVisit && !isClosed && (
                   <div className="flex justify-end pt-1">
@@ -997,6 +1119,20 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                                   </button>
                                 </div>
                               )}
+                              {lo.status === 'ordered' && !isClosed && canOrderLab && (
+                                <div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setCancelOrderReason('');
+                                      setCancelOrderTarget({ type: 'lab', id: lo.id, label: `Lab: ${lo.test_name}` });
+                                    }}
+                                    className="px-2 py-0.5 text-[11px] font-medium text-red-700 border border-red-200 hover:bg-red-50 rounded"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              )}
                             </div>
                           </div>
                           {panelItems.length > 0 && (
@@ -1080,6 +1216,18 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                                 <span>Print</span>
                               </button>
                             )}
+                            {(io.status === 'ordered' || io.status === 'scheduled') && !isClosed && canOrderImaging && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setCancelOrderReason('');
+                                  setCancelOrderTarget({ type: 'imaging', id: io.id, label: `Imaging: ${io.exam_name}` });
+                                }}
+                                className="px-2 py-0.5 text-[11px] font-medium text-red-700 border border-red-200 hover:bg-red-50 rounded"
+                              >
+                                Cancel
+                              </button>
+                            )}
                           </div>
                         </div>
                         {io.impression && (
@@ -1158,15 +1306,29 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                           </div>
                           {np.notes && <div className="text-slate-600 mt-0.5">{np.notes}</div>}
                         </div>
-                        {np.status === 'ordered' && canCompleteNursing && (
-                          <button
-                            onClick={() => handleCompleteNursingProcedure(np.id)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded"
-                          >
-                            <Check className="w-3 h-3" />
-                            <span>Mark Performed</span>
-                          </button>
-                        )}
+                        <div className="flex items-center gap-1.5">
+                          {np.status === 'ordered' && canCompleteNursing && (
+                            <button
+                              onClick={() => handleCompleteNursingProcedure(np.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded"
+                            >
+                              <Check className="w-3 h-3" />
+                              <span>Mark Performed</span>
+                            </button>
+                          )}
+                          {np.status === 'ordered' && !isClosed && canNursingOrder && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCancelOrderReason('');
+                                setCancelOrderTarget({ type: 'nursing', id: np.id, label: `Nursing: ${np.service_name}` });
+                              }}
+                              className="px-2 py-1 text-xs font-medium text-red-700 border border-red-200 hover:bg-red-50 rounded"
+                            >
+                              Cancel
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))
                   )}
@@ -1203,13 +1365,28 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                   )}
                 </div>
 
-                {rxAllergyWarnings.length > 0 && (
-                  <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-900 flex items-start gap-2">
-                    <AlertTriangle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
-                    <div>
-                      <strong>Allergy Conflict Alert:</strong> Patient allergies (<em>{v.allergies}</em>) may conflict with{' '}
-                      <strong>{rxAllergyWarnings.map((m) => m.generic_name).join(', ')}</strong>.
+                {(rxAllergyWarnings.length > 0 || rxOverrideRequired) && (
+                  <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-900 space-y-2">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                      <div>
+                        <strong>Allergy Conflict Alert:</strong> Patient allergies (<em>{v.allergies}</em>) may conflict with{' '}
+                        <strong>
+                          {rxAllergyWarnings.length > 0
+                            ? rxAllergyWarnings.map((m) => m.generic_name).join(', ')
+                            : 'selected medication'}
+                        </strong>
+                        . Document clinical override justification below to proceed.
+                      </div>
                     </div>
+                    <input
+                      required
+                      minLength={5}
+                      value={rxAllergyOverride}
+                      onChange={(e) => setRxAllergyOverride(e.target.value)}
+                      placeholder="Mandatory allergy override clinical justification (min 5 chars)..."
+                      className="w-full px-2.5 py-1.5 text-xs bg-white border border-red-300 rounded text-slate-900"
+                    />
                   </div>
                 )}
 
@@ -1451,6 +1628,126 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                 ))
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 24h Vitals Amendment Modal */}
+      {correctVitalTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-lg w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Amend Vitals Entry #{correctVitalTarget.id}
+              </h3>
+              <button onClick={() => setCorrectVitalTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleSubmitCorrectVital} className="p-6 space-y-3 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div>
+                  <label className="block text-slate-600 mb-1">BP Sys</label>
+                  <input type="number" value={correctVitalForm.bp_systolic} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, bp_systolic: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">BP Dia</label>
+                  <input type="number" value={correctVitalForm.bp_diastolic} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, bp_diastolic: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">Temp (°C)</label>
+                  <input type="number" step="0.1" value={correctVitalForm.temperature} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, temperature: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">SpO2 (%)</label>
+                  <input type="number" value={correctVitalForm.spo2} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, spo2: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">Pulse</label>
+                  <input type="number" value={correctVitalForm.pulse} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, pulse: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">Resp Rate</label>
+                  <input type="number" value={correctVitalForm.respiratory_rate} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, respiratory_rate: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">Weight (kg)</label>
+                  <input type="number" step="0.1" value={correctVitalForm.weight_kg} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, weight_kg: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">Height (cm)</label>
+                  <input type="number" step="0.1" value={correctVitalForm.height_cm} onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, height_cm: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded font-mono" />
+                </div>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Clinical Notes</label>
+                <input
+                  value={correctVitalForm.notes}
+                  onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, notes: e.target.value })}
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Mandatory Correction Reason * (min 5 chars)</label>
+                <input
+                  required
+                  minLength={5}
+                  value={correctVitalForm.correction_reason}
+                  onChange={(e) => setCorrectVitalForm({ ...correctVitalForm, correction_reason: e.target.value })}
+                  placeholder="e.g. Thermometer recalibrated, re-measured reading"
+                  className="w-full px-2.5 py-1.5 border border-slate-300 rounded"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setCorrectVitalTarget(null)} className="px-4 py-2 border border-slate-300 rounded-md">
+                  Cancel
+                </button>
+                <button type="submit" className="px-4 py-2 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
+                  Save Vitals Amendment
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Order Cancellation Modal */}
+      {cancelOrderTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Cancel Order · {cancelOrderTarget.label}
+              </h3>
+              <button onClick={() => setCancelOrderTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleCancelOrderSubmit} className="p-6 space-y-4 text-xs">
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded text-amber-900">
+                Cancelling an unpaid order automatically voids its invoice and reverses its revenue accrual in the General Ledger.
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Cancellation Reason * (min 5 chars)</label>
+                <textarea
+                  required
+                  minLength={5}
+                  rows={2}
+                  value={cancelOrderReason}
+                  onChange={(e) => setCancelOrderReason(e.target.value)}
+                  placeholder="e.g. Duplicate order or patient declined scan"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setCancelOrderTarget(null)} className="px-4 py-2 border border-slate-300 rounded-md">
+                  Keep Order
+                </button>
+                <button type="submit" className="px-4 py-2 font-medium text-white bg-red-700 hover:bg-red-800 rounded-md">
+                  Confirm Cancel &amp; Void Bill
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

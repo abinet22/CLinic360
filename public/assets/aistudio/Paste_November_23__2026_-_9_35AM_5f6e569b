@@ -1,0 +1,321 @@
+Clinic360: End-to-End Gap Analysis
+
+Scope reviewed: your two spec documents, server/db.ts, server/routes.ts, server/auth.ts, server/realtime.ts, the MySQL schema, and all 14 React views plus types and config. I traced behaviour from the code, not from what the docs claim.
+
+Overall verdict: the outpatient loop (registration → cashier gate → triage → consult → lab/imaging/Rx → pharmacy) is real and well built. The payment gates, two-person lab verification, FEFO dispensing, segregation-of-duties checks on approvals and the hash-chained audit log all work. Finance, HR and inpatient are thinner than the UI suggests, and there are several production-blocking defects. It is not safe to go live yet.
+
+Severity key: Critical = blocker, High, Medium, Low.
+
+Area 1: Patient & Front-Desk Lifecycle
+
+Current state
+
+Implemented:
+MRN sequence, search by name, phone and MRN, and masking of clinical fields by permission.
+Walk-in visit creation with a consultation invoice and a Cash-Before-Service gate.
+Queue tickets sorted by priority, and appointments with overlap and clinician-block checks.
+Check-in that creates a visit, a bill and a ticket.
+Merge, which moves child rows and is audited.
+Partial or stubbed:
+Duplicate check is a non-blocking warning.
+Queue is a single global ticket sequence.
+Reschedule exists in the API only.
+Missing: consent, guardian, unknown or emergency patient, national ID capture in the UI, card reprint, doctor schedules, reminders, waitlist, no-show report.
+
+Gaps
+
+[High] Fabricated clinical defaults in forms.
+Registration pre-selects blood group O+ and DOB 1992-05-14. The cashier check-in form pre-fills DOB 1993-04-12 and sex Female.
+A blood group that was never tested is a transfusion-safety hazard, and a default DOB corrupts age-based logic such as the radiation gate and paediatrics.
+Fix: blank defaults, with blood_group = 'Unknown' and dob_estimated as explicit fields. Make DOB or estimated age mandatory with no preset.
+[High] Patient edit silently drops identity fields.
+The edit form sends name, sex and DOB, but PATCH /patients/:id whitelists only contact and payer fields. The UI says "Updated" and nothing changed.
+Fix: allow identity fields behind a new patient.identity.update permission with a mandatory reason, and write before/after to the audit log (spec B1 control).
+[High] Payer-type change is an unapproved free-care path.
+REC, CSH and DOC all hold patient.update. They can flip self-pay → exempt or insurance. Every later invoice then auto-sets paid at 0 or credit_billed with no approval.
+Fix: restrict patient_type changes to a patient.payer.change permission. Require an approval request for exempt with a reason and an expiry, and add patient_payer_history(patient_id, from, to, approved_by, valid_to).
+[High] The emergency flag is an unauthenticated payment bypass.
+Any role with visit.create (REC, CSH, NUR) can set triage_priority='emergency'. Lab, imaging, pharmacy and vitals then skip the gate with no reason and no permission check (canBypassPaymentGate trusts the flag).
+Fix:
+Only triage.emergency.set (NUR or DOC) may set emergency.
+Auto-create a payment_gate_bypass record with visit_id, set_by and reason.
+Give it a follow-up state (pending_billing → credit | waived | paid) so bypassed bills do not rot as unpaid invoices.
+[High] Patient selectors truncate at 80–100 records.
+Billing, IPD, appointments and the walk-in modal load /api/patients?limit=80|100 into a <select>. Beyond that, patients cannot be invoiced, booked or admitted.
+Fix: replace every dropdown with a server-side typeahead (/patients?search=&limit=10).
+[High] Merge is unsafe.
+The UI pre-selects the last and first rows of the current page as source and target.
+The table list omits nursing_procedures, medication_administrations and insurance_claims, leaving orphans.
+There is no preview and no undo.
+Fix: two-step merge. Pick both charts, show a side-by-side diff and row counts, require a second approver, and iterate over a registry of every table with patient_id (an information-schema check in a test).
+[Medium] Duplicate detection is weak.
+It matches on OR phone = ?, so families sharing a phone produce noise. There is no phonetic or fuzzy matching, which matters for transliterated Amharic names. National ID is not used.
+Fix: a scored match on normalised name tokens (Soundex or a trigram variant), DOB ±1 year, phone and national ID. A score above 0.9 should require a "this is a different person" confirmation with a reason.
+[Medium] No consent or guardian model.
+Fix: patient_consents(patient_id, type ENUM(general_treatment, data_processing, procedure, hiv_test, photo), granted_by, relationship, signed_at, document_id, revoked_at).
+Require a guardian for patients under 18, and block orders of type procedure without a consent row. Confirm obligations under the local data-protection law with counsel (Ethiopia enacted one in 2024).
+[Medium] Appointments have no schedules.
+Only overlap and manual blocks exist. Bookings are accepted at 03:00 or in the past.
+Fix: doctor_schedules(doctor_id, weekday, start, end, slot_minutes, max_overbook, valid_from, valid_to). Validate bookings against schedule minus blocks minus existing bookings, and add a reschedule UI, waitlist and no-show report.
+[Medium] Leave approval doesn't protect booked patients.
+Approved leave creates doctor_blocks, but existing appointments in that window are not flagged. Blocks are capped at 14 days (blocksCreated < 14), so longer leave leaves the tail open. Rejecting or cancelling leave after approval does not remove blocks.
+Fix: on approval, list the conflicting appointments into a "to reschedule" worklist. Remove the cap. Add source_leave_id to blocks so reversal is exact.
+[Medium] Queue is simplistic.
+The global Q- sequence never resets and there are no per-department tickets. "Call Next" works on any ticket, not the next one. There is no skip, recall or LWBS (left without being seen) timeout.
+Lab, pharmacy and cashier tickets are not created from orders, only seeded.
+Fix: a per-department daily sequence, and a /queue/:dept/call-next endpoint that picks by priority then time.
+[Medium] The registration-card fee is inconsistent. The cashier check-in sets charge_registration_card:false, so the fee is skipped on that path. Move the rule server-side, keyed on "first visit".
+[Low] "Today" uses toISOString() (UTC). In Addis (UTC+3) it is wrong from 00:00 to 03:00. Use a configured clinic time zone throughout. Timestamps are also shown as raw UTC strings.
+Area 2: Clinical & Diagnostic Workflows
+
+Current state
+
+Implemented:
+Vitals with BMI and a boolean early-warning flag, and consultation notes.
+Lab: lab orders and sample collection, single and multi-analyte results, two-person verify, reject and recollect, amend with the old value kept, and critical acknowledgement.
+Imaging: perform, report and addendum, a radiation-safety gate, and image attachments.
+Pharmacy: stock-check → bill → pay → dispense, with FEFO across batches, partial dispense, and an allergy block at dispense.
+Printable reports.
+Partial: admission from OPD, ICD-10 (free text), nursing procedures.
+Missing: order cancellation, referrals, certificates, follow-up linkage, controlled drugs, OTC, returns, and a usable inpatient clinical record.
+
+Gaps
+
+[High] Vitals are pre-filled with "normal" values. BP 120/80, SpO₂ 98, temp 36.8, 70 kg and 170 cm are defaults, so a nurse can save without measuring. Fix: no defaults, validate plausible ranges, require at least a core set, and log recorded_by plus a "not measured" option per field. Vitals are append-only with no correction path, so add vitals.corrected_of_id with a reason inside a 24-hour window.
+[High] No order cancellation. There is no cancel for lab, imaging or Rx, so wrong-patient orders cannot be undone (the playbook in doc 2, Part G, assumes they can). Fix: POST /orders/:type/:id/cancel with a reason. Allowed only in ordered state. If the invoice is unpaid, void it. If paid, auto-raise a refund request.
+[High] Permission holes in the lab route.
+PATCH /lab/orders/:id passes the middleware for anyone holding visit.read (PHA, NUR, WRD, MGR, AUD, LAB, IMG).
+ack_critical and recollect have no further permission check. An auditor or pharmacist can acknowledge a critical result or reset a rejected sample.
+Fix: lab.critical.ack (DOC only) and lab.sample.recollect. Remove visit.read from the route gate.
+[High] No server-side allergy check at prescribing.
+The check is client-side only at order time and server-side only at dispense, using substring matching on free text. Allergy None known conflates "unknown" with "NKDA".
+Fix: patient_allergies(allergen_code, class, reaction, severity, status, verified_by), and a server check in POST …/orders/prescription against drug class. Require a documented override reason and mark the Rx. Add dose-range and duplicate-therapy checks.
+[High] Inpatient clinical record is mostly absent.
+The MAR holds one optional "initial medication" row. There are no recurring doses (due → given, with no schedule generator, and missed is never set), no doctor medication orders, no rounds or SOAP, no nursing notes, no inpatient vitals (vitals.visit_id is NOT NULL), and no inpatient lab, imaging or drug orders charged to the admission.
+Fix: medication_orders(admission_id, medicine_id, dose, route, frequency, prn, start_at, stop_at, ordered_by, status) with a generator that creates medication_administrations rows for the next 24 hours. Mark a dose missed after a grace period and escalate. Add ward_rounds, nursing_notes and inpatient_vitals (keyed on admission_id). Let orders hang off admission_id as well as visit_id.
+[Medium] The pharmacy complete_visit flag bypasses the diagnosis rule. It closes the visit without checking diagnosis_text. Close should also fail while lab or imaging orders are outstanding. Share one closeVisit() service that enforces the same rules from both routes.
+[Medium] No stock reservation. Quantity is billed and paid, then stock can drain before dispensing, so dispensing fails after payment. Fix: a stock_reservations row at bill time with a TTL, or deduct at bill time and restore on cancel.
+[Medium] Controlled drugs, OTC and returns are absent. Fix: medicines.schedule and is_controlled. Add a controlled_register with a mandatory second-user signature (different user_id), otc_sales billed at the counter, and pharmacy_returns (to store or from patient) that post stock and GL.
+[Medium] Lab quality gaps.
+Abnormal flags are manual and no collected_by or collected_at is stored, so turnaround time cannot be measured from collection.
+Reference ranges are free text, not by age and sex.
+Fix: lab_reference_ranges(test_id, analyte, sex, age_min, age_max, low, high, critical_low, critical_high), auto-flag on entry, a notification to the doctor at entry (not only verify) for criticals, and a critical_call_log.
+[Medium] No consult tooling.
+ICD-10 is a free-text field with no validation.
+There is one diagnosis per visit, no referral letters, certificates or sick notes, and follow_up_date doesn't create an appointment.
+Any doctor can edit another doctor's open visit.
+Fix: an icd10_codes master and a visit_diagnoses table (primary and secondary), referrals and certificates with print templates, auto-create a follow-up appointment, and an ownership check on PATCH /visits/:id/consultation.
+[Medium] The visits list can silently drop patients. GET /visits returns the latest 60 rows across all statuses, closed ones included, sorted by priority. On a busy day, open visits fall off. Fix: server filters for doctor_id, status != closed and date, plus pagination.
+[Medium] Imaging upload limits are inconsistent. The UI and route allow about 2.8 MB, but express.json({limit:'2mb'}) rejects base64 above about 1.5 MB with a 413. Images are stored as base64 in the DB. Fix: move to object or file storage and keep a path in the DB. Verify file signatures, not only the MIME header. Add the reported_draft state, a separate reporter from the performer, and a repeat reason.
+[Low] Allergy and EWS logic is duplicated on client and server. Early-warning thresholds are adult-only. Add paediatric ranges and a proper score.
+Area 3: Finance & Billing
+
+Current state
+
+Implemented:
+Service catalogue (read-only), invoices, partial payments, four methods, sequential receipts with logged reprints, and shifts with variance notes.
+Deposits and approvals for discount, refund and void, with the self-approval block.
+Journal posting, a trial balance, a P&L, AP and AR claims, expense vouchers, five CSV-exportable reports, and an audit trail.
+Stubbed or missing: tariff management, tax, period close, reversals, bank reconciliation, COGS, a balance sheet and cash flow.
+
+Gaps
+
+[Critical] Revenue is double-counted on inpatient bed charges.
+accrue-bed posts Dr 1100 (Insurance AR) / Cr 4040 for every patient type, including self-pay.
+When the self-pay patient then pays, the payment posts Dr cash / Cr 4040 again. The same happens when a deposit is applied.
+Revenue is overstated and 1100 is inflated with self-pay amounts that are never cleared.
+Fix: adopt one policy. Recommended is accrual: invoice issue posts Dr 1150 Patient Receivable / Cr revenue (per line), payments post Dr cash / Cr 1150, deposits are a liability (2010) and applying one posts Dr 2010 / Cr 1150, and insurance invoices post Dr 1100 / Cr revenue. Add source_type+source_id unique constraints so nothing posts twice.
+[Critical] Revenue is attributed to one account per invoice. Payments credit the revenue account of the highest-value line. A multi-line invoice is posted wholly to one account. Fix: allocate per invoice_items.category, pro-rata across partial payments, or post at invoicing (see 1).
+[Critical] Refunds have no GL entry.
+Refund approval inserts a negative payment and adjusts the shift and invoice, but posts no journal. It also uses any open shift (ORDER BY id DESC LIMIT 1, not the requester's or approver's). It always records cash even if the original was card or mobile. It marks the invoice voided even though services were rendered.
+Fix: a credit_notes / refunds(original_payment_id, receipt_id, method, shift_id, journal_id) table. Post the reversing JE (Dr revenue / Cr cash or bank), refund by the original method, and use the approver-selected cashier's open shift. Cascade-cancel unfulfilled lab, Rx and imaging orders on void.
+[High] No COGS or inventory relief. GRN posts Dr 1200 / Cr 2100, but dispensing, consumable use, expiry write-offs and adjustments post nothing. Account 5010 exists and is never used, so inventory only grows and margin is overstated. Fix: a posting hook from stock_movements (Dr 5010 or 5xxx / Cr 1200) at batch cost, with write-offs to a loss account.
+[High] Credit and insurance flow is inconsistent.
+A patient can pay a credit_billed invoice, which credits AR (1100) before any claim debited it.
+Invoices that are never claimed carry no revenue.
+There is no payer master, coverage rules, co-pay split, pre-authorisation, claim batches, rejection or write-off. Settlement is always "remaining balance".
+Fix: payers, payer_plans, invoice_allocations(invoice_id, payer_id, amount, patient_copay), claims with rejected and partially_approved states, adjustments, and remittance records. Post revenue and AR at invoice time per payer share.
+[High] Money handling.
+The UI hard-codes $. For an Ethiopian clinic, use ETB (a currency setting).
+SQLite stores money as REAL and JS does float arithmetic. Use integer cents or decimal.js, with DECIMAL columns on both dialects.
+There is no VAT or withholding tax model.
+Fix: settings.currency, minor-unit integers in code, and tax_codes applied per service line.
+[High] No master-data or tariff management.
+There are no endpoints or screens to create or edit services, lab tests, imaging exams, medicines, prices, wards, suppliers or approval limits. Everything is seeded.
+Price lists have no effective dates, no per-payer tariff, and prices are hard-coded in UI labels ("$45.00").
+Fix: the CRUD endpoints, and price_lists(payer_plan_id, valid_from) / price_list_items. A price change needs MGR approval (spec B12).
+[High] Per-order invoices fragment the bill. Every lab test, scan, nursing procedure and Rx creates its own invoice, so a visit produces many invoices and the patient pays one at a time. Fix: a single open visit invoice that accumulates lines, with a per-line gate_status (so Cash-Before-Service still works at line level) and allocation of payments to lines.
+[High] No accounting controls.
+There are no accounting periods, no close or lock, and no reversal entries (reversal_of_id).
+Manual journals are limited to two lines.
+Expense vouchers default to auto_post:true with approved_by = requester, so one person creates, approves and posts an expense.
+Fix:
+accounting_periods(status). Posting to a closed period is rejected.
+journal_entries.reversal_of_id and a POST /journal/:id/reverse that requires a reason.
+Multi-line manual journals.
+Expense approval by a different user above a limit.
+cost_center_id on journal lines.
+[High] Cashier and discharge override controls. A cashier (holding ipd.discharge.clear) can force-discharge with an unpaid balance by typing any reason. The spec requires manager override. The check also applies only to self-pay, so insurance and credit patients are never checked. Fix: a separate ipd.discharge.override permission needing an approval request, and a credit-limit check for non-self-pay.
+[Medium] Reports are incomplete or over-exposed.
+/reports/:type is open to finance.report.view, audit.read or store.item.read. Pharmacists, lab techs and ward nurses can run the daily-cash and AR reports.
+Dashboard and reports exclude refunds, so revenue is gross.
+The trial balance row hard-codes "$0.00 diff".
+There is no balance sheet, cash flow, bank reconciliation or AP ageing.
+Fix: per-report permissions, net-of-refund revenue, computed totals, and bank_accounts / bank_reconciliations.
+[Medium] Smaller billing items.
+Reprinting "Original" is unlimited and unlogged.
+There is no paper-receipt capture for downtime (spec G).
+There is no cash drop, no denomination count, and no shift-variance tolerance.
+Receipt and ID prefixes hard-code the year 26.
+[Medium] Many multi-step writes are not transactional. Lab and imaging orders (invoice + items + order + visit update), prescriptions and appointment updates run without a transaction, so a mid-failure leaves an invoice with no order. Wrap them in withTransaction, and write the audit row in the same transaction.
+Area 4: HR & Workforce
+
+Current state
+
+Implemented: one staff_contracts row per user (salary, allowance, licence number and expiry), a licence-expiry banner, leave request and approval (which auto-blocks doctor calendars), monthly payroll draft, and GL posting.
+Missing:
+A staff master record, positions and supervisors.
+Attendance, rosters and shifts.
+Leave balances and a supervisor step.
+Payslips and self-service.
+Overtime, loans and incentives.
+Offboarding.
+Correct statutory deductions.
+A payroll approval chain.
+
+Gaps
+
+[Critical] Payroll has no controls. One permission (hr.manage) lets the HR officer generate and post payroll to the GL. The spec requires prepare → verify → approve (ACC) → approve (MGR). There is also no "paid" state and no payment entry: posting credits 2200 for gross, and nothing ever debits it. Fix: states draft → verified → approved → posted → paid, each by a different permission and user. Split the journal into Dr 5100 salaries and employer cost, Cr 2210 PAYE payable, Cr 2220 pension payable, Cr 2200 net pay payable. Then post Dr 2200 / Cr bank at payment.
+[Critical] Statutory calculation is hard-coded and wrong. It uses a flat 15% on gross including allowances and no pension. Ethiopian PAYE is progressive, and private-sector pension is 7% employee and 11% employer, with some allowances partly exempt. Fix: tax_brackets(valid_from, lower, upper, rate, deduction), pension_rules, and a per-component taxable flag. Verify the current schedule against the Ministry of Revenue before go-live.
+[High] Multi-role staff are paid twice. The payroll query LEFT JOINs user_roles, so a user with two roles produces two payroll lines. The contract list and /admin/users have the same duplication. Aggregate roles, or take the primary role from staff.primary_role.
+[High] No attendance, roster or shift model. This is the missing link between HR, clinical availability and payroll. Fix:
+staff_shifts(code, start, end, paid_hours).
+rosters(staff_id, date, shift_id, department, status), with a published state.
+attendance(staff_id, date, in, out, source ENUM(manual, device), late_minutes, status).
+Make doctor_schedules derive from published rosters, so booking is limited to rostered clinicians.
+Feed absent and late days, unpaid leave and overtime into the payroll run.
+[High] Licences are not enforced. An expired licence only shows a banner in the HR screen. The doctor can keep prescribing and ordering, and the system fires no notification to HR or staff. Fix: a daily job that notifies at 60, 30 and 7 days. On expiry, set clinical_privileges_active = false, which visit.update, prescription.create and lab.result.verify check.
+[High] Leave control gaps. HRO can decide their own request (no requested_by != decided_by check). There is no balance, accrual or leave type with entitlement. days_count is calendar days, including weekends and public holidays. There is no supervisor step and no reason required on reject. Fix: leave_balances, a holiday calendar (including Ethiopian public holidays), a supervisor-then-HR chain, and unpaid leave reflected in payroll.
+[Medium] No staff master or onboarding flow. Users are created first, and the contract is bolted on later (the spec says HR → Admin). Offboarding does not deactivate the account. contract_end is ignored, so expired or terminated staff are still paid. Fix: a staff table (personal data, ID, emergency contact, bank account, documents, supervisor, position) with user_id nullable. Admin creates the login from a staff record only. Setting exit_date triggers account deactivation and excludes the person from payroll from that date.
+[Medium] No payslips or self-service. The spec says each person sees their own payslip, but no such view exists. Add payslips published after posting, with a hr.payslip.own endpoint. Also restrict salary visibility, which is currently open to anyone with hr.manage (MGR and HRO).
+[Medium] No incentives or commissions. The data to compute them exists (visits.doctor_id, invoice items by category), but nothing uses it. Fix: incentive_rules(role, service_category, basis ENUM(percent, fixed), value) and a monthly incentive_lines accrual feeding payroll. The model needs a business rule decision from you first.
+[Low] Payroll cannot be regenerated or adjusted (one run per month, contract edits after the draft are not reflected), and has no proration for joiners and leavers, loans or advances.
+Area 5: Cross-Module Integration, Security & Operations
+
+Current state: the real-time SSE sync, JWT sessions with revocation, lockout after five failed logins, a bcrypt login, parameterised SQL, and the hash-chained audit log are all good foundations. Role and permission changes take effect immediately because permissions are loaded per request.
+
+Gaps
+
+[Critical] One database error can crash the process.
+Express 4 does not catch rejected promises from async handlers. A DB error (for example the enum mismatches below) becomes an unhandled rejection, and on current Node versions that terminates the process. There is also no global error middleware.
+Fix: express-async-errors or a wrap(fn) helper, a final error-handling middleware that logs and returns a safe 500, and process.on('unhandledRejection') logging.
+[Critical] MySQL schema and code have diverged.
+queue_tickets.department is ENUM('OPD','LAB','IMG','PHA','CSH'), but the code inserts 'TRIAGE'.
+visits.visit_type is ENUM('walk_in','scheduled'), but check-in sends 'follow_up'.
+Seed data uses SQLite's datetime('now'), which fails in MySQL and would abort first-run seeding. Other places rely on a try/catch fallback to NOW().
+Combined with 1, a MySQL deployment would crash on normal actions.
+Fix: one migration tool (Knex or Drizzle) generating both dialects, a nowSql() helper, a CI job that runs the full seed and an integration test against real MySQL 8, and ENUMs replaced by lookup tables or VARCHAR with CHECK.
+[Critical] Demo accounts and passwords ship to production.
+On an empty database, 16 users are seeded with the password Clinic360!.
+GET /auth/demo-accounts is unauthenticated and lists every staff email, and the login page offers one-click login for each.
+The "Create staff user" form pre-fills the same temporary password.
+Fix: gate seeding and /demo-accounts behind SEED_DEMO=true and non-production. Generate the first admin from a CLI. Generate one-time invite links instead of typed passwords.
+[Critical] Two-factor is non-functional in production.
+The code is returned to the client in dev only (devVerificationCode). In production nothing is sent, so ADM, ACC and MGR accounts cannot sign in.
+There is no attempt limit on /auth/verify-2fa, so the 6-digit code can be brute-forced, and challenges are held in memory.
+Fix: TOTP (otplib) with per-user secrets, or delivery over SMS or email, plus attempt limits and a lockout.
+[Critical] Privacy rules are enforced in the UI, not the server.
+Break-glass is a client modal. GET /patients/:id, /visits and /visits/:id return full clinical data to any doctor without it.
+role_permissions.scope (own, department) exists and is never used. There is no data scoping by doctor, department or branch.
+Any patient.read user can page through the full registry (up to 200 per page).
+Fix: one assertPatientAccess(user, patientId) used by every clinical read. It allows access for an assigned or treating clinician, and otherwise requires a break-glass record created in the last N minutes. Log every full-record read to the audit trail. Add search-required and rate-limited list endpoints.
+[High] Segregation-of-duties and over-permissioning.
+ADM holds accounting.expense.create (can post expenses to the GL, which the spec forbids).
+MGR holds accounting.ledger.manage (manual journals) and hr.manage.
+The hr.manage permission covers generate, post and approve (see HR 1). Nothing prevents a creator being the approver on expenses or leave.
+ensureExtraPermissionsAndSeeds re-adds bindings on every boot, so any future role edit through a UI would be undone at restart.
+Fix: a permission audit against doc 1 §7, split permissions (.create vs .approve), a generic assertDifferentUser(creator, approver) helper, and a seed that only inserts on first run.
+[High] No account-recovery or role-management endpoints.
+There is no forgot or reset password, no unlock, and no role change, multi-role assignment, temporary access or permission override. The "Roles" tab is read-only. Create-user accepts only one role.
+Fix: the W15 flows (reset link, forced change, role history to the audit log, temp roles with expires_at), plus user_permission_overrides.
+[High] Audit trail gaps.
+Audit rows are written after the business commit, outside the transaction. A failure means an unaudited action and a 500.
+Many reads are not logged (visits, lab, imaging, receipts, exports and report runs).
+The row hash excludes IP, user agent and branch.
+Verification skips recomputing the first row, runs only on demand, and cannot detect deletion of the newest rows.
+The app DB user has full rights on audit_logs, so the "append-only" claim is not enforced.
+Fix: write the audit row inside the same transaction. Revoke UPDATE and DELETE for the app DB user (INSERT and SELECT only). Add a nightly verify job that stores the latest hash externally (a file, email or another system) to detect tail truncation. Add per-record, per-user and per-date filters, export, and alert rules (spec §4.15).
+[High] Session and secret handling.
+If JWT_SECRET is unset, a random secret is generated per process, so every restart logs everyone out. Revoked tokens live in memory only.
+The SSE stream takes the JWT as a query string, which proxies log.
+There is no idle timeout and no trust proxy (so req.ip and the rate limit are wrong behind a reverse proxy).
+Fix: a required secret in production (fail fast), a revoked-token table, short-lived access tokens with refresh, and SSE auth via a short-lived one-time ticket.
+[High] Production-readiness basics are missing.
+There is no automated test suite, and the spec calls for per-role and per-route permission tests. Migrations are ad hoc ALTER TABLE with a silent catch.
+There is no structured logging, metrics or alerting, and no backup or restore tooling.
+There is no input validation library (add zod), no helmet or CSP, and no graceful shutdown.
+CORS accepts any *.run.app origin.
+Fix: versioned migrations, pino logs with request IDs, /health that checks the DB, and a nightly backup script with a quarterly restore test.
+[Medium] Notifications are per role, not per user. Marking one read marks it read for everyone in that role, and POST /notifications/:id/read does not check ownership. Fix: notification_receipts(user_id, notification_id), and SMS and email channels for patient reminders and result alerts.
+[Medium] No offline or downtime resilience.
+SSE only reconnects. There is no service worker, no queue for cashier actions, and no paper-fallback fields such as a paper receipt number or a back-dated entry with a reference. At minimum, document the LAN-server deployment and add a downtime-entry mode.
+[Medium] Single-branch in practice. branch_id exists on tables but no query filters by it. If multi-branch is planned, thread it through the access layer now, because retrofitting it later is costly.
+[Low] Localisation and printing. English only, no Amharic or Ethiopian calendar, A4 only (no 80 mm thermal receipt), and a hard-coded clinic name and letterhead with no settings screen.
+[Low] Doc drift. The spec says Ant Design and a MySQL-first stack. The code is Tailwind with a SQLite fallback and mysql2. Decide which is canonical and update the spec.
+Top 10 Priority Gaps
+Process crash on any async error (5.1), which makes every other bug a potential outage.
+MySQL/code divergence (5.2), so a MySQL deployment fails on normal actions.
+GL integrity: bed-charge double revenue, single-account revenue, refunds without journals, no COGS (3.1–3.4). The books cannot be trusted.
+Payment-gate bypass holes: emergency flag and unapproved payer-type changes (1.3, 1.4), which are direct revenue-leak and fraud paths.
+Privacy enforced only in the UI (5.5): break-glass, scope and bulk enumeration.
+Demo accounts in production, non-functional 2FA, no password recovery (5.3, 5.4, 5.7).
+No master-data CRUD (3.7): prices, tests, drugs and wards cannot be managed without DB access.
+Payroll without controls or correct tax, plus multi-role double payment (4.1–4.3).
+Fabricated clinical defaults and silently ignored identity edits (1.1, 1.2, 2.1), which are patient-safety and data-quality risks.
+Segregation-of-duties and permission holes (5.6, 2.3, 3.9, 3.10): lab critical ack and recollect, expense self-approval, cashier discharge override.
+
+Close behind: the unusable inpatient MAR (2.5), the missing stock ledger and order cancellation (2.2), and the absence of attendance and roster (4.4).
+
+Phased Remediation Roadmap
+
+Phase 1: Core operational and financial integrity (go-live blockers)
+
+Async error handling, structured logging, and versioned migrations.
+MySQL parity: lookup tables for enums, a dialect helper, and a CI integration test on real MySQL 8.
+Production hardening: gate demo seeding and /auth/demo-accounts, a required JWT_SECRET, invite links, TOTP, password reset and unlock, and a DB user without UPDATE or DELETE on audit_logs.
+Server-side patient access control with break-glass and read logging.
+One posting policy: accrual with a 1150 patient receivable, per-line revenue, refund JEs and credit notes, COGS from a stock_movements ledger, and accounting periods with reversals.
+Gate fixes: emergency permission, payer-change approval, order cancellation, and lab ack_critical and recollect permissions.
+Master-data CRUD: services, price lists, lab, imaging, medicines, wards and approval limits.
+Remove fabricated defaults, fix the identity edit, and replace patient dropdowns with typeahead.
+Wrap multi-step writes in transactions, with the audit row in the same transaction.
+Currency and decimal handling, and a time zone setting.
+
+Phase 2: HR and cross-workflow automation
+
+Staff master and onboarding → account creation → offboarding → deactivation.
+Shifts, roster and attendance feeding doctor_schedules and appointment slots.
+Leave balances, a holiday calendar and the supervisor chain, with conflict handling for booked appointments.
+Payroll state machine with segregated approvals, progressive PAYE and pension, a correct journal split, a paid state and payslips.
+Licence enforcement with notifications; incentives (once the business rule is agreed).
+Inpatient: medication orders and MAR generator, rounds, nursing notes, inpatient vitals and orders, auto bed-day accrual, and deposit-before-bed.
+Pharmacy: stock reservation, controlled-drugs register, OTC and returns; PO → GRN → supplier invoice matching; stock counts and expiry notifications.
+Insurance: payer master, plans, co-pay allocation and claim batches.
+
+Phase 3: Reporting, controls and polish
+
+Report library: per-report permissions, net revenue, balance sheet, cash flow, AP and AR ageing, bank reconciliation, HMIS/DHIS2 export, and PDF export.
+Audit tooling: nightly chain verification with an external anchor, alert rules, and per-record history screens.
+Consent management, referrals and certificates, ICD-10 master, lab reference ranges with auto-flagging, and a radiology draft/final workflow with object storage.
+Per-user notifications, SMS reminders, and offline/downtime mode.
+Amharic and Ethiopian calendar, thermal printing, a clinic settings screen, and multi-branch.
+Automated per-role, per-route permission tests, and an operations runbook (backups, restore drill, monitoring).
+Missing Context Checklist
+Business rules: the revenue-recognition policy you want (cash or accrual), discount thresholds, refund policy, credit and insurance contracts, incentive or commission rules, and licence-lapse policy.
+Payroll rules: the current Ethiopian PAYE brackets and pension treatment you must follow, and the allowance taxability schedule.
+Deployment: the target database (MySQL only, or SQLite for small sites), hosting (LAN server or cloud), reverse proxy and TLS setup, backup approach, and .env in production.
+Missing code: any server/routes split or middleware I did not see (the files shown contain no tests, migrations or CI config), and any scripts for backup or jobs.
+Data volume: expected patients, daily visits and staff count, which set pagination, indexing and queue-sizing choices.
+Regulatory: MoH reporting (HMIS/DHIS2) requirements, local health-records retention, and data-protection obligations.
+Integrations: SMS gateway, mobile money, lab analysers, PACS, fingerprint attendance devices.
+Roles in practice: whether one person holds several roles in your pilot clinic. That drives the multi-role fixes.

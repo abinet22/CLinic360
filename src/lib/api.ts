@@ -14,9 +14,11 @@ export function setAuthToken(token: string | null): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  data?: Record<string, unknown>;
+  constructor(status: number, message: string, data?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    this.data = data;
   }
 }
 
@@ -46,7 +48,7 @@ export async function apiFetch<T = unknown>(url: string, options: RequestInit = 
 
   if (!res.ok) {
     const errMsg = typeof data.error === 'string' ? data.error : `Request failed (${res.status})`;
-    throw new ApiError(res.status, errMsg);
+    throw new ApiError(res.status, errMsg, data);
   }
 
   return data as T;

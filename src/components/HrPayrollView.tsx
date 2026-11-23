@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Briefcase, Calendar, Check, Plus, RefreshCw, X } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertTriangle, Briefcase, Calendar, Check, FileText, Plus, RefreshCw, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
-import type { LeaveRequest, PayrollRun, StaffContract, UserContext } from '../types';
+import type { LeaveRequest, PayrollRun, StaffContract, StaffPayslip, UserContext } from '../types';
 
 interface HrOverview {
   isHrManager: boolean;
+  canViewPayroll: boolean;
   contracts: StaffContract[];
   leaveRequests: LeaveRequest[];
   payrollRuns: PayrollRun[];
@@ -16,10 +17,19 @@ interface Props {
   onNotify: (msg: string, type?: 'success' | 'error') => void;
 }
 
-export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
+export const HrPayrollView: React.FC<Props> = ({ user, onNotify }) => {
   const [data, setData] = useState<HrOverview | null>(null);
+  const [payslips, setPayslips] = useState<StaffPayslip[]>([]);
   const [loading, setLoading] = useState(true);
-  const [subTab, setSubTab] = useState<'contracts' | 'leave' | 'payroll'>('contracts');
+  const [subTab, setSubTab] = useState<'contracts' | 'leave' | 'payroll' | 'payslips'>('leave');
+  const initializedTab = useRef(false);
+
+  const canVerifyPayroll = user.permissions.includes('hr.payroll.verify');
+  const canApprovePayroll = user.permissions.includes('hr.payroll.approve');
+  const canPostPayroll = user.permissions.includes('hr.payroll.post') || user.permissions.includes('hr.manage');
+  const canPayPayroll = user.permissions.includes('hr.payroll.pay');
+  const canViewOwnPayslips =
+    user.permissions.includes('hr.payslip.own') || user.permissions.includes('hr.leave.request');
 
   // Contract modal
   const [contractOpen, setContractOpen] = useState(false);
@@ -40,23 +50,43 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
   const [lEnd, setLEnd] = useState(() => new Date().toISOString().slice(0, 10));
   const [lReason, setLReason] = useState('');
 
+  // Leave decision modal (mandatory note for rejection, optional for cancellation)
+  const [leaveDecisionTarget, setLeaveDecisionTarget] = useState<{
+    lr: LeaveRequest;
+    decision: 'rejected' | 'cancelled';
+  } | null>(null);
+  const [leaveDecisionNote, setLeaveDecisionNote] = useState('');
+
   // Payroll generation
   const [payMonth, setPayMonth] = useState(() => new Date().toISOString().slice(0, 7));
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiFetch<HrOverview>('/api/hr/overview');
+      const [res, slipRes] = await Promise.all([
+        apiFetch<HrOverview>('/api/hr/overview'),
+        canViewOwnPayslips
+          ? apiFetch<{ payslips: StaffPayslip[] }>('/api/hr/my-payslips').catch(() => ({ payslips: [] }))
+          : Promise.resolve({ payslips: [] }),
+      ]);
       setData(res);
-      if (!res.isHrManager) {
-        setSubTab('leave');
+      setPayslips(slipRes.payslips || []);
+      if (!initializedTab.current) {
+        initializedTab.current = true;
+        if (res.isHrManager) {
+          setSubTab('contracts');
+        } else if (res.canViewPayroll) {
+          setSubTab('payroll');
+        } else {
+          setSubTab('leave');
+        }
       }
     } catch (err) {
       onNotify((err as Error).message, 'error');
     } finally {
       setLoading(false);
     }
-  }, [onNotify]);
+  }, [canViewOwnPayslips, onNotify]);
 
   useEffect(() => {
     loadData();
@@ -108,17 +138,21 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
     }
   }
 
-  async function handleDecideLeave(id: number, decision: 'approved' | 'rejected') {
+  async function handleDecideLeave(id: number, decision: 'approved' | 'rejected' | 'cancelled', decision_note?: string) {
     try {
       const res = await apiFetch<{ blocksCreated: number }>(`/api/hr/leave/${id}/decide`, {
         method: 'POST',
-        body: JSON.stringify({ decision }),
+        body: JSON.stringify({ decision, decision_note }),
       });
       onNotify(
         decision === 'approved'
           ? `Leave approved${res.blocksCreated > 0 ? ` (${res.blocksCreated} clinician schedule block(s) auto-created)` : ''}.`
-          : 'Leave request rejected.'
+          : decision === 'cancelled'
+            ? 'Leave request cancelled and schedule blocks released.'
+            : 'Leave request rejected.'
       );
+      setLeaveDecisionTarget(null);
+      setLeaveDecisionNote('');
       loadData();
     } catch (err) {
       onNotify((err as Error).message, 'error');
@@ -138,12 +172,44 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
     }
   }
 
+  async function handleVerifyPayroll(runId: number) {
+    try {
+      await apiFetch(`/api/hr/payroll/${runId}/verify`, { method: 'POST' });
+      onNotify('Payroll run verified by Finance and forwarded for approval.');
+      loadData();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleApprovePayroll(runId: number) {
+    try {
+      await apiFetch(`/api/hr/payroll/${runId}/approve`, { method: 'POST' });
+      onNotify('Payroll run approved for General Ledger posting.');
+      loadData();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
   async function handlePostPayroll(runId: number) {
     try {
       const res = await apiFetch<{ entryNumber: string }>(`/api/hr/payroll/${runId}/post`, {
         method: 'POST',
       });
       onNotify(`Payroll posted to General Ledger (${res.entryNumber}).`);
+      loadData();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handlePayPayroll(runId: number) {
+    try {
+      const res = await apiFetch<{ entryNumber: string }>(`/api/hr/payroll/${runId}/pay`, {
+        method: 'POST',
+      });
+      onNotify(`Bank salary disbursement recorded (${res.entryNumber}).`);
       loadData();
     } catch (err) {
       onNotify((err as Error).message, 'error');
@@ -161,7 +227,9 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
           <p className="text-xs text-slate-500 mt-0.5">
             {data?.isHrManager
               ? 'Staff contracts, practising licence expiry alerts, leave workflow, and GL-linked monthly payroll.'
-              : 'Submit and track your personal leave requests.'}
+              : data?.canViewPayroll
+                ? 'Verify, approve, or disburse monthly payroll runs, plus personal leave & payslips.'
+                : 'Submit and track your personal leave requests and monthly payslips.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -218,14 +286,15 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
         </div>
       )}
 
-      {data?.isHrManager && (
+      {data && (
         <div className="flex flex-wrap gap-1 border-b border-slate-200">
           {(
             [
-              ['contracts', `Staff Contracts (${data.contracts.length})`],
-              ['leave', `Leave Requests (${data.leaveRequests.length})`],
-              ['payroll', `Monthly Payroll (${data.payrollRuns.length})`],
-            ] as Array<['contracts' | 'leave' | 'payroll', string]>
+              ...(data.isHrManager ? [['contracts', `Staff Contracts (${data.contracts.length})`] as const] : []),
+              ['leave', data.isHrManager ? `Leave Approvals (${data.leaveRequests.length})` : `My Leave (${data.leaveRequests.length})`] as const,
+              ...(data.isHrManager || data.canViewPayroll ? [['payroll', `Monthly Payroll (${data.payrollRuns.length})`] as const] : []),
+              ...(canViewOwnPayslips ? [['payslips', `My Payslips (${payslips.length})`] as const] : []),
+            ] as Array<['contracts' | 'leave' | 'payroll' | 'payslips', string]>
           ).map(([key, label]) => (
             <button
               key={key}
@@ -353,23 +422,39 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
                     </td>
                     {data.isHrManager && (
                       <td className="py-2.5 px-4 text-right">
-                        {lr.status === 'pending' && (
-                          <div className="inline-flex items-center gap-1.5">
+                        <div className="inline-flex items-center gap-1.5">
+                          {lr.status === 'pending' && (
+                            <>
+                              <button
+                                onClick={() => handleDecideLeave(lr.id, 'approved')}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded whitespace-nowrap"
+                              >
+                                <Check className="w-3 h-3" />
+                                <span>Approve</span>
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setLeaveDecisionNote('');
+                                  setLeaveDecisionTarget({ lr, decision: 'rejected' });
+                                }}
+                                className="px-2.5 py-1 text-xs font-medium text-red-700 border border-red-200 hover:bg-red-50 rounded"
+                              >
+                                Reject
+                              </button>
+                            </>
+                          )}
+                          {(lr.status === 'pending' || lr.status === 'approved') && (
                             <button
-                              onClick={() => handleDecideLeave(lr.id, 'approved')}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded whitespace-nowrap"
+                              onClick={() => {
+                                setLeaveDecisionNote('');
+                                setLeaveDecisionTarget({ lr, decision: 'cancelled' });
+                              }}
+                              className="px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
                             >
-                              <Check className="w-3 h-3" />
-                              <span>Approve</span>
+                              Cancel Leave
                             </button>
-                            <button
-                              onClick={() => handleDecideLeave(lr.id, 'rejected')}
-                              className="px-2.5 py-1 text-xs font-medium text-red-700 border border-red-200 hover:bg-red-50 rounded"
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        )}
+                          )}
+                        </div>
                       </td>
                     )}
                   </tr>
@@ -381,55 +466,98 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
       )}
 
       {/* PAYROLL */}
-      {data?.isHrManager && subTab === 'payroll' && (
+      {(data?.isHrManager || data?.canViewPayroll) && subTab === 'payroll' && (
         <div className="space-y-4">
           <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-wrap items-end justify-between gap-3">
-            <div className="flex items-end gap-3">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Payroll Month</label>
-                <input
-                  type="month"
-                  value={payMonth}
-                  onChange={(e) => setPayMonth(e.target.value)}
-                  className="px-3 py-1.5 text-xs border border-slate-300 rounded-md font-mono"
-                />
+            {data.isHrManager ? (
+              <div className="flex items-end gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Payroll Month</label>
+                  <input
+                    type="month"
+                    value={payMonth}
+                    onChange={(e) => setPayMonth(e.target.value)}
+                    className="px-3 py-1.5 text-xs border border-slate-300 rounded-md font-mono"
+                  />
+                </div>
+                <button
+                  onClick={handleGeneratePayroll}
+                  className="px-4 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
+                >
+                  Generate Monthly Draft
+                </button>
               </div>
-              <button
-                onClick={handleGeneratePayroll}
-                className="px-4 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
-              >
-                Generate Monthly Draft
-              </button>
-            </div>
+            ) : (
+              <div className="text-xs font-medium text-slate-700">
+                Payroll Approval &amp; Disbursement Controls (Segregation of Duties Enforced)
+              </div>
+            )}
             <div className="text-xs text-slate-500">
-              Posting a payroll run records Dr 5100 Salaries / Cr 2200 Payroll Payables in General Ledger.
+              Workflow: Draft → Verify (Finance) → Approve (Manager) → Post GL (5100/2200/2210/2220) → Disburse Bank Pay (2200/1020)
             </div>
           </div>
 
           {data.payrollRuns.map((run) => (
             <div key={run.id} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
               <div className="px-5 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
-                <div className="text-xs">
-                  <span className="font-mono font-semibold text-teal-800 mr-2">{run.run_number}</span>
-                  <span className="font-semibold text-slate-900">Period {run.pay_month}</span>
-                  <span className="mx-2 text-slate-300">·</span>
-                  <span className="font-mono">
-                    Gross ${Number(run.total_gross).toFixed(2)} · Tax ${Number(run.total_deductions).toFixed(2)} · Net $
-                    {Number(run.total_net).toFixed(2)}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {run.status === 'posted' ? (
-                    <span className="text-xs font-mono font-semibold text-emerald-700">
-                      Posted ({run.journal_entry_number})
+                <div className="text-xs space-y-1">
+                  <div>
+                    <span className="font-mono font-semibold text-teal-800 mr-2">{run.run_number}</span>
+                    <span className="font-semibold text-slate-900">Period {run.pay_month}</span>
+                    <span className="ml-2 px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono uppercase text-[11px]">
+                      {run.status}
                     </span>
-                  ) : (
+                    <span className="mx-2 text-slate-300">·</span>
+                    <span className="font-mono">
+                      Gross ${Number(run.total_gross).toFixed(2)} · Deductions ${Number(run.total_deductions).toFixed(2)} · Net $
+                      {Number(run.total_net).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-mono">
+                    Draft: {run.created_by_name || '—'}
+                    {run.verified_by_name && ` · Verified: ${run.verified_by_name}`}
+                    {run.approved_by_name && ` · Approved: ${run.approved_by_name}`}
+                    {run.journal_entry_number && ` · Accrual JE: ${run.journal_entry_number}`}
+                    {run.payment_journal_entry_number && ` · Bank Pay JE: ${run.payment_journal_entry_number}`}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {run.status === 'draft' && canVerifyPayroll && (
+                    <button
+                      onClick={() => handleVerifyPayroll(run.id)}
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-sky-700 hover:bg-sky-800 rounded whitespace-nowrap"
+                    >
+                      Verify (Finance)
+                    </button>
+                  )}
+                  {run.status === 'verified' && canApprovePayroll && (
+                    <button
+                      onClick={() => handleApprovePayroll(run.id)}
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-indigo-700 hover:bg-indigo-800 rounded whitespace-nowrap"
+                    >
+                      Approve Run
+                    </button>
+                  )}
+                  {run.status === 'approved' && canPostPayroll && (
                     <button
                       onClick={() => handlePostPayroll(run.id)}
-                      className="px-3 py-1 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded whitespace-nowrap"
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded whitespace-nowrap"
                     >
-                      Post to Accounting Ledger
+                      Post to GL
                     </button>
+                  )}
+                  {run.status === 'posted' && canPayPayroll && (
+                    <button
+                      onClick={() => handlePayPayroll(run.id)}
+                      className="px-3 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded whitespace-nowrap"
+                    >
+                      Disburse Bank Pay
+                    </button>
+                  )}
+                  {run.status === 'paid' && (
+                    <span className="text-xs font-mono font-semibold text-emerald-700">
+                      Disbursed ({run.payment_journal_entry_number || run.journal_entry_number})
+                    </span>
                   )}
                 </div>
               </div>
@@ -441,7 +569,8 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
                       <th className="py-2 px-4">Role</th>
                       <th className="py-2 px-4 text-right">Base</th>
                       <th className="py-2 px-4 text-right">Allowance</th>
-                      <th className="py-2 px-4 text-right">Tax (15%)</th>
+                      <th className="py-2 px-4 text-right">PAYE Tax</th>
+                      <th className="py-2 px-4 text-right">Pension (EE/ER)</th>
                       <th className="py-2 px-4 text-right">Net Pay</th>
                     </tr>
                   </thead>
@@ -452,7 +581,12 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
                         <td className="py-2 px-4 font-mono text-slate-500">{it.role_code}</td>
                         <td className="py-2 px-4 text-right font-mono tabular-nums">${Number(it.base_salary).toFixed(2)}</td>
                         <td className="py-2 px-4 text-right font-mono tabular-nums">${Number(it.allowances).toFixed(2)}</td>
-                        <td className="py-2 px-4 text-right font-mono tabular-nums">${Number(it.tax_deduction).toFixed(2)}</td>
+                        <td className="py-2 px-4 text-right font-mono tabular-nums">
+                          ${Number(it.paye_tax ?? it.tax_deduction).toFixed(2)}
+                        </td>
+                        <td className="py-2 px-4 text-right font-mono tabular-nums text-slate-600">
+                          ${Number(it.pension_employee ?? 0).toFixed(2)} / ${Number(it.pension_employer ?? 0).toFixed(2)}
+                        </td>
                         <td className="py-2 px-4 text-right font-mono font-semibold tabular-nums">${Number(it.net_pay).toFixed(2)}</td>
                       </tr>
                     ))}
@@ -461,6 +595,57 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* MY PAYSLIPS */}
+      {subTab === 'payslips' && (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-slate-200 flex items-center gap-2">
+            <FileText className="w-4 h-4 text-teal-700" />
+            <h2 className="font-display text-sm font-semibold text-slate-900">My Approved &amp; Posted Payslips</h2>
+          </div>
+          {payslips.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">
+              No approved or disbursed payslips recorded for your account yet.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <th className="py-2.5 px-4">Period &amp; Run</th>
+                    <th className="py-2.5 px-4">Status</th>
+                    <th className="py-2.5 px-4 text-right">Base Salary</th>
+                    <th className="py-2.5 px-4 text-right">Allowances</th>
+                    <th className="py-2.5 px-4 text-right">PAYE Tax</th>
+                    <th className="py-2.5 px-4 text-right">Pension (EE)</th>
+                    <th className="py-2.5 px-4 text-right">Net Pay</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {payslips.map((ps) => (
+                    <tr key={ps.id}>
+                      <td className="py-2.5 px-4 font-mono">
+                        <div className="font-semibold text-slate-900">{ps.pay_month}</div>
+                        <div className="text-slate-500">{ps.run_number}</div>
+                      </td>
+                      <td className="py-2.5 px-4 font-mono capitalize text-emerald-700 font-semibold">{ps.run_status}</td>
+                      <td className="py-2.5 px-4 text-right font-mono tabular-nums">${Number(ps.base_salary).toFixed(2)}</td>
+                      <td className="py-2.5 px-4 text-right font-mono tabular-nums">${Number(ps.allowances).toFixed(2)}</td>
+                      <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                        ${Number(ps.paye_tax ?? ps.tax_deduction).toFixed(2)}
+                      </td>
+                      <td className="py-2.5 px-4 text-right font-mono tabular-nums">${Number(ps.pension_employee ?? 0).toFixed(2)}</td>
+                      <td className="py-2.5 px-4 text-right font-mono font-semibold text-teal-800 tabular-nums">
+                        ${Number(ps.net_pay).toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
@@ -651,6 +836,59 @@ export const HrPayrollView: React.FC<Props> = ({ onNotify }) => {
                 </button>
                 <button type="submit" className="px-4 py-1.5 bg-teal-700 hover:bg-teal-800 text-white rounded-md font-medium">
                   Submit Request
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* LEAVE DECISION MODAL */}
+      {leaveDecisionTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg w-full max-w-md p-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                {leaveDecisionTarget.decision === 'rejected' ? 'Reject Leave Request' : 'Cancel Leave Request'}
+              </h3>
+              <button onClick={() => setLeaveDecisionTarget(null)} className="text-slate-400 hover:text-slate-600">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleDecideLeave(leaveDecisionTarget.lr.id, leaveDecisionTarget.decision, leaveDecisionNote);
+              }}
+              className="space-y-3 text-xs"
+            >
+              <div className="text-slate-600">
+                Staff: <strong className="text-slate-900">{leaveDecisionTarget.lr.staff_name}</strong> ({leaveDecisionTarget.lr.start_date} to{' '}
+                {leaveDecisionTarget.lr.end_date})
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">
+                  {leaveDecisionTarget.decision === 'rejected' ? 'Formal Rejection Reason *' : 'Cancellation Note (Optional)'}
+                </label>
+                <textarea
+                  rows={2}
+                  required={leaveDecisionTarget.decision === 'rejected'}
+                  value={leaveDecisionNote}
+                  onChange={(e) => setLeaveDecisionNote(e.target.value)}
+                  placeholder="Enter HR audit note..."
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button type="button" onClick={() => setLeaveDecisionTarget(null)} className="px-3 py-1.5 border border-slate-200 rounded-md">
+                  Back
+                </button>
+                <button
+                  type="submit"
+                  className={`px-4 py-1.5 text-white rounded-md font-medium ${
+                    leaveDecisionTarget.decision === 'rejected' ? 'bg-red-700 hover:bg-red-800' : 'bg-slate-900 hover:bg-slate-800'
+                  }`}
+                >
+                  Confirm {leaveDecisionTarget.decision === 'rejected' ? 'Rejection' : 'Cancellation'}
                 </button>
               </div>
             </form>

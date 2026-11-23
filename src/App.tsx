@@ -201,19 +201,33 @@ export default function App() {
       visible:
         perms.includes('finance.report.view') ||
         perms.includes('accounting.ledger.manage') ||
-        perms.includes('accounting.expense.create'),
+        perms.includes('accounting.expense.create') ||
+        perms.includes('accounting.period.manage') ||
+        perms.includes('accounting.journal.reverse'),
     },
     {
       key: 'hr',
       label: 'HR & Payroll',
       icon: Briefcase,
-      visible: perms.includes('hr.manage') || perms.includes('hr.leave.request'),
+      visible:
+        perms.includes('hr.manage') ||
+        perms.includes('hr.leave.request') ||
+        perms.includes('hr.payroll.verify') ||
+        perms.includes('hr.payroll.approve') ||
+        perms.includes('hr.payroll.post') ||
+        perms.includes('hr.payroll.pay') ||
+        perms.includes('hr.payslip.own'),
     },
     {
       key: 'governance',
       label: 'Users & Audit Log',
       icon: ShieldCheck,
-      visible: perms.includes('audit.read') || perms.includes('admin.user.manage') || perms.includes('admin.role.manage'),
+      visible:
+        perms.includes('audit.read') ||
+        perms.includes('admin.user.manage') ||
+        perms.includes('admin.role.manage') ||
+        perms.includes('admin.settings.manage') ||
+        perms.includes('catalog.manage'),
     },
   ];
   const navItems = allNavItems.filter((item) => item.visible);

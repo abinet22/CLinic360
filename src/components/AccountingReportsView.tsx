@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BookOpen, Check, Download, FileText, Plus, Printer, RefreshCw, X } from 'lucide-react';
+import { BookOpen, Check, Download, FileText, Lock, Plus, Printer, RefreshCw, RotateCcw, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type {
+  AccountingPeriod,
   ChartAccount,
   ExpenseVoucher,
   InsuranceClaim,
@@ -35,6 +36,8 @@ interface AccountingOverview {
     last_name: string;
     created_at: string;
   }>;
+  periods?: AccountingPeriod[];
+  expenseAutoPostLimit?: number;
 }
 
 type SubTab = 'ledger' | 'statements' | 'ar' | 'ap' | 'expenses' | 'reports';
@@ -60,6 +63,8 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
 
   const canManage = user.permissions.includes('accounting.ledger.manage');
   const canRecordExpense = canManage || user.permissions.includes('accounting.expense.create');
+  const canClosePeriod = canManage || user.permissions.includes('accounting.period.manage');
+  const canReverseJournal = canManage || user.permissions.includes('accounting.journal.reverse');
 
   // Manual Journal Modal
   const [jeModalOpen, setJeModalOpen] = useState(false);
@@ -67,6 +72,13 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
   const [jeDebitAcct, setJeDebitAcct] = useState('5200');
   const [jeCreditAcct, setJeCreditAcct] = useState('1020');
   const [jeAmount, setJeAmount] = useState('');
+
+  // Accounting Period & Journal Reversal state
+  const [periodToClose, setPeriodToClose] = useState(() => new Date().toISOString().slice(0, 7));
+  const [closingPeriod, setClosingPeriod] = useState(false);
+  const [reverseTarget, setReverseTarget] = useState<JournalEntry | null>(null);
+  const [reverseReason, setReverseReason] = useState('');
+  const [reversingJournal, setReversingJournal] = useState(false);
 
   // Expense Voucher Form & Modal
   const [expModalOpen, setExpModalOpen] = useState(false);
@@ -217,9 +229,11 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
         }
       );
       onNotify(
-        res.entryNumber
-          ? `Expense voucher ${res.voucherNumber} recorded & posted to GL (${res.entryNumber}).`
-          : `Expense voucher ${res.voucherNumber} created.`
+        res.status === 'pending'
+          ? `Expense voucher ${res.voucherNumber} submitted for Manager approval (exceeds auto-post limit).`
+          : res.entryNumber
+            ? `Expense voucher ${res.voucherNumber} recorded & posted to GL (${res.entryNumber}).`
+            : `Expense voucher ${res.voucherNumber} created.`
       );
       setExpModalOpen(false);
       setExpPayee('');
@@ -230,6 +244,51 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
       onNotify((err as Error).message, 'error');
     } finally {
       setExpSubmitting(false);
+    }
+  }
+
+  async function handleClosePeriod(e: React.FormEvent) {
+    e.preventDefault();
+    if (!/^\d{4}-\d{2}$/.test(periodToClose.trim())) {
+      onNotify('Enter accounting period in YYYY-MM format.', 'error');
+      return;
+    }
+    setClosingPeriod(true);
+    try {
+      await apiFetch('/api/accounting/periods/close', {
+        method: 'POST',
+        body: JSON.stringify({ period_code: periodToClose.trim() }),
+      });
+      onNotify(`Accounting period ${periodToClose.trim()} closed and locked.`);
+      loadOverview();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setClosingPeriod(false);
+    }
+  }
+
+  async function handleReverseJournal(e: React.FormEvent) {
+    e.preventDefault();
+    if (!reverseTarget) return;
+    if (reverseReason.trim().length < 5) {
+      onNotify('Reversal requires a formal audit reason (min 5 characters).', 'error');
+      return;
+    }
+    setReversingJournal(true);
+    try {
+      const res = await apiFetch<{ entryNumber: string }>(`/api/accounting/journals/${reverseTarget.id}/reverse`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: reverseReason.trim() }),
+      });
+      onNotify(`Posted reversal entry ${res.entryNumber} for ${reverseTarget.entry_number}.`);
+      setReverseTarget(null);
+      setReverseReason('');
+      loadOverview();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setReversingJournal(false);
     }
   }
 
@@ -354,54 +413,129 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
 
       {/* GENERAL LEDGER */}
       {subTab === 'ledger' && overview && (
-        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-          <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
-            <h2 className="font-display text-sm font-semibold text-slate-900">Posted Journal Entries</h2>
-            <span className="text-xs font-mono text-slate-500">{overview.journals.length} entries</span>
-          </div>
-          <div className="divide-y divide-slate-200">
-            {overview.journals.map((je) => (
-              <div key={je.id} className="p-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-2.5 text-xs">
-                    <span className="font-mono font-semibold text-teal-800">{je.entry_number}</span>
-                    <span className="font-mono text-slate-500">{je.entry_date}</span>
-                    <span className="text-slate-400">·</span>
-                    <span className="uppercase font-mono text-[11px] text-slate-600">{je.source_type}</span>
-                    <span className="font-medium text-slate-900">{je.description}</span>
-                  </div>
-                  <div className="text-xs font-mono tabular-nums text-slate-600">
-                    Dr ${Number(je.total_debit).toFixed(2)} / Cr ${Number(je.total_credit).toFixed(2)} · {je.posted_by_name}
-                  </div>
-                </div>
-                <table className="w-full text-xs border border-slate-100 rounded">
-                  <thead>
-                    <tr className="bg-slate-50 text-slate-500 border-b border-slate-100">
-                      <th className="py-1.5 px-3 text-left">Account</th>
-                      <th className="py-1.5 px-3 text-left">Memo</th>
-                      <th className="py-1.5 px-3 text-right">Debit</th>
-                      <th className="py-1.5 px-3 text-right">Credit</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {je.lines.map((ln, idx) => (
-                      <tr key={idx}>
-                        <td className="py-1.5 px-3 font-mono text-slate-800">
-                          {ln.code} — {ln.name}
-                        </td>
-                        <td className="py-1.5 px-3 text-slate-500">{ln.memo || '—'}</td>
-                        <td className="py-1.5 px-3 text-right font-mono tabular-nums text-slate-900">
-                          {Number(ln.debit) > 0 ? `$${Number(ln.debit).toFixed(2)}` : '—'}
-                        </td>
-                        <td className="py-1.5 px-3 text-right font-mono tabular-nums text-slate-900">
-                          {Number(ln.credit) > 0 ? `$${Number(ln.credit).toFixed(2)}` : '—'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+        <div className="space-y-4">
+          <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                <Lock className="w-3.5 h-3.5 text-teal-700" />
+                <span>Accounting Periods</span>
               </div>
-            ))}
+              <div className="flex flex-wrap gap-1.5 text-[11px] font-mono">
+                {(overview.periods || []).length === 0 ? (
+                  <span className="text-slate-500">All current periods open</span>
+                ) : (
+                  (overview.periods || []).map((p) => (
+                    <span
+                      key={p.id}
+                      className={`px-2 py-0.5 rounded border ${
+                        p.status === 'closed'
+                          ? 'bg-slate-100 border-slate-300 text-slate-700'
+                          : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      }`}
+                    >
+                      {p.period_code}: {p.status.toUpperCase()}
+                    </span>
+                  ))
+                )}
+              </div>
+            </div>
+            {canClosePeriod && (
+              <form onSubmit={handleClosePeriod} className="flex items-center gap-2 text-xs">
+                <input
+                  type="month"
+                  value={periodToClose}
+                  onChange={(e) => setPeriodToClose(e.target.value)}
+                  className="px-2.5 py-1.5 border border-slate-300 rounded-md font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={closingPeriod}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-md disabled:opacity-60"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>{closingPeriod ? 'Closing...' : 'Close Period'}</span>
+                </button>
+              </form>
+            )}
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
+              <h2 className="font-display text-sm font-semibold text-slate-900">Posted Journal Entries</h2>
+              <span className="text-xs font-mono text-slate-500">{overview.journals.length} entries</span>
+            </div>
+            <div className="divide-y divide-slate-200">
+              {overview.journals.map((je) => {
+                const isAlreadyReversed = overview.journals.some((other) => other.reversal_of_id === je.id);
+                const canReverseThis = canReverseJournal && !je.reversal_of_id && !isAlreadyReversed;
+                return (
+                  <div key={je.id} className="p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-mono font-semibold text-teal-800">{je.entry_number}</span>
+                        <span className="font-mono text-slate-500">{je.entry_date}</span>
+                        <span className="text-slate-400">·</span>
+                        <span className="uppercase font-mono text-[11px] text-slate-600">{je.source_type}</span>
+                        <span className="font-medium text-slate-900">{je.description}</span>
+                        {je.reversal_of_id && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-[11px] font-mono text-amber-800">
+                            Reversal
+                          </span>
+                        )}
+                        {isAlreadyReversed && (
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-[11px] font-mono text-slate-600">
+                            Reversed
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-xs font-mono tabular-nums text-slate-600">
+                        <span>
+                          Dr ${Number(je.total_debit).toFixed(2)} / Cr ${Number(je.total_credit).toFixed(2)} · {je.posted_by_name}
+                        </span>
+                        {canReverseThis && (
+                          <button
+                            onClick={() => {
+                              setReverseTarget(je);
+                              setReverseReason('');
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-1 font-sans text-[11px] font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>Reverse</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <table className="w-full text-xs border border-slate-100 rounded">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 border-b border-slate-100">
+                          <th className="py-1.5 px-3 text-left">Account</th>
+                          <th className="py-1.5 px-3 text-left">Memo</th>
+                          <th className="py-1.5 px-3 text-right">Debit</th>
+                          <th className="py-1.5 px-3 text-right">Credit</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {je.lines.map((ln, idx) => (
+                          <tr key={idx}>
+                            <td className="py-1.5 px-3 font-mono text-slate-800">
+                              {ln.code} — {ln.name}
+                            </td>
+                            <td className="py-1.5 px-3 text-slate-500">{ln.memo || '—'}</td>
+                            <td className="py-1.5 px-3 text-right font-mono tabular-nums text-slate-900">
+                              {Number(ln.debit) > 0 ? `$${Number(ln.debit).toFixed(2)}` : '—'}
+                            </td>
+                            <td className="py-1.5 px-3 text-right font-mono tabular-nums text-slate-900">
+                              {Number(ln.credit) > 0 ? `$${Number(ln.credit).toFixed(2)}` : '—'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       )}
@@ -697,7 +831,9 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
                   </p>
                 </div>
                 <span className="text-[11px] font-mono px-2.5 py-1 rounded bg-teal-50 text-teal-800 border border-teal-200">
-                  Auto-Post to GL Enabled
+                  {overview.expenseAutoPostLimit !== undefined
+                    ? `Auto-Post Limit: $${Number(overview.expenseAutoPostLimit).toFixed(2)}`
+                    : 'Auto-Post to GL Enabled'}
                 </span>
               </div>
 
@@ -1209,6 +1345,55 @@ export const AccountingReportsView: React.FC<Props> = ({ user, onNotify }) => {
                   className="px-4 py-1.5 bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white rounded-md font-medium"
                 >
                   {expSubmitting ? 'Posting...' : 'Record & Post to GL'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* JOURNAL REVERSAL MODAL */}
+      {reverseTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg w-full max-w-md p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Reverse Journal Entry · {reverseTarget.entry_number}
+              </h3>
+              <button onClick={() => setReverseTarget(null)} className="text-slate-400 hover:text-slate-600">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={handleReverseJournal} className="space-y-4 text-xs">
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded text-slate-700">
+                <div><strong>Description:</strong> {reverseTarget.description}</div>
+                <div className="font-mono mt-1">Amount: ${Number(reverseTarget.total_debit).toFixed(2)}</div>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Reversal Reason (min 5 chars) *</label>
+                <textarea
+                  rows={2}
+                  required
+                  minLength={5}
+                  value={reverseReason}
+                  onChange={(e) => setReverseReason(e.target.value)}
+                  placeholder="e.g. Incorrect GL expense account posted; rebooking under 5300"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setReverseTarget(null)}
+                  className="px-3 py-1.5 border border-slate-200 rounded-md text-slate-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={reversingJournal}
+                  className="px-4 py-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white rounded-md font-medium"
+                >
+                  {reversingJournal ? 'Posting Reversal...' : 'Post Reversal Entry'}
                 </button>
               </div>
             </form>

@@ -34,6 +34,8 @@ export interface Patient {
   patient_type: 'self-pay' | 'insurance' | 'credit' | 'exempt';
   payer_name: string | null;
   insurance_number: string | null;
+  national_id?: string | null;
+  dob_estimated?: number;
   status: string;
   created_at: string;
 }
@@ -149,6 +151,8 @@ export interface VitalsRecord {
   early_warning_flag: number;
   notes: string | null;
   recorded_at: string;
+  corrected_of_id?: number | null;
+  correction_reason?: string | null;
 }
 
 export interface LabAnalyteTemplate {
@@ -448,7 +452,7 @@ export interface CashierShift {
 
 export interface ApprovalRequest {
   id: number;
-  request_type: 'discount' | 'void_invoice' | 'refund' | 'reopen_visit';
+  request_type: 'discount' | 'void_invoice' | 'refund' | 'reopen_visit' | 'discharge_override' | 'payer_exempt';
   entity_type: string;
   entity_id: number;
   requested_amount: number | null;
@@ -460,11 +464,33 @@ export interface ApprovalRequest {
   decided_by_name: string | null;
   decision_note: string | null;
   invoice_number: string | null;
+  admission_number?: string | null;
   total_amount: number | null;
   first_name: string | null;
   last_name: string | null;
   mrn: string | null;
   created_at: string;
+}
+
+export interface PaymentGateBypass {
+  id: number;
+  visit_id: number;
+  patient_id: number;
+  entity_type: 'lab' | 'imaging' | 'prescription' | string;
+  entity_id: number;
+  reason: string;
+  set_by: number;
+  set_by_name?: string | null;
+  follow_up_status: 'pending_billing' | 'resolved';
+  resolved_by?: number | null;
+  resolved_by_name?: string | null;
+  resolved_at?: string | null;
+  resolution_note?: string | null;
+  created_at: string;
+  mrn?: string;
+  first_name?: string;
+  last_name?: string;
+  visit_number?: string;
 }
 
 export interface AuditLog {
@@ -575,6 +601,67 @@ export interface PatientDeposit {
   created_at: string;
 }
 
+export interface MedicationOrder {
+  id: number;
+  admission_id: number;
+  patient_id: number;
+  medicine_id: number | null;
+  medicine_name: string;
+  dose: string;
+  route: string;
+  frequency: 'OD' | 'BID' | 'TID' | 'QID' | 'STAT' | 'PRN' | string;
+  prn: number;
+  status: 'active' | 'stopped' | 'completed' | string;
+  ordered_by_name?: string | null;
+  created_at: string;
+}
+
+export interface WardRound {
+  id: number;
+  admission_id: number;
+  patient_id: number;
+  doctor_id: number;
+  doctor_name?: string | null;
+  subjective: string;
+  objective: string;
+  assessment: string;
+  plan: string;
+  recorded_at: string;
+}
+
+export interface NursingNote {
+  id: number;
+  admission_id: number;
+  patient_id: number;
+  nurse_id: number;
+  nurse_name?: string | null;
+  note_type: string;
+  note: string;
+  recorded_at: string;
+}
+
+export interface IpdVitalRecord {
+  id: number;
+  admission_id: number | null;
+  visit_id?: number | null;
+  patient_id: number;
+  bp_systolic: number | null;
+  bp_diastolic: number | null;
+  pulse?: number | null;
+  heart_rate?: number | null;
+  respiratory_rate: number | null;
+  temperature?: number | null;
+  temperature_c?: number | null;
+  spo2: number | null;
+  weight_kg: number | null;
+  height_cm: number | null;
+  bmi?: number | null;
+  early_warning_flag?: number;
+  notes: string | null;
+  recorded_by_name?: string | null;
+  recorded_at: string;
+}
+
 export interface IpdStatement {
   admission: Admission & {
     date_of_birth?: string;
@@ -584,6 +671,10 @@ export interface IpdStatement {
   invoices: Invoice[];
   deposits: PatientDeposit[];
   marHistory: MedicationAdministration[];
+  medicationOrders?: MedicationOrder[];
+  wardRounds?: WardRound[];
+  nursingNotes?: NursingNote[];
+  vitals?: IpdVitalRecord[];
 }
 
 export interface DoctorBlock {
@@ -648,12 +739,22 @@ export interface JournalLine {
   memo: string | null;
 }
 
+export interface AccountingPeriod {
+  id: number;
+  period_code: string;
+  status: 'open' | 'closed';
+  closed_by?: number | null;
+  closed_by_name?: string | null;
+  closed_at?: string | null;
+}
+
 export interface JournalEntry {
   id: number;
   entry_number: string;
   entry_date: string;
   source_type: string;
   source_id: number | null;
+  reversal_of_id?: number | null;
   description: string;
   total_debit: number;
   total_credit: number;
@@ -747,7 +848,7 @@ export interface LeaveRequest {
   end_date: string;
   days_count: number;
   reason: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   decided_by_name: string | null;
   created_at: string;
 }
@@ -760,6 +861,10 @@ export interface PayrollItem {
   role_code: string;
   base_salary: number;
   allowances: number;
+  taxable_allowances?: number;
+  pension_employee?: number;
+  pension_employer?: number;
+  paye_tax?: number;
   tax_deduction: number;
   net_pay: number;
 }
@@ -771,12 +876,33 @@ export interface PayrollRun {
   total_gross: number;
   total_deductions: number;
   total_net: number;
-  status: 'draft' | 'posted';
+  status: 'draft' | 'verified' | 'approved' | 'posted' | 'paid';
   journal_entry_id: number | null;
   journal_entry_number: string | null;
+  payment_journal_entry_number?: string | null;
   created_by_name: string | null;
+  verified_by_name?: string | null;
+  approved_by_name?: string | null;
+  paid_by_name?: string | null;
   posted_at: string | null;
+  paid_at?: string | null;
   items: PayrollItem[];
+}
+
+export interface StaffPayslip extends PayrollItem {
+  run_number: string;
+  pay_month: string;
+  run_status: string;
+  posted_at: string | null;
+  paid_at: string | null;
+}
+
+export interface ClinicSettings {
+  clinicName: string;
+  currencyCode: string;
+  currencySymbol: string;
+  timezone: string;
+  expenseAutoPostLimit?: number;
 }
 
 

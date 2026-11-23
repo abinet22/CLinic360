@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, CreditCard, Edit2, Eye, GitMerge, Lock, Plus, Receipt, Search, Stethoscope, UserPlus, X } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { AlertTriangle, CheckCircle2, CreditCard, Edit2, Eye, GitMerge, Lock, Megaphone, Plus, Receipt, Search, Stethoscope, UserPlus, X } from 'lucide-react';
+import { ApiError, apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
 import type { CashierShift, Patient, QueueTicket, ServiceItem, UserContext } from '../types';
 
@@ -56,6 +56,7 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     patient_type: 'self-pay',
     payer_name: '',
     insurance_number: '',
+    dob_estimated: false,
     issue_queue_ticket: true,
     charge_registration_card: true,
   });
@@ -120,6 +121,9 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     patient_type: 'self-pay',
     payer_name: '',
     insurance_number: '',
+    national_id: '',
+    identity_change_reason: '',
+    payer_change_reason: '',
   });
 
   const canCreate = user.permissions.includes('patient.create');
@@ -343,38 +347,84 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
       patient_type: p.patient_type || 'self-pay',
       payer_name: p.payer_name || '',
       insurance_number: p.insurance_number && p.insurance_number !== 'Masked' ? p.insurance_number : '',
+      national_id: p.national_id && p.national_id !== 'Masked' ? p.national_id : '',
+      identity_change_reason: '',
+      payer_change_reason: '',
     });
   }
+
+  const editIdentityChanged = Boolean(
+    editTarget &&
+      (editForm.first_name !== (editTarget.first_name || '') ||
+        editForm.last_name !== (editTarget.last_name || '') ||
+        editForm.sex !== (editTarget.sex || 'Female') ||
+        editForm.date_of_birth !== (editTarget.date_of_birth || '') ||
+        (editForm.national_id || '') !==
+          (editTarget.national_id && editTarget.national_id !== 'Masked' ? editTarget.national_id : ''))
+  );
+
+  const editPayerChanged = Boolean(
+    editTarget &&
+      (editForm.patient_type !== (editTarget.patient_type || 'self-pay') ||
+        (editForm.payer_name || '') !== (editTarget.payer_name || '') ||
+        (editForm.insurance_number || '') !==
+          (editTarget.insurance_number && editTarget.insurance_number !== 'Masked'
+            ? editTarget.insurance_number
+            : ''))
+  );
 
   async function handleUpdatePatient(e: React.FormEvent) {
     e.preventDefault();
     if (!editTarget) return;
+    if (editIdentityChanged && editForm.identity_change_reason.trim().length < 5) {
+      onNotify('Identity changes require a formal reason (min 5 characters).', 'error');
+      return;
+    }
+    if (editPayerChanged && editForm.payer_change_reason.trim().length < 5) {
+      onNotify('Payer category changes require a documented reason (min 5 characters).', 'error');
+      return;
+    }
     try {
       const payload: Record<string, string | null> = {
-        first_name: editForm.first_name,
-        last_name: editForm.last_name,
-        sex: editForm.sex,
-        date_of_birth: editForm.date_of_birth,
         phone: editForm.phone,
         email: editForm.email || null,
         address: editForm.address || null,
         next_of_kin_name: editForm.next_of_kin_name || null,
         next_of_kin_phone: editForm.next_of_kin_phone || null,
-        patient_type: editForm.patient_type,
-        payer_name: editForm.payer_name || null,
       };
+      if (editIdentityChanged) {
+        payload.first_name = editForm.first_name;
+        payload.last_name = editForm.last_name;
+        payload.sex = editForm.sex;
+        payload.date_of_birth = editForm.date_of_birth;
+        if (editForm.national_id) payload.national_id = editForm.national_id;
+        payload.identity_change_reason = editForm.identity_change_reason.trim();
+      }
+      if (editPayerChanged) {
+        payload.patient_type = editForm.patient_type;
+        payload.payer_name = editForm.payer_name || null;
+        if (editForm.insurance_number) payload.insurance_number = editForm.insurance_number;
+        payload.payer_change_reason = editForm.payer_change_reason.trim();
+      }
       if (canClinicalRead) {
         payload.blood_group = editForm.blood_group;
         payload.allergies = editForm.allergies;
-        if (editForm.insurance_number) {
-          payload.insurance_number = editForm.insurance_number;
-        }
       }
-      await apiFetch(`/api/patients/${editTarget.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(payload),
-      });
-      onNotify(`Updated demographics for ${editForm.first_name} ${editForm.last_name}`, 'success');
+      const res = await apiFetch<{ patient: Patient; pendingExemptApprovalId?: number | null }>(
+        `/api/patients/${editTarget.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        }
+      );
+      if (res.pendingExemptApprovalId) {
+        onNotify(
+          `Patient demographics updated · Fee exemption request #${res.pendingExemptApprovalId} sent for Manager approval.`,
+          'success'
+        );
+      } else {
+        onNotify(`Updated demographics for ${editForm.first_name} ${editForm.last_name}`, 'success');
+      }
       const editedId = editTarget.id;
       setEditTarget(null);
       loadPatients();
@@ -398,6 +448,36 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
       }
       setSelectedDetail(detail);
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403 && err.data?.breakGlassRequired) {
+        const listMatch = patients.find((p) => p.id === id);
+        const placeholderPatient: Patient = listMatch || {
+          id,
+          mrn: `ID-${id}`,
+          first_name: 'Unassigned',
+          last_name: 'Patient',
+          sex: 'Other',
+          date_of_birth: '',
+          phone: '',
+          email: null,
+          address: null,
+          patient_type: 'self-pay',
+          payer_name: null,
+          insurance_number: null,
+          status: 'active',
+          created_at: '',
+        };
+        setBreakGlassReason('');
+        setBreakGlassPending({
+          patient: placeholderPatient,
+          clinicalMasked: true,
+          appointments: [],
+          visits: [],
+          vitals: [],
+          invoices: [],
+          accessHistory: [],
+        });
+        return;
+      }
       onNotify((err as Error).message, 'error');
     }
   }
@@ -410,16 +490,31 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
       onNotify('Clinical justification must be at least 8 characters.', 'error');
       return;
     }
+    const targetId = breakGlassPending.patient.id;
     try {
-      await apiFetch(`/api/patients/${breakGlassPending.patient.id}/break-glass`, {
+      await apiFetch(`/api/patients/${targetId}/break-glass`, {
         method: 'POST',
         body: JSON.stringify({ reason }),
       });
-      setBreakGlassCleared((prev) => ({ ...prev, [breakGlassPending.patient.id]: reason }));
-      setSelectedDetail(breakGlassPending);
+      setBreakGlassCleared((prev) => ({ ...prev, [targetId]: reason }));
       setBreakGlassPending(null);
       setBreakGlassReason('');
+      const unlockedDetail = await apiFetch<PatientDetailPayload>(`/api/patients/${targetId}`);
+      setSelectedDetail(unlockedDetail);
       onNotify('Break-Glass access logged and escalated to Auditor & Manager', 'success');
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleCallNextInDept() {
+    if (deptFilter === 'ALL') return;
+    try {
+      const res = await apiFetch<{ ticket: QueueTicket }>(`/api/queue/${encodeURIComponent(deptFilter)}/call-next`, {
+        method: 'POST',
+      });
+      onNotify(`Called ticket ${res.ticket.ticket_number} in ${deptFilter} queue`, 'success');
+      loadQueue();
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -987,7 +1082,18 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                 </button>
               ))}
             </div>
-            <div className="text-xs text-slate-500">Ordered by triage priority (Emergency &gt; Urgent &gt; Routine)</div>
+            <div className="flex flex-wrap items-center gap-3">
+              {canQueue && deptFilter !== 'ALL' && (
+                <button
+                  onClick={handleCallNextInDept}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
+                >
+                  <Megaphone className="w-3.5 h-3.5" />
+                  <span>Call Next Waiting ({deptFilter})</span>
+                </button>
+              )}
+              <div className="text-xs text-slate-500">Ordered by triage priority (Emergency &gt; Urgent &gt; Routine)</div>
+            </div>
           </div>
 
           {tickets.length === 0 ? (
@@ -1152,7 +1258,17 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Date of Birth *</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-medium text-slate-700">Date of Birth *</label>
+                    <label className="inline-flex items-center gap-1 text-[11px] text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={form.dob_estimated}
+                        onChange={(e) => setForm({ ...form, dob_estimated: e.target.checked })}
+                      />
+                      <span>Estimated DOB</span>
+                    </label>
+                  </div>
                   <input
                     type="date"
                     required
@@ -1733,6 +1849,36 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
                   />
                 </div>
+                {editIdentityChanged && (
+                  <div className="sm:col-span-2 p-3 bg-amber-50 border border-amber-200 rounded-md">
+                    <label className="block text-xs font-semibold text-amber-900 mb-1">
+                      Mandatory Identity Change Audit Reason (min 5 chars) *
+                    </label>
+                    <input
+                      required
+                      minLength={5}
+                      value={editForm.identity_change_reason}
+                      onChange={(e) => setEditForm({ ...editForm, identity_change_reason: e.target.value })}
+                      placeholder="e.g. Corrected legal spelling per national ID verification"
+                      className="w-full px-3 py-1.5 text-xs bg-white border border-amber-300 rounded-md"
+                    />
+                  </div>
+                )}
+                {editPayerChanged && (
+                  <div className="sm:col-span-2 p-3 bg-amber-50 border border-amber-200 rounded-md">
+                    <label className="block text-xs font-semibold text-amber-900 mb-1">
+                      Mandatory Payer Category Change Reason (min 5 chars) *
+                    </label>
+                    <input
+                      required
+                      minLength={5}
+                      value={editForm.payer_change_reason}
+                      onChange={(e) => setEditForm({ ...editForm, payer_change_reason: e.target.value })}
+                      placeholder="e.g. Updated corporate insurance policy card"
+                      className="w-full px-3 py-1.5 text-xs bg-white border border-amber-300 rounded-md"
+                    />
+                  </div>
+                )}
               </div>
               <div className="pt-4 border-t border-slate-200 flex justify-end gap-3">
                 <button

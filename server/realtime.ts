@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express';
+import crypto from 'node:crypto';
 
 export type ClinicEventType =
   | 'connected'
@@ -20,6 +21,25 @@ interface SseClient {
 
 let nextClientId = 1;
 const clients = new Map<number, SseClient>();
+const sseTickets = new Map<string, { userId: number; expiresAt: number }>();
+
+export function createRealtimeTicket(userId: number): string {
+  const now = Date.now();
+  for (const [key, val] of sseTickets.entries()) {
+    if (val.expiresAt <= now) sseTickets.delete(key);
+  }
+  const ticket = crypto.randomBytes(24).toString('hex');
+  sseTickets.set(ticket, { userId, expiresAt: now + 30_000 });
+  return ticket;
+}
+
+export function consumeRealtimeTicket(ticket: string): number | null {
+  const record = sseTickets.get(ticket);
+  if (!record) return null;
+  sseTickets.delete(ticket);
+  if (record.expiresAt < Date.now()) return null;
+  return record.userId;
+}
 
 export function registerRealtimeClient(
   req: Request,

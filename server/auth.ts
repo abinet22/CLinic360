@@ -2,9 +2,10 @@ import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import { execute, getDialect, query, queryOne, withTransaction } from './db.ts';
+import { consumeRealtimeTicket } from './realtime.ts';
 
 if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
-  console.warn('[Clinic360] WARNING: JWT_SECRET is not set in production; using ephemeral process secret.');
+  throw new Error('[Clinic360] FATAL: JWT_SECRET environment variable must be set in production.');
 }
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -19,21 +20,35 @@ function pruneRevokedTokens() {
   }
 }
 
-export function revokeToken(jti?: string | null, expSeconds?: number | null) {
+export async function revokeToken(jti?: string | null, expSeconds?: number | null): Promise<void> {
   if (!jti) return;
   pruneRevokedTokens();
   const expiresAtMs = expSeconds ? expSeconds * 1000 : Date.now() + 12 * 3600 * 1000;
   revokedTokens.set(jti, expiresAtMs);
+  const expiresAtSql = formatUtcSqlDatetime(new Date(expiresAtMs));
+  await execute('INSERT INTO revoked_tokens (jti, expires_at) VALUES (?, ?)', [jti, expiresAtSql]).catch(async () => {
+    await execute('UPDATE revoked_tokens SET expires_at = ? WHERE jti = ?', [expiresAtSql, jti]).catch(() => {});
+  });
 }
 
-export function isTokenRevoked(jti?: string | null): boolean {
+export async function isTokenRevoked(jti?: string | null): Promise<boolean> {
   if (!jti) return false;
   const expiresAtMs = revokedTokens.get(jti);
-  if (!expiresAtMs) return false;
-  if (expiresAtMs <= Date.now()) {
-    revokedTokens.delete(jti);
+  if (expiresAtMs) {
+    if (expiresAtMs <= Date.now()) {
+      revokedTokens.delete(jti);
+    } else {
+      return true;
+    }
+  }
+  const dbRow = await queryOne<{ expires_at: string }>('SELECT expires_at FROM revoked_tokens WHERE jti = ?', [jti]).catch(() => null);
+  if (!dbRow) return false;
+  const dbExpMs = new Date(`${String(dbRow.expires_at).replace(' ', 'T')}Z`).getTime();
+  if (dbExpMs <= Date.now()) {
+    await execute('DELETE FROM revoked_tokens WHERE jti = ?', [jti]).catch(() => {});
     return false;
   }
+  revokedTokens.set(jti, dbExpMs);
   return true;
 }
 
@@ -129,18 +144,32 @@ const PASSWORD_CHANGE_EXEMPT_PATHS = new Set([
   '/auth/logout',
   '/notifications',
   '/health',
+  '/settings/public',
 ]);
 
 export async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   try {
+    const sseTicket = req.path === '/events/stream' && typeof req.query.ticket === 'string' ? req.query.ticket : null;
+    if (sseTicket) {
+      const ticketUserId = consumeRealtimeTicket(sseTicket);
+      if (!ticketUserId) {
+        return res.status(401).json({ error: 'Realtime stream ticket expired or invalid' });
+      }
+      const ctx = await loadUserContext(ticketUserId);
+      if (!ctx) {
+        return res.status(401).json({ error: 'Account inactive or invalid session' });
+      }
+      req.user = ctx;
+      return next();
+    }
+
     const authHeader = req.headers.authorization;
-    const queryToken = typeof req.query.token === 'string' ? req.query.token : null;
-    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : queryToken;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
     if (!token) {
       return res.status(401).json({ error: 'Authentication required' });
     }
     const details = verifyAccessTokenDetails(token);
-    if (isTokenRevoked(details.jti)) {
+    if (await isTokenRevoked(details.jti)) {
       return res.status(401).json({ error: 'Session has been signed out. Please log in again.' });
     }
     const ctx = await loadUserContext(details.userId);
@@ -185,8 +214,68 @@ export function requirePermission(...requiredPermissions: string[]) {
   };
 }
 
-export function hasPermission(user: AuthUser, perm: string): boolean {
-  return user.permissions.includes(perm);
+export function hasPermission(user: AuthUser, ...perms: string[]): boolean {
+  return perms.some((perm) => user.permissions.includes(perm));
+}
+
+export function assertDifferentUser(actorId: number, creatorId: number | null | undefined, label: string): void {
+  if (creatorId != null && Number(actorId) === Number(creatorId)) {
+    const err = new Error(`Segregation of Duties Violation: Cannot self-approve or double-verify your own ${label}.`) as Error & { status?: number };
+    err.status = 403;
+    throw err;
+  }
+}
+
+export async function assertPatientAccess(
+  user: AuthUser,
+  patientId: number
+): Promise<{ allowed: boolean; clinicalAuthorized: boolean; breakGlassActive: boolean; reason?: string }> {
+  const canSeeClinical = hasPermission(user, 'patient.clinical.read');
+  if (!canSeeClinical) {
+    return { allowed: true, clinicalAuthorized: false, breakGlassActive: false };
+  }
+
+  // Non-DOC clinical service roles (NUR, WRD, PHA, LAB, IMG) & MGR oversight
+  const isDoctorOnly = user.roles.includes('DOC') && !user.roles.includes('MGR') && !user.roles.includes('ADM');
+  if (!isDoctorOnly) {
+    return { allowed: true, clinicalAuthorized: true, breakGlassActive: false };
+  }
+
+  const nowStr = formatUtcSqlDatetime();
+  const [visitRow, apptRow, admRow, bgRow] = await Promise.all([
+    queryOne<{ id: number }>(
+      `SELECT id FROM visits
+       WHERE patient_id = ? AND (doctor_id = ? OR created_by = ? OR (doctor_id IS NULL AND status != 'closed'))
+       LIMIT 1`,
+      [patientId, user.id, user.id]
+    ),
+    queryOne<{ id: number }>(
+      `SELECT id FROM appointments WHERE patient_id = ? AND doctor_id = ? AND status IN ('scheduled','checked_in','completed') LIMIT 1`,
+      [patientId, user.id]
+    ),
+    queryOne<{ id: number }>(
+      `SELECT id FROM admissions WHERE patient_id = ? AND admitting_doctor_id = ? AND status != 'discharged' LIMIT 1`,
+      [patientId, user.id]
+    ),
+    queryOne<{ id: number }>(
+      `SELECT id FROM break_glass_logs WHERE patient_id = ? AND user_id = ? AND expires_at > ? ORDER BY id DESC LIMIT 1`,
+      [patientId, user.id, nowStr]
+    ).catch(() => null),
+  ]);
+
+  if (visitRow || apptRow || admRow) {
+    return { allowed: true, clinicalAuthorized: true, breakGlassActive: false };
+  }
+  if (bgRow) {
+    return { allowed: true, clinicalAuthorized: true, breakGlassActive: true };
+  }
+
+  return {
+    allowed: false,
+    clinicalAuthorized: false,
+    breakGlassActive: false,
+    reason: 'Break-Glass clinical justification required to open a patient chart you are not assigned to treat.',
+  };
 }
 
 export interface AuditInput {
@@ -203,6 +292,19 @@ export interface AuditInput {
 
 export function formatUtcSqlDatetime(d: Date = new Date()): string {
   return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+export function formatClinicDate(timezone = 'Africa/Addis_Ababa', d: Date = new Date()): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
 }
 
 export async function writeAuditLog(input: AuditInput): Promise<void> {
@@ -236,6 +338,9 @@ export async function writeAuditLog(input: AuditInput): Promise<void> {
       beforeJson,
       afterJson,
       reason: input.reason ?? null,
+      ipAddress,
+      userAgent,
+      branchId,
       prevHash,
     });
 
@@ -280,6 +385,9 @@ interface AuditChainRow {
   before_json: string | null;
   after_json: string | null;
   reason: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  branch_id: number;
   prev_hash: string;
   row_hash: string;
 }
@@ -305,12 +413,10 @@ export async function verifyAuditChain(): Promise<{ valid: boolean; totalRows: n
         if (row.prev_hash !== 'GENESIS') {
           return { valid: false, totalRows, brokenAtId: row.id };
         }
-        prevRowHash = row.row_hash;
-        continue;
-      }
-      if (row.prev_hash !== prevRowHash) {
+      } else if (row.prev_hash !== prevRowHash) {
         return { valid: false, totalRows, brokenAtId: row.id };
       }
+
       const normalizedOccurredAt =
         typeof row.occurred_at === 'string' && row.occurred_at.includes('T')
           ? row.occurred_at.slice(0, 19).replace('T', ' ')
@@ -327,6 +433,9 @@ export async function verifyAuditChain(): Promise<{ valid: boolean; totalRows: n
         beforeJson: row.before_json,
         afterJson: row.after_json,
         reason: row.reason,
+        ipAddress: row.ip_address ?? '127.0.0.1',
+        userAgent: row.user_agent ?? '',
+        branchId: Number(row.branch_id ?? 1),
         prevHash: row.prev_hash,
       });
       const recomputed: string = crypto.createHash('sha256').update(payload).digest('hex');

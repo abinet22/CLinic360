@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Check, DollarSign, FileText, Lock, Printer, Search, ShieldAlert, UserCheck, UserPlus, Wallet, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
-import type { Admission, ApprovalRequest, CashierShift, Invoice, Patient, PatientDeposit, UserContext } from '../types';
+import type { Admission, ApprovalRequest, CashierShift, Invoice, Patient, PatientDeposit, PaymentGateBypass, UserContext } from '../types';
 
 interface DoctorOption {
   id: number;
@@ -45,7 +45,7 @@ interface BillingCashierViewProps {
 }
 
 export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, onNotify }) => {
-  const [subTab, setSubTab] = useState<'invoices' | 'deposits' | 'approvals' | 'shifts'>('invoices');
+  const [subTab, setSubTab] = useState<'invoices' | 'deposits' | 'approvals' | 'bypasses' | 'shifts'>('invoices');
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [invTotal, setInvTotal] = useState(0);
   const [invPage, setInvPage] = useState(1);
@@ -55,6 +55,9 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
   const [deposits, setDeposits] = useState<PatientDeposit[]>([]);
   const [shifts, setShifts] = useState<CashierShift[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [bypasses, setBypasses] = useState<PaymentGateBypass[]>([]);
+  const [resolveTarget, setResolveTarget] = useState<PaymentGateBypass | null>(null);
+  const [resolveNote, setResolveNote] = useState('');
   const [patients, setPatients] = useState<Patient[]>([]);
   const [doctors, setDoctors] = useState<DoctorOption[]>([]);
   const [admissions, setAdmissions] = useState<Admission[]>([]);
@@ -141,17 +144,19 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
       });
       if (invSearch.trim()) qs.set('q', invSearch.trim());
 
-      const [invRes, depRes, shfRes, appRes] = await Promise.all([
+      const [invRes, depRes, shfRes, appRes, bypRes] = await Promise.all([
         apiFetch<{ invoices: Invoice[]; total?: number }>(`/api/billing/invoices?${qs}`),
         apiFetch<{ deposits: PatientDeposit[] }>('/api/billing/deposits'),
         apiFetch<{ shifts: CashierShift[] }>('/api/billing/shifts'),
         apiFetch<{ approvals: ApprovalRequest[] }>('/api/billing/approvals'),
+        apiFetch<{ bypasses: PaymentGateBypass[] }>('/api/billing/bypasses').catch(() => ({ bypasses: [] as PaymentGateBypass[] })),
       ]);
       setInvoices(invRes.invoices || []);
       setInvTotal(typeof invRes.total === 'number' ? invRes.total : (invRes.invoices || []).length);
       setDeposits(depRes.deposits || []);
       setShifts(shfRes.shifts || []);
       setApprovals(appRes.approvals || []);
+      setBypasses(bypRes.bypasses || []);
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -484,6 +489,23 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
     }
   }
 
+  async function handleResolveBypass(e: React.FormEvent) {
+    e.preventDefault();
+    if (!resolveTarget) return;
+    try {
+      await apiFetch(`/api/billing/bypasses/${resolveTarget.id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ resolution_note: resolveNote.trim() || 'Resolved via Cashier billing follow-up' }),
+      });
+      onNotify(`Emergency bypass #${resolveTarget.id} marked resolved`, 'success');
+      setResolveTarget(null);
+      setResolveNote('');
+      loadBilling();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
   return (
     <div className="space-y-5">
       {/* Shift Status & Controls */}
@@ -576,7 +598,15 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
               subTab === 'approvals' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Discounts &amp; Void Approvals ({approvals.filter((a) => a.status === 'pending').length} pending)
+            Approvals ({approvals.filter((a) => a.status === 'pending').length} pending)
+          </button>
+          <button
+            onClick={() => setSubTab('bypasses')}
+            className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+              subTab === 'bypasses' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            Gate Bypasses ({bypasses.filter((b) => b.follow_up_status === 'pending_billing').length} open)
           </button>
           <button
             onClick={() => setSubTab('shifts')}
@@ -858,7 +888,9 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
                   <tr key={ar.id} className="hover:bg-slate-50/70">
                     <td className="py-3 px-4 text-xs">
                       <div className="font-semibold text-slate-900 capitalize">{ar.request_type.replace('_', ' ')}</div>
-                      <div className="font-mono text-slate-500">{ar.invoice_number}</div>
+                      <div className="font-mono text-slate-500">
+                        {ar.invoice_number || ar.admission_number || `${ar.entity_type} #${ar.entity_id}`}
+                      </div>
                     </td>
                     <td className="py-3 px-4 text-xs">
                       <div className="font-medium text-slate-900">{ar.first_name} {ar.last_name}</div>
@@ -903,6 +935,75 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {subTab === 'bypasses' && (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3 bg-slate-50 border-b border-slate-200 text-xs text-slate-600 flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-amber-700" />
+            <span>
+              Emergency payment-gate bypasses logged by clinicians or diagnostics must be reconciled with billing settlement.
+            </span>
+          </div>
+          {bypasses.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No emergency payment-gate bypasses recorded.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Order / Visit</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4">Clinical Bypass Reason</th>
+                    <th className="py-2.5 px-4">Authorized By</th>
+                    <th className="py-2.5 px-4">Follow-Up Status</th>
+                    {canTakePayment && <th className="py-2.5 px-4 text-right">Billing Action</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {bypasses.map((b) => (
+                    <tr key={b.id} className="hover:bg-slate-50/70">
+                      <td className="py-3 px-4 font-mono">
+                        <div className="font-semibold text-slate-900 uppercase">{b.entity_type} #{b.entity_id}</div>
+                        <div className="text-slate-500">{b.visit_number || `Visit #${b.visit_id}`}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-slate-900">{b.first_name} {b.last_name}</div>
+                        <div className="font-mono text-slate-500">{b.mrn}</div>
+                      </td>
+                      <td className="py-3 px-4 text-slate-700 max-w-xs">{b.reason}</td>
+                      <td className="py-3 px-4 text-slate-700">
+                        <div>{b.set_by_name || `User #${b.set_by}`}</div>
+                        <div className="font-mono text-[11px] text-slate-400">{b.created_at}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className={b.follow_up_status === 'resolved' ? 'text-emerald-700 font-semibold' : 'text-amber-700 font-semibold'}>
+                          {b.follow_up_status === 'resolved' ? 'Resolved' : 'Pending Billing'}
+                        </span>
+                        {b.resolution_note && <div className="text-slate-500 mt-0.5">{b.resolution_note}</div>}
+                      </td>
+                      {canTakePayment && (
+                        <td className="py-3 px-4 text-right">
+                          {b.follow_up_status === 'pending_billing' && (
+                            <button
+                              onClick={() => {
+                                setResolveTarget(b);
+                                setResolveNote('');
+                              }}
+                              className="px-2.5 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+                            >
+                              Resolve Follow-Up
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
@@ -1607,6 +1708,45 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
                 </button>
                 <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
                   Generate Consultation Bill &amp; Check In
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* Resolve Payment Gate Bypass Modal */}
+      {resolveTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="font-display text-base font-semibold text-slate-900">
+                Resolve Bypass · {resolveTarget.entity_type.toUpperCase()} #{resolveTarget.entity_id}
+              </h3>
+              <button onClick={() => setResolveTarget(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleResolveBypass} className="p-6 space-y-4">
+              <div className="text-xs text-slate-600">
+                Patient: <strong className="text-slate-900">{resolveTarget.first_name} {resolveTarget.last_name}</strong> ({resolveTarget.mrn})
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Billing Resolution Note *</label>
+                <textarea
+                  rows={2}
+                  required
+                  value={resolveNote}
+                  onChange={(e) => setResolveNote(e.target.value)}
+                  placeholder="e.g. Settled via Receipt RCP-00012 or billed to corporate insurance"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md"
+                />
+              </div>
+              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
+                <button type="button" onClick={() => setResolveTarget(null)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
+                  Cancel
+                </button>
+                <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
+                  Mark Resolved
                 </button>
               </div>
             </form>

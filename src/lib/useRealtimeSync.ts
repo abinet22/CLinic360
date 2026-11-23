@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getAuthToken } from './api';
+import { apiFetch, getAuthToken } from './api';
 
 export type ClinicEventType =
   | 'connected'
@@ -23,6 +23,8 @@ let source: EventSource | null = null;
 let currentToken: string | null = null;
 let currentStatus: RealtimeStatus = 'disconnected';
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let streamGeneration = 0;
+let isConnecting = false;
 
 function setStatus(next: RealtimeStatus) {
   currentStatus = next;
@@ -44,6 +46,8 @@ const STREAM_EVENTS: ClinicEventType[] = [
 ];
 
 function closeStream() {
+  streamGeneration += 1;
+  isConnecting = false;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -56,24 +60,55 @@ function closeStream() {
   setStatus('disconnected');
 }
 
-function ensureStream() {
+async function ensureStream() {
   const token = getAuthToken();
   if (!token) {
     closeStream();
     return;
   }
-  if (source && currentToken === token) {
+  if ((source || isConnecting) && currentToken === token) {
     return;
   }
   closeStream();
+  const gen = streamGeneration;
   currentToken = token;
+  isConnecting = true;
   setStatus('connecting');
 
-  const es = new EventSource(`/api/events/stream?token=${encodeURIComponent(token)}`);
+  let ticket = '';
+  try {
+    const res = await apiFetch<{ ticket?: string }>('/api/events/ticket', { method: 'POST' });
+    ticket = res.ticket || '';
+  } catch {
+    if (gen !== streamGeneration) return;
+    isConnecting = false;
+    if (!getAuthToken()) {
+      setStatus('disconnected');
+      return;
+    }
+    setStatus('reconnecting');
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void ensureStream();
+      }, 3000);
+    }
+    return;
+  }
+
+  if (gen !== streamGeneration || !ticket || getAuthToken() !== token) {
+    isConnecting = false;
+    return;
+  }
+
+  const es = new EventSource(`/api/events/stream?ticket=${encodeURIComponent(ticket)}`);
   source = es;
+  isConnecting = false;
 
   es.onopen = () => {
-    setStatus('connected');
+    if (source === es) {
+      setStatus('connected');
+    }
   };
 
   for (const eventName of STREAM_EVENTS) {
@@ -109,7 +144,7 @@ function ensureStream() {
     if (!reconnectTimer) {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
-        ensureStream();
+        void ensureStream();
       }, 2500);
     }
   };

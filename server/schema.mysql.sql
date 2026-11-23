@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS patients (
   payer_name VARCHAR(140) NULL,
   insurance_number VARCHAR(80) NULL,
   national_id VARCHAR(80) NULL,
+  dob_estimated TINYINT(1) NOT NULL DEFAULT 0,
   status ENUM('active','merged','inactive') NOT NULL DEFAULT 'active',
   merged_into_id INT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -112,7 +113,7 @@ CREATE TABLE IF NOT EXISTS queue_tickets (
   id INT AUTO_INCREMENT PRIMARY KEY,
   branch_id INT NOT NULL DEFAULT 1,
   ticket_number VARCHAR(24) NOT NULL,
-  department ENUM('OPD','LAB','IMG','PHA','CSH') NOT NULL DEFAULT 'OPD',
+  department ENUM('OPD','TRIAGE','LAB','IMG','PHA','CSH') NOT NULL DEFAULT 'OPD',
   patient_id INT NOT NULL,
   visit_id INT NULL,
   priority ENUM('emergency','urgent','routine') NOT NULL DEFAULT 'routine',
@@ -152,7 +153,7 @@ CREATE TABLE IF NOT EXISTS visits (
   patient_id INT NOT NULL,
   doctor_id INT NULL,
   appointment_id INT NULL,
-  visit_type ENUM('walk_in','scheduled') NOT NULL DEFAULT 'walk_in',
+  visit_type VARCHAR(30) NOT NULL DEFAULT 'walk_in',
   specialty VARCHAR(80) NULL,
   consultation_invoice_id INT NULL,
   workflow_stage ENUM('awaiting_payment','paid_awaiting_vitals','ready_for_doctor','in_consultation','awaiting_diagnostics','results_ready','awaiting_pharmacy','completed') NOT NULL DEFAULT 'paid_awaiting_vitals',
@@ -176,7 +177,8 @@ CREATE TABLE IF NOT EXISTS visits (
 
 CREATE TABLE IF NOT EXISTS vitals (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  visit_id INT NOT NULL,
+  visit_id INT NULL,
+  admission_id INT NULL,
   patient_id INT NOT NULL,
   bp_systolic INT NULL,
   bp_diastolic INT NULL,
@@ -190,9 +192,10 @@ CREATE TABLE IF NOT EXISTS vitals (
   blood_glucose DECIMAL(5,1) NULL,
   early_warning_flag TINYINT(1) NOT NULL DEFAULT 0,
   notes VARCHAR(255) NULL,
+  corrected_of_id INT NULL,
+  correction_reason VARCHAR(255) NULL,
   recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   recorded_by INT NOT NULL,
-  FOREIGN KEY (visit_id) REFERENCES visits(id),
   FOREIGN KEY (patient_id) REFERENCES patients(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -267,7 +270,7 @@ CREATE TABLE IF NOT EXISTS invoices (
   discount_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   total_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-  status ENUM('unpaid','partial','paid','credit_billed','voided') NOT NULL DEFAULT 'unpaid',
+  status VARCHAR(30) NOT NULL DEFAULT 'unpaid',
   notes VARCHAR(255) NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_by INT NULL,
@@ -320,7 +323,7 @@ CREATE TABLE IF NOT EXISTS receipts (
 
 CREATE TABLE IF NOT EXISTS approval_requests (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  request_type ENUM('discount','void_invoice','refund','reopen_visit') NOT NULL,
+  request_type VARCHAR(40) NOT NULL,
   entity_type VARCHAR(40) NOT NULL,
   entity_id INT NOT NULL,
   requested_amount DECIMAL(12,2) NULL,
@@ -342,6 +345,8 @@ CREATE TABLE IF NOT EXISTS lab_orders (
   invoice_id INT NULL,
   ordered_by INT NOT NULL,
   sample_barcode VARCHAR(40) NULL,
+  collected_by INT NULL,
+  collected_at DATETIME NULL,
   result_value VARCHAR(160) NULL,
   previous_result_value VARCHAR(160) NULL,
   abnormal_flag ENUM('normal','high','low','critical') NULL,
@@ -349,7 +354,7 @@ CREATE TABLE IF NOT EXISTS lab_orders (
   panel_results_json TEXT NULL,
   rejection_reason VARCHAR(255) NULL,
   amend_reason VARCHAR(255) NULL,
-  status ENUM('ordered','collected','resulted','verified','rejected','amended') NOT NULL DEFAULT 'ordered',
+  status ENUM('ordered','collected','resulted','verified','rejected','amended','cancelled') NOT NULL DEFAULT 'ordered',
   entered_by INT NULL,
   verified_by INT NULL,
   critical_ack_by INT NULL,
@@ -374,7 +379,8 @@ CREATE TABLE IF NOT EXISTS imaging_orders (
   findings TEXT NULL,
   impression TEXT NULL,
   addendum TEXT NULL,
-  status ENUM('ordered','scheduled','performed','reported_draft','reported_final') NOT NULL DEFAULT 'ordered',
+  repeat_reason VARCHAR(255) NULL,
+  status ENUM('ordered','scheduled','performed','reported_draft','reported_final','cancelled') NOT NULL DEFAULT 'ordered',
   performed_by INT NULL,
   reported_by INT NULL,
   finalised_at DATETIME NULL,
@@ -391,6 +397,7 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   doctor_id INT NOT NULL,
   invoice_id INT NULL,
   status ENUM('awaiting_stock_check','pending_payment','paid_ready_to_dispense','pending','partial','dispensed','cancelled') NOT NULL DEFAULT 'awaiting_stock_check',
+  allergy_override_reason VARCHAR(255) NULL,
   notes VARCHAR(255) NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   dispensed_at DATETIME NULL,
@@ -457,11 +464,12 @@ CREATE TABLE IF NOT EXISTS admissions (
 CREATE TABLE IF NOT EXISTS medication_administrations (
   id INT AUTO_INCREMENT PRIMARY KEY,
   admission_id INT NOT NULL,
+  medication_order_id INT NULL,
   patient_id INT NOT NULL,
   medicine_name VARCHAR(160) NOT NULL,
   dose VARCHAR(80) NOT NULL,
-  scheduled_time VARCHAR(20) NOT NULL,
-  status ENUM('due','given','withheld') NOT NULL DEFAULT 'due',
+  scheduled_time VARCHAR(40) NOT NULL,
+  status ENUM('due','given','withheld','missed') NOT NULL DEFAULT 'due',
   reason_not_given VARCHAR(255) NULL,
   administered_by_name VARCHAR(140) NULL,
   administered_at DATETIME NULL,
@@ -612,6 +620,7 @@ CREATE TABLE IF NOT EXISTS doctor_blocks (
   end_time VARCHAR(10) NOT NULL,
   block_type ENUM('leave','off_duty','surgery','unavailable') NOT NULL DEFAULT 'unavailable',
   reason VARCHAR(255) NULL,
+  source_leave_id INT NULL,
   created_by INT NOT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_doc_blocks_date (doctor_id, block_date),
@@ -667,9 +676,11 @@ CREATE TABLE IF NOT EXISTS journal_entries (
   description VARCHAR(255) NOT NULL,
   total_debit DECIMAL(12,2) NOT NULL,
   total_credit DECIMAL(12,2) NOT NULL,
+  reversal_of_id INT NULL,
   posted_by INT NOT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_je_date_source (entry_date, source_type)
+  INDEX idx_je_date_source (entry_date, source_type),
+  INDEX idx_je_source_id (source_type, source_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS journal_lines (
@@ -772,10 +783,17 @@ CREATE TABLE IF NOT EXISTS payroll_runs (
   total_gross DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   total_deductions DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   total_net DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-  status ENUM('draft','posted') NOT NULL DEFAULT 'draft',
+  status ENUM('draft','verified','approved','posted','paid') NOT NULL DEFAULT 'draft',
   journal_entry_id INT NULL,
+  payment_journal_entry_id INT NULL,
   created_by INT NOT NULL,
+  verified_by INT NULL,
+  verified_at DATETIME NULL,
+  approved_by INT NULL,
+  approved_at DATETIME NULL,
   posted_at DATETIME NULL,
+  paid_by INT NULL,
+  paid_at DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -787,10 +805,187 @@ CREATE TABLE IF NOT EXISTS payroll_items (
   role_code VARCHAR(16) NOT NULL,
   base_salary DECIMAL(12,2) NOT NULL,
   allowances DECIMAL(12,2) NOT NULL,
+  taxable_allowances DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  pension_employee DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  pension_employer DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  paye_tax DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   tax_deduction DECIMAL(12,2) NOT NULL,
   net_pay DECIMAL(12,2) NOT NULL,
   FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id),
   FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS system_settings (
+  setting_key VARCHAR(80) PRIMARY KEY,
+  setting_value TEXT NOT NULL,
+  updated_by INT NULL,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+  jti VARCHAR(80) PRIMARY KEY,
+  expires_at DATETIME NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS auth_2fa_challenges (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id INT NOT NULL,
+  email VARCHAR(160) NOT NULL,
+  code VARCHAR(12) NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  token_hash VARCHAR(128) NOT NULL UNIQUE,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS break_glass_logs (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  reason VARCHAR(255) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_bg_user_pat (user_id, patient_id),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS patient_payer_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  patient_id INT NOT NULL,
+  from_type VARCHAR(30) NOT NULL,
+  to_type VARCHAR(30) NOT NULL,
+  payer_name VARCHAR(140) NULL,
+  reason VARCHAR(255) NOT NULL,
+  valid_to DATE NULL,
+  changed_by INT NOT NULL,
+  approved_by INT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS payment_gate_bypasses (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  visit_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  entity_type VARCHAR(40) NOT NULL,
+  entity_id INT NOT NULL,
+  set_by INT NOT NULL,
+  reason VARCHAR(255) NOT NULL,
+  follow_up_status ENUM('pending_billing','credit','waived','paid') NOT NULL DEFAULT 'pending_billing',
+  resolved_by INT NULL,
+  resolution_note VARCHAR(255) NULL,
+  resolved_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS credit_notes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  credit_note_number VARCHAR(32) NOT NULL UNIQUE,
+  original_payment_id INT NULL,
+  receipt_id INT NULL,
+  invoice_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  payment_method VARCHAR(40) NOT NULL,
+  shift_id INT NULL,
+  journal_entry_id INT NULL,
+  reason VARCHAR(255) NOT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (invoice_id) REFERENCES invoices(id),
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS accounting_periods (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  period_code VARCHAR(20) NOT NULL UNIQUE,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  status ENUM('open','closed') NOT NULL DEFAULT 'open',
+  closed_by INT NULL,
+  closed_at DATETIME NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  item_id INT NOT NULL,
+  batch_id INT NULL,
+  location VARCHAR(30) NOT NULL,
+  movement_type ENUM('grn','issue','dispense','expiry_writeoff','adjustment','return') NOT NULL,
+  quantity_change INT NOT NULL,
+  unit_cost DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  total_cost DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  reference_type VARCHAR(40) NULL,
+  reference_id INT NULL,
+  journal_entry_id INT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (item_id) REFERENCES store_items(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS medication_orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  admission_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  medicine_id INT NULL,
+  medicine_name VARCHAR(160) NOT NULL,
+  dose VARCHAR(80) NOT NULL,
+  route VARCHAR(40) NOT NULL DEFAULT 'Oral',
+  frequency VARCHAR(40) NOT NULL DEFAULT 'BID',
+  prn TINYINT(1) NOT NULL DEFAULT 0,
+  start_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  stop_at DATETIME NULL,
+  ordered_by INT NOT NULL,
+  status ENUM('active','stopped','completed') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (admission_id) REFERENCES admissions(id),
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS ward_rounds (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  admission_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  doctor_id INT NOT NULL,
+  subjective TEXT NULL,
+  objective TEXT NULL,
+  assessment TEXT NOT NULL,
+  plan TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (admission_id) REFERENCES admissions(id),
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS nursing_notes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  admission_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  nurse_id INT NOT NULL,
+  note_type VARCHAR(40) NOT NULL DEFAULT 'Shift Note',
+  note TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (admission_id) REFERENCES admissions(id),
+  FOREIGN KEY (patient_id) REFERENCES patients(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tax_brackets (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  lower_bound DECIMAL(12,2) NOT NULL,
+  upper_bound DECIMAL(12,2) NULL,
+  rate DECIMAL(6,4) NOT NULL,
+  deduction DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  active TINYINT(1) NOT NULL DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_invoices_patient ON invoices(patient_id, status);

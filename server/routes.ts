@@ -1,10 +1,13 @@
-import { Router, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import { execute, getDbConfigSummary, getDialect, nextSequence, query, queryOne, withTransaction } from './db.ts';
+import { execute, getDbConfigSummary, getDialect, nextSequence, nowSql, query, queryOne, withTransaction } from './db.ts';
 import {
   type AuthRequest,
   type AuthUser,
+  assertDifferentUser,
+  assertPatientAccess,
+  formatClinicDate,
   hasPermission,
   loadUserContext,
   requireAuth,
@@ -14,7 +17,7 @@ import {
   verifyAuditChain,
   writeAuditLog,
 } from './auth.ts';
-import { broadcastClinicEvent, registerRealtimeClient } from './realtime.ts';
+import { broadcastClinicEvent, createRealtimeTicket, registerRealtimeClient } from './realtime.ts';
 
 function maskPatientRecord(p: Record<string, unknown>, user: AuthUser): Record<string, unknown> {
   const canSeeClinical = hasPermission(user, 'patient.clinical.read');
@@ -76,7 +79,7 @@ const ALLERGY_CLASS_MAP: Array<{ triggers: string[]; meds: string[] }> = [
 
 function findAllergyConflicts(allergiesRaw: string | null | undefined, genericName: string): boolean {
   const allergyText = (allergiesRaw || '').toLowerCase().trim();
-  if (!allergyText || allergyText === 'none' || allergyText === 'none known' || allergyText === 'nkda') {
+  if (!allergyText || allergyText === 'none' || allergyText === 'none known' || allergyText === 'nkda' || allergyText === 'unknown') {
     return false;
   }
   const medLower = genericName.toLowerCase();
@@ -90,10 +93,83 @@ function findAllergyConflicts(allergiesRaw: string | null | undefined, genericNa
   return tokens.some((tok) => medLower.includes(tok));
 }
 
+function validateVitalsRanges(v: {
+  bp_systolic?: unknown;
+  bp_diastolic?: unknown;
+  temperature?: unknown;
+  pulse?: unknown;
+  respiratory_rate?: unknown;
+  spo2?: unknown;
+  weight_kg?: unknown;
+  height_cm?: unknown;
+  blood_glucose?: unknown;
+}): string | null {
+  const checks: Array<[unknown, string, number, number]> = [
+    [v.bp_systolic, 'Systolic BP', 40, 280],
+    [v.bp_diastolic, 'Diastolic BP', 20, 180],
+    [v.temperature, 'Temperature (°C)', 30, 45],
+    [v.pulse, 'Pulse (bpm)', 20, 240],
+    [v.respiratory_rate, 'Respiratory Rate', 4, 80],
+    [v.spo2, 'SpO2 (%)', 40, 100],
+    [v.weight_kg, 'Weight (kg)', 0.5, 400],
+    [v.height_cm, 'Height (cm)', 30, 250],
+    [v.blood_glucose, 'Blood Glucose', 10, 1500],
+  ];
+  for (const [val, label, min, max] of checks) {
+    if (val != null && val !== '') {
+      const n = Number(val);
+      if (!Number.isFinite(n) || n < min || n > max) {
+        return `${label} must be between ${min} and ${max}.`;
+      }
+    }
+  }
+  if (v.bp_systolic != null && v.bp_systolic !== '' && v.bp_diastolic != null && v.bp_diastolic !== '') {
+    if (Number(v.bp_diastolic) >= Number(v.bp_systolic)) {
+      return 'Diastolic BP must be lower than Systolic BP.';
+    }
+  }
+  return null;
+}
+
 const router = Router();
+for (const method of ['get', 'post', 'put', 'patch', 'delete'] as const) {
+  const orig = router[method].bind(router);
+  (router as unknown as Record<string, (...args: unknown[]) => unknown>)[method] = (...args: unknown[]) => {
+    const [pathArg, ...handlers] = args as [
+      unknown,
+      ...Array<(req: Request, res: Response, next: NextFunction) => unknown>,
+    ];
+    const wrapped = handlers.map((fn) => (req: Request, res: Response, next: NextFunction) => {
+      try {
+        return Promise.resolve(fn(req, res, next)).catch(next);
+      } catch (err) {
+        next(err);
+      }
+    });
+    return (orig as (...a: unknown[]) => unknown)(pathArg, ...wrapped);
+  };
+}
+
 const loginAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
-const pending2faChallenges = new Map<string, { userId: number; code: string; email: string; expiresAt: number }>();
 const lastAuditViewByUser = new Map<number, number>();
+
+async function getClinicSettings() {
+  const rows = await query<{ setting_key: string; setting_value: string }>('SELECT setting_key, setting_value FROM system_settings');
+  const map = new Map(rows.map((r) => [r.setting_key, r.setting_value]));
+  const parsedLimit = Number(map.get('expense_auto_post_limit') ?? 100);
+  return {
+    clinicName: map.get('clinic_name') || 'Clinic360 Central Medical Center',
+    currencyCode: map.get('currency_code') || 'USD',
+    currencySymbol: map.get('currency_symbol') || '$',
+    timezone: map.get('timezone') || 'Africa/Addis_Ababa',
+    expenseAutoPostLimit: Number.isFinite(parsedLimit) && parsedLimit >= 0 ? parsedLimit : 100,
+  };
+}
+
+async function getClinicToday(): Promise<string> {
+  const settings = await getClinicSettings();
+  return formatClinicDate(settings.timezone);
+}
 
 async function postJournalEntry(opts: {
   entryDate?: string;
@@ -101,6 +177,7 @@ async function postJournalEntry(opts: {
   sourceId?: number | null;
   description: string;
   postedBy: number;
+  reversalOfId?: number | null;
   lines: Array<{ accountCode: string; debit?: number; credit?: number; memo?: string }>;
 }) {
   const normalizedLines = opts.lines
@@ -122,6 +199,18 @@ async function postJournalEntry(opts: {
     throw new Error(`Unbalanced journal entry (Dr ${totalDebit} != Cr ${totalCredit}).`);
   }
 
+  const entryDate = opts.entryDate || (await getClinicToday());
+  const periodCode = entryDate.slice(0, 7);
+  const closedPeriod = await queryOne<{ period_code: string }>(
+    "SELECT period_code FROM accounting_periods WHERE period_code = ? AND status = 'closed' LIMIT 1",
+    [periodCode]
+  );
+  if (closedPeriod) {
+    const err = new Error(`Accounting period ${periodCode} is closed. Post to an open period instead.`) as Error & { status?: number };
+    err.status = 409;
+    throw err;
+  }
+
   const codes = [...new Set(normalizedLines.map((l) => l.accountCode))];
   const ph = codes.map(() => '?').join(',');
   const acctRows = await query<{ id: number; code: string }>(`SELECT id, code FROM chart_of_accounts WHERE code IN (${ph})`, codes);
@@ -133,11 +222,10 @@ async function postJournalEntry(opts: {
   }
 
   const entryNumber = await nextSequence('JE');
-  const entryDate = opts.entryDate || new Date().toISOString().slice(0, 10);
   const jeRes = await execute(
-    `INSERT INTO journal_entries (entry_number, entry_date, source_type, source_id, description, total_debit, total_credit, posted_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [entryNumber, entryDate, opts.sourceType, opts.sourceId ?? null, opts.description, totalDebit, totalCredit, opts.postedBy]
+    `INSERT INTO journal_entries (entry_number, entry_date, source_type, source_id, description, total_debit, total_credit, reversal_of_id, posted_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [entryNumber, entryDate, opts.sourceType, opts.sourceId ?? null, opts.description, totalDebit, totalCredit, opts.reversalOfId ?? null, opts.postedBy]
   );
 
   for (const line of normalizedLines) {
@@ -158,8 +246,191 @@ function revenueAccountForCategory(category: string): string {
   return '4010';
 }
 
+async function buildPerLineRevenueLines(
+  invoiceId: number,
+  targetAmount: number,
+  side: 'debit' | 'credit',
+  memo: string
+): Promise<Array<{ accountCode: string; debit?: number; credit?: number; memo?: string }>> {
+  const amt = Number(Number(targetAmount || 0).toFixed(2));
+  if (amt <= 0) return [];
+  const items = await query<{ category: string; total: number }>(
+    'SELECT category, COALESCE(SUM(line_total), 0) AS total FROM invoice_items WHERE invoice_id = ? GROUP BY category',
+    [invoiceId]
+  );
+  const byAcct = new Map<string, number>();
+  for (const it of items) {
+    const acct = revenueAccountForCategory(it.category);
+    byAcct.set(acct, (byAcct.get(acct) || 0) + Number(it.total || 0));
+  }
+  const entries = [...byAcct.entries()].filter(([, v]) => v > 0);
+  const sumRaw = entries.reduce((s, [, v]) => s + v, 0);
+  if (entries.length === 0 || sumRaw <= 0) {
+    return [{ accountCode: '4010', [side]: amt, memo }];
+  }
+
+  const out: Array<{ accountCode: string; debit?: number; credit?: number; memo?: string }> = [];
+  let allocated = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const [acct, val] = entries[i];
+    const part = i === entries.length - 1 ? Number((amt - allocated).toFixed(2)) : Number(((amt * val) / sumRaw).toFixed(2));
+    if (part > 0) {
+      allocated = Number((allocated + part).toFixed(2));
+      out.push({ accountCode: acct, [side]: part, memo });
+    }
+  }
+  return out.length > 0 ? out : [{ accountCode: '4010', [side]: amt, memo }];
+}
+
+async function hasInvoiceAccrualJE(invoiceId: number): Promise<boolean> {
+  const row = await queryOne<{ id: number }>(
+    `SELECT je.id
+     FROM journal_entries je
+     LEFT JOIN insurance_claims ic ON je.source_type = 'ar_claim' AND ic.id = je.source_id
+     WHERE (je.source_type IN ('invoice', 'ipd_bed') AND je.source_id = ?) OR ic.invoice_id = ?
+     LIMIT 1`,
+    [invoiceId, invoiceId]
+  );
+  return Boolean(row);
+}
+
+async function postInvoiceAccrualJE(opts: {
+  invoiceId: number;
+  invoiceNumber: string;
+  payerType: string;
+  totalAmount: number;
+  postedBy: number;
+  sourceType?: string;
+  description?: string;
+}) {
+  const total = Number(Number(opts.totalAmount || 0).toFixed(2));
+  if (total <= 0 || opts.payerType === 'exempt') return null;
+  const arAcct = opts.payerType === 'insurance' || opts.payerType === 'credit' ? '1100' : '1150';
+  const revLines = await buildPerLineRevenueLines(opts.invoiceId, total, 'credit', opts.invoiceNumber);
+  return postJournalEntry({
+    sourceType: opts.sourceType || 'invoice',
+    sourceId: opts.invoiceId,
+    description: opts.description || `Invoice accrual ${opts.invoiceNumber}`,
+    postedBy: opts.postedBy,
+    lines: [{ accountCode: arAcct, debit: total, memo: opts.invoiceNumber }, ...revLines],
+  });
+}
+
+async function checkActiveClinicianLicence(userId: number): Promise<{ valid: boolean; error?: string }> {
+  const contract = await queryOne<{ licence_number: string | null; licence_expiry: string | null; status: string }>(
+    'SELECT licence_number, licence_expiry, status FROM staff_contracts WHERE user_id = ? LIMIT 1',
+    [userId]
+  );
+  if (!contract) return { valid: true };
+  if (contract.status !== 'active') {
+    return { valid: false, error: 'Your employment contract is not active. Contact HR.' };
+  }
+  if (contract.licence_expiry) {
+    const today = await getClinicToday();
+    if (contract.licence_expiry < today) {
+      return {
+        valid: false,
+        error: `Practice licence (${contract.licence_number || 'on file'}) expired on ${contract.licence_expiry}. Renew with HR before consulting or prescribing.`,
+      };
+    }
+  }
+  return { valid: true };
+}
+
+async function recordPaymentGateBypass(opts: {
+  visitId: number;
+  patientId: number;
+  entityType: string;
+  entityId: number;
+  user: AuthUser;
+  reason: string;
+  req: Request;
+}) {
+  await execute(
+    `INSERT INTO payment_gate_bypasses (visit_id, patient_id, entity_type, entity_id, set_by, reason, follow_up_status)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending_billing')`,
+    [opts.visitId, opts.patientId, opts.entityType, opts.entityId, opts.user.id, opts.reason]
+  );
+  await writeAuditLog({
+    user: opts.user,
+    action: 'payment.gate.bypass',
+    entityType: opts.entityType,
+    entityId: opts.entityId,
+    patientId: opts.patientId,
+    reason: opts.reason,
+    after: { visitId: opts.visitId },
+    req: opts.req,
+  });
+}
+
+async function closeVisit(opts: {
+  visitId: number;
+  user: AuthUser;
+  req: Request;
+  forcePartialClose?: boolean;
+  forceReason?: string;
+}): Promise<{ ok: true } | { ok: false; error: string; httpStatus: number }> {
+  const visit = await queryOne<{
+    id: number;
+    patient_id: number;
+    appointment_id: number | null;
+    diagnosis_text: string | null;
+    status: string;
+  }>('SELECT id, patient_id, appointment_id, diagnosis_text, status FROM visits WHERE id = ?', [opts.visitId]);
+  if (!visit) return { ok: false, error: 'Visit not found', httpStatus: 404 };
+  if (visit.status === 'closed') return { ok: true };
+  if (!visit.diagnosis_text?.trim()) {
+    return { ok: false, error: 'Diagnosis is required before closing a visit.', httpStatus: 400 };
+  }
+
+  const [openLab, openImg, openRx] = await Promise.all([
+    queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM lab_orders WHERE visit_id = ? AND status IN ('ordered','collected','resulted')", [opts.visitId]),
+    queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM imaging_orders WHERE visit_id = ? AND status IN ('ordered','scheduled','performed','reported_draft')", [opts.visitId]),
+    queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM prescriptions WHERE visit_id = ? AND status IN ('awaiting_stock_check','pending_payment','pending','paid_ready_to_dispense')", [opts.visitId]),
+  ]);
+
+  const remaining = Number(openLab?.cnt || 0) + Number(openImg?.cnt || 0) + Number(openRx?.cnt || 0);
+  if (remaining > 0) {
+    if (!opts.forcePartialClose) {
+      return {
+        ok: false,
+        error: `Visit has ${remaining} incomplete lab, imaging, or pharmacy order(s). Complete or cancel them first, or provide force_partial_close with reason.`,
+        httpStatus: 409,
+      };
+    }
+    if (!opts.forceReason || opts.forceReason.trim().length < 5) {
+      return { ok: false, error: 'Partial visit closure requires a formal clinical reason (min 5 characters).', httpStatus: 400 };
+    }
+  }
+
+  await execute("UPDATE visits SET status = 'closed', workflow_stage = 'completed', closed_at = ?, closed_by = ? WHERE id = ?", [
+    nowSql(),
+    opts.user.id,
+    opts.visitId,
+  ]);
+  await execute("UPDATE queue_tickets SET status = 'completed' WHERE visit_id = ?", [opts.visitId]);
+  if (visit.appointment_id) {
+    await execute("UPDATE appointments SET status = 'completed' WHERE id = ? AND status != 'cancelled'", [visit.appointment_id]);
+  }
+
+  await writeAuditLog({
+    user: opts.user,
+    action: 'visit.close',
+    entityType: 'visit',
+    entityId: opts.visitId,
+    patientId: visit.patient_id,
+    reason: opts.forcePartialClose ? opts.forceReason || null : null,
+    after: { forcedPartial: Boolean(opts.forcePartialClose && remaining > 0), remainingOrders: remaining },
+    req: opts.req,
+  });
+
+  broadcastClinicEvent('visit:updated', { visitId: opts.visitId });
+  broadcastClinicEvent('queue:updated', { visitId: opts.visitId });
+  return { ok: true };
+}
+
 async function syncMedicineFromBatches(medicineId: number) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = await getClinicToday();
   const batches = await query<{ qty_on_hand: number; batch_number: string; expiry_date: string }>(
     `SELECT sb.qty_on_hand, sb.batch_number, sb.expiry_date
      FROM stock_batches sb
@@ -307,18 +578,88 @@ async function createNotification(opts: {
   });
 }
 
-router.get('/health', (_req, res) => {
-  res.json({ ok: true, dialect: getDialect(), service: 'Clinic360 API' });
+router.get('/health', async (_req, res) => {
+  try {
+    await queryOne('SELECT 1 AS ok');
+    res.json({ ok: true, db: 'connected', dialect: getDialect(), service: 'Clinic360 API' });
+  } catch {
+    res.status(503).json({ ok: false, db: 'disconnected', dialect: getDialect(), service: 'Clinic360 API' });
+  }
+});
+
+router.post('/events/ticket', requireAuth, (req: AuthRequest, res: Response) => {
+  const ticket = createRealtimeTicket(req.user!.id);
+  res.json({ ticket });
 });
 
 router.get('/events/stream', requireAuth, (req: AuthRequest, res: Response) => {
   registerRealtimeClient(req, res, { id: req.user!.id, roles: req.user!.roles });
 });
 
+router.get('/settings/public', async (_req, res) => {
+  const s = await getClinicSettings();
+  res.json({
+    clinicName: s.clinicName,
+    currencyCode: s.currencyCode,
+    currencySymbol: s.currencySymbol,
+    timezone: s.timezone,
+  });
+});
+
+router.get('/admin/settings', requireAuth, requirePermission('admin.user.manage', 'catalog.manage'), async (_req, res) => {
+  const settings = await getClinicSettings();
+  res.json({ settings });
+});
+
+router.put('/admin/settings', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const { clinicName, currencyCode, currencySymbol, timezone, expenseAutoPostLimit } = req.body || {};
+  const updates: Array<[string, string]> = [];
+  if (typeof clinicName === 'string' && clinicName.trim()) updates.push(['clinic_name', clinicName.trim()]);
+  if (typeof currencyCode === 'string' && currencyCode.trim()) updates.push(['currency_code', currencyCode.trim().toUpperCase()]);
+  if (typeof currencySymbol === 'string' && currencySymbol.trim()) updates.push(['currency_symbol', currencySymbol.trim()]);
+  if (typeof timezone === 'string' && timezone.trim()) updates.push(['timezone', timezone.trim()]);
+  if (expenseAutoPostLimit !== undefined && Number(expenseAutoPostLimit) >= 0) {
+    updates.push(['expense_auto_post_limit', String(Number(expenseAutoPostLimit))]);
+  }
+
+  for (const [k, v] of updates) {
+    const existing = await queryOne('SELECT setting_key FROM system_settings WHERE setting_key = ?', [k]);
+    if (existing) {
+      await execute('UPDATE system_settings SET setting_value = ?, updated_by = ?, updated_at = ? WHERE setting_key = ?', [
+        v,
+        req.user!.id,
+        nowSql(),
+        k,
+      ]);
+    } else {
+      await execute('INSERT INTO system_settings (setting_key, setting_value, updated_by, updated_at) VALUES (?, ?, ?, ?)', [
+        k,
+        v,
+        req.user!.id,
+        nowSql(),
+      ]);
+    }
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.settings.update',
+    entityType: 'system_settings',
+    entityId: 'global',
+    after: Object.fromEntries(updates),
+    req,
+  });
+
+  res.json({ settings: await getClinicSettings() });
+});
+
 // ---------------------------------------------------------------------------
 // AUTHENTICATION & NOTIFICATIONS
 // ---------------------------------------------------------------------------
 router.get('/auth/demo-accounts', async (_req, res) => {
+  if (process.env.NODE_ENV === 'production' && process.env.SEED_DEMO !== 'true') {
+    return res.json({ accounts: [] });
+  }
   const rows = await query<{
     full_name: string;
     email: string;
@@ -379,14 +720,17 @@ router.post('/auth/login', async (req, res) => {
     return res.status(403).json({ error: 'Account is deactivated. Contact your administrator.' });
   }
 
-  if (user.locked_until && new Date(user.locked_until).getTime() > now) {
-    return res.status(423).json({ error: 'Account temporarily locked due to failed logins.' });
+  if (user.locked_until) {
+    const lockIso = user.locked_until.includes('T') ? user.locked_until : `${user.locked_until.replace(' ', 'T')}Z`;
+    if (new Date(lockIso).getTime() > now) {
+      return res.status(423).json({ error: 'Account temporarily locked due to failed logins.' });
+    }
   }
 
   const valid = await bcrypt.compare(String(password), user.password_hash);
   if (!valid) {
     const nextFails = user.failed_attempts + 1;
-    const lockUntil = nextFails >= 5 ? new Date(now + 15 * 60_000).toISOString() : null;
+    const lockUntil = nextFails >= 5 ? nowSql(new Date(now + 15 * 60_000)) : null;
     await execute('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?', [
       nextFails,
       lockUntil,
@@ -403,13 +747,10 @@ router.post('/auth/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
-  await execute("UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = datetime('now') WHERE id = ?", [
+  await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?', [
+    nowSql(),
     user.id,
-  ]).catch(async () => {
-    await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE id = ?', [
-      user.id,
-    ]);
-  });
+  ]);
 
   const ctx = await loadUserContext(user.id);
   if (!ctx) {
@@ -419,12 +760,11 @@ router.post('/auth/login', async (req, res) => {
   if (ctx.twoFaEnabled) {
     const challengeId = crypto.randomBytes(12).toString('hex');
     const code = String(crypto.randomInt(100000, 999999));
-    pending2faChallenges.set(challengeId, {
-      userId: ctx.id,
-      code,
-      email: ctx.email,
-      expiresAt: Date.now() + 10 * 60_000,
-    });
+    const expiresAt = nowSql(new Date(Date.now() + 10 * 60_000));
+    await execute(
+      'INSERT INTO auth_2fa_challenges (id, user_id, email, code, attempts, expires_at) VALUES (?, ?, ?, ?, 0, ?)',
+      [challengeId, ctx.id, ctx.email, code, expiresAt]
+    );
     const [localPart, domain] = ctx.email.split('@');
     const maskedEmail = `${localPart.slice(0, 2)}***@${domain || 'clinic360.local'}`;
     await writeAuditLog({
@@ -460,18 +800,35 @@ router.post('/auth/verify-2fa', async (req, res) => {
   if (!challengeId || !code) {
     return res.status(400).json({ error: 'Verification challenge and 6-digit code are required.' });
   }
-  const challenge = pending2faChallenges.get(String(challengeId));
-  if (!challenge || challenge.expiresAt < Date.now()) {
-    pending2faChallenges.delete(String(challengeId));
+  const challenge = await queryOne<{
+    id: string;
+    user_id: number;
+    email: string;
+    code: string;
+    attempts: number;
+    expires_at: string;
+  }>('SELECT * FROM auth_2fa_challenges WHERE id = ?', [String(challengeId)]);
+
+  if (!challenge) {
     return res.status(401).json({ error: '2FA challenge expired or invalid. Please sign in again.' });
   }
+  const expMs = new Date(`${String(challenge.expires_at).replace(' ', 'T')}Z`).getTime();
+  if (expMs < Date.now()) {
+    await execute('DELETE FROM auth_2fa_challenges WHERE id = ?', [challenge.id]);
+    return res.status(401).json({ error: '2FA challenge expired or invalid. Please sign in again.' });
+  }
+  if (Number(challenge.attempts) >= 5) {
+    await execute('DELETE FROM auth_2fa_challenges WHERE id = ?', [challenge.id]);
+    return res.status(429).json({ error: 'Too many invalid 2FA attempts. Sign in again to get a new code.' });
+  }
 
-  const ctx = await loadUserContext(challenge.userId);
+  const ctx = await loadUserContext(challenge.user_id);
   if (!ctx) {
     return res.status(403).json({ error: 'Unable to load user permissions.' });
   }
 
   if (String(code).trim() !== challenge.code) {
+    await execute('UPDATE auth_2fa_challenges SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
     await writeAuditLog({
       user: ctx,
       action: 'auth.2fa.failed',
@@ -483,7 +840,7 @@ router.post('/auth/verify-2fa', async (req, res) => {
     return res.status(401).json({ error: 'Invalid 6-digit authenticator code.' });
   }
 
-  pending2faChallenges.delete(String(challengeId));
+  await execute('DELETE FROM auth_2fa_challenges WHERE id = ?', [challenge.id]);
   const token = signAccessToken(ctx);
   await writeAuditLog({
     user: ctx,
@@ -493,6 +850,73 @@ router.post('/auth/verify-2fa', async (req, res) => {
     req,
   });
   res.json({ token, user: ctx, dialect: getDialect() });
+});
+
+router.post('/auth/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+
+  const user = await queryOne<{ id: number; full_name: string; active: number }>(
+    'SELECT id, full_name, active FROM users WHERE email = ?',
+    [email]
+  );
+  if (!user || !user.active) {
+    return res.json({ ok: true, message: 'If an active account matches that email, a reset token has been generated.' });
+  }
+
+  const rawToken = crypto.randomBytes(24).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = nowSql(new Date(Date.now() + 30 * 60_000));
+  await execute('INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)', [
+    user.id,
+    tokenHash,
+    expiresAt,
+  ]);
+  await writeAuditLog({
+    user: { id: user.id, fullName: user.full_name, roles: [] },
+    action: 'auth.password.reset_requested',
+    entityType: 'user',
+    entityId: user.id,
+    req,
+  });
+
+  res.json({
+    ok: true,
+    message: 'If an active account matches that email, a reset token has been generated.',
+    devResetToken: process.env.NODE_ENV === 'production' ? undefined : rawToken,
+  });
+});
+
+router.post('/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  if (!token || !newPassword || String(newPassword).length < 8) {
+    return res.status(400).json({ error: 'Reset token and a new password (min 8 characters) are required.' });
+  }
+  const tokenHash = crypto.createHash('sha256').update(String(token).trim()).digest('hex');
+  const rec = await queryOne<{ id: number; user_id: number; expires_at: string; used_at: string | null }>(
+    'SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = ? LIMIT 1',
+    [tokenHash]
+  );
+  if (!rec || rec.used_at || rec.expires_at <= nowSql()) {
+    return res.status(400).json({ error: 'Password reset token is invalid or has expired.' });
+  }
+
+  const nextHash = await bcrypt.hash(String(newPassword), 10);
+  await withTransaction(async () => {
+    await execute('UPDATE users SET password_hash = ?, must_change_password = 0, failed_attempts = 0, locked_until = NULL WHERE id = ?', [
+      nextHash,
+      rec.user_id,
+    ]);
+    await execute('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?', [nowSql(), rec.id]);
+  });
+
+  await writeAuditLog({
+    action: 'auth.password.reset_completed',
+    entityType: 'user',
+    entityId: rec.user_id,
+    req,
+  });
+  res.json({ ok: true });
 });
 
 router.post('/auth/change-password', requireAuth, async (req: AuthRequest, res: Response) => {
@@ -533,7 +957,7 @@ router.get('/auth/me', requireAuth, async (req: AuthRequest, res: Response) => {
 });
 
 router.post('/auth/logout', requireAuth, async (req: AuthRequest, res: Response) => {
-  revokeToken(req.authJti, req.authExp);
+  await revokeToken(req.authJti, req.authExp);
   await writeAuditLog({
     user: req.user,
     action: 'auth.logout',
@@ -575,7 +999,7 @@ router.post('/notifications/read-all', requireAuth, async (req: AuthRequest, res
 // ---------------------------------------------------------------------------
 router.get('/dashboard', requireAuth, async (req: AuthRequest, res: Response) => {
   const user = req.user!;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = await getClinicToday();
 
   const patientCount = await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM patients WHERE status = 'active'");
   const todayAppts = await queryOne<{ cnt: number }>(
@@ -609,7 +1033,7 @@ router.get('/dashboard', requireAuth, async (req: AuthRequest, res: Response) =>
   let unpaidBalance = 0;
   if (canSeeFinance) {
     const revRow = await queryOne<{ total: number }>(
-      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status = 'completed'"
+      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status IN ('completed','refunded')"
     );
     const unpaidRow = await queryOne<{ total: number }>(
       "SELECT COALESCE(SUM(total_amount - paid_amount), 0) AS total FROM invoices WHERE status IN ('unpaid','partial')"
@@ -737,7 +1161,7 @@ router.get('/patients', requireAuth, requirePermission('patient.read'), async (r
   const countRow = await queryOne<{ cnt: number }>(`SELECT COUNT(*) AS cnt FROM patients${whereSql}`, params);
 
   let sql = `SELECT id, mrn, first_name, last_name, sex, date_of_birth, phone, email, address,
-                    patient_type, payer_name, insurance_number, status, created_at`;
+                    patient_type, payer_name, insurance_number, dob_estimated, status, created_at`;
   if (canSeeClinical) {
     sql += ', blood_group, allergies';
   }
@@ -748,17 +1172,66 @@ router.get('/patients', requireAuth, requirePermission('patient.read'), async (r
 });
 
 router.get('/patients/check-duplicate', requireAuth, requirePermission('patient.read'), async (req: AuthRequest, res: Response) => {
-  const { first_name, last_name, date_of_birth, phone } = req.query;
-  const matches = await query(
-    `SELECT id, mrn, first_name, last_name, date_of_birth, phone
+  const firstName = String(req.query.first_name || '').trim().toLowerCase();
+  const lastName = String(req.query.last_name || '').trim().toLowerCase();
+  const dob = String(req.query.date_of_birth || '').trim();
+  const phone = String(req.query.phone || '').trim();
+  const cleanPhone = phone.replace(/[\s\-+()]/g, '');
+  const nationalId = String(req.query.national_id || '').trim().toLowerCase();
+
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (firstName && lastName && dob) {
+    clauses.push('(LOWER(first_name) = ? AND LOWER(last_name) = ? AND date_of_birth = ?)');
+    params.push(firstName, lastName, dob);
+  }
+  if (phone) {
+    clauses.push("phone = ? OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '-', ''), ' ', ''), '+', ''), '(', ''), ')', '') = ?");
+    params.push(phone, cleanPhone || phone);
+  }
+  if (nationalId) {
+    clauses.push('(national_id IS NOT NULL AND LOWER(national_id) = ?)');
+    params.push(nationalId);
+  }
+  if (clauses.length === 0) return res.json({ duplicates: [] });
+
+  const candidates = await query<{
+    id: number;
+    mrn: string;
+    first_name: string;
+    last_name: string;
+    date_of_birth: string;
+    phone: string;
+    national_id: string | null;
+  }>(
+    `SELECT id, mrn, first_name, last_name, date_of_birth, phone, national_id
      FROM patients
-     WHERE status = 'active'
-       AND ((LOWER(first_name) = LOWER(?) AND LOWER(last_name) = LOWER(?) AND date_of_birth = ?)
-            OR phone = ?)
-     LIMIT 5`,
-    [String(first_name || ''), String(last_name || ''), String(date_of_birth || ''), String(phone || '')]
+     WHERE status = 'active' AND (${clauses.join(' OR ')})
+     LIMIT 10`,
+    params
   );
-  res.json({ duplicates: matches });
+
+  const scored = candidates
+    .map((c) => {
+      let score = 0;
+      const cPhoneClean = String(c.phone || '').replace(/[\s\-+()]/g, '');
+      if (nationalId && c.national_id && c.national_id.toLowerCase() === nationalId) score += 90;
+      if (firstName && lastName && dob && c.first_name.toLowerCase() === firstName && c.last_name.toLowerCase() === lastName && c.date_of_birth === dob) score += 70;
+      if (cleanPhone && cPhoneClean === cleanPhone) score += 50;
+      return {
+        id: c.id,
+        mrn: c.mrn,
+        first_name: c.first_name,
+        last_name: c.last_name,
+        date_of_birth: c.date_of_birth,
+        phone: c.phone,
+        match_score: score,
+      };
+    })
+    .sort((a, b) => b.match_score - a.match_score)
+    .slice(0, 5);
+
+  res.json({ duplicates: scored });
 });
 
 router.post('/patients/merge', requireAuth, requirePermission('patient.merge'), async (req: AuthRequest, res: Response) => {
@@ -776,9 +1249,32 @@ router.post('/patients/merge', requireAuth, requirePermission('patient.merge'), 
       return { ok: false as const, error: 'Both source and target must be active patient records.', httpStatus: 404 };
     }
 
-    const tables = ['appointments', 'visits', 'vitals', 'invoices', 'payments', 'receipts', 'lab_orders', 'imaging_orders', 'prescriptions', 'queue_tickets', 'admissions', 'patient_deposits'];
+    const tables = [
+      'appointments',
+      'visits',
+      'vitals',
+      'invoices',
+      'payments',
+      'receipts',
+      'lab_orders',
+      'imaging_orders',
+      'prescriptions',
+      'queue_tickets',
+      'admissions',
+      'patient_deposits',
+      'nursing_procedures',
+      'medication_orders',
+      'medication_administrations',
+      'ward_rounds',
+      'nursing_notes',
+      'insurance_claims',
+      'credit_notes',
+      'payment_gate_bypasses',
+      'patient_payer_history',
+      'break_glass_logs',
+    ];
     for (const tbl of tables) {
-      await execute(`UPDATE ${tbl} SET patient_id = ? WHERE patient_id = ?`, [tgtId, srcId]);
+      await execute(`UPDATE ${tbl} SET patient_id = ? WHERE patient_id = ?`, [tgtId, srcId]).catch(() => {});
     }
     await execute("UPDATE patients SET status = 'merged', merged_into_id = ?, updated_by = ? WHERE id = ?", [tgtId, req.user!.id, srcId]);
 
@@ -805,13 +1301,22 @@ router.post('/patients/merge', requireAuth, requirePermission('patient.merge'), 
 
 router.get('/patients/:id', requireAuth, requirePermission('patient.read'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const canSeeClinical = hasPermission(req.user!, 'patient.clinical.read');
-  const canSeeBilling = hasPermission(req.user!, 'billing.invoice.read');
-
   const patient = await queryOne<Record<string, unknown>>('SELECT * FROM patients WHERE id = ?', [id]);
   if (!patient) {
     return res.status(404).json({ error: 'Patient not found' });
   }
+
+  const access = await assertPatientAccess(req.user!, id);
+  if (!access.allowed) {
+    return res.status(403).json({
+      error: access.reason || 'Break-Glass authorization required to view unassigned patient chart.',
+      breakGlassRequired: true,
+      patientId: id,
+    });
+  }
+
+  const canSeeClinical = access.clinicalAuthorized;
+  const canSeeBilling = hasPermission(req.user!, 'billing.invoice.read');
 
   const safePatient = maskPatientRecord(patient, req.user!);
 
@@ -845,7 +1350,7 @@ router.get('/patients/:id', requireAuth, requirePermission('patient.read'), asyn
     ? await query('SELECT * FROM invoices WHERE patient_id = ? ORDER BY id DESC', [id])
     : [];
 
-  const accessHistory = hasPermission(req.user!, 'audit.read') || hasPermission(req.user!, 'patient.clinical.read')
+  const accessHistory = hasPermission(req.user!, 'audit.read') || canSeeClinical
     ? await query(
         'SELECT id, occurred_at, user_name, role_at_time, action FROM audit_logs WHERE patient_id = ? ORDER BY id DESC LIMIT 15',
         [id]
@@ -870,6 +1375,7 @@ router.get('/patients/:id', requireAuth, requirePermission('patient.read'), asyn
   res.json({
     patient: safePatient,
     clinicalMasked: !canSeeClinical,
+    breakGlassActive: access.breakGlassActive,
     assignedDoctorIds,
     appointments,
     visits,
@@ -891,10 +1397,17 @@ router.post('/patients/:id/break-glass', requireAuth, requirePermission('patient
   );
   if (!patient) return res.status(404).json({ error: 'Patient not found' });
 
+  const cleanReason = String(reason).trim();
+  const expiresAt = nowSql(new Date(Date.now() + 4 * 3600 * 1000));
+  await execute(
+    'INSERT INTO break_glass_logs (user_id, patient_id, reason, expires_at) VALUES (?, ?, ?, ?)',
+    [req.user!.id, id, cleanReason, expiresAt]
+  );
+
   await createNotification({
     targetRole: 'AUD',
     title: 'Break-Glass Chart Access Logged',
-    message: `${req.user!.fullName} invoked Break-Glass access for ${patient.first_name} ${patient.last_name} (${patient.mrn}): ${String(reason).trim()}`,
+    message: `${req.user!.fullName} invoked Break-Glass access for ${patient.first_name} ${patient.last_name} (${patient.mrn}): ${cleanReason}`,
     severity: 'critical',
     entityType: 'patient',
     entityId: id,
@@ -914,12 +1427,12 @@ router.post('/patients/:id/break-glass', requireAuth, requirePermission('patient
     entityType: 'patient',
     entityId: id,
     patientId: id,
-    reason: String(reason).trim(),
-    after: { mrn: patient.mrn },
+    reason: cleanReason,
+    after: { mrn: patient.mrn, expiresAt },
     req,
   });
 
-  res.json({ ok: true, grantedAt: new Date().toISOString() });
+  res.json({ ok: true, grantedAt: nowSql(), expiresAt });
 });
 
 router.post('/patients', requireAuth, requirePermission('patient.create'), async (req: AuthRequest, res: Response) => {
@@ -939,6 +1452,7 @@ router.post('/patients', requireAuth, requirePermission('patient.create'), async
     payer_name,
     insurance_number,
     national_id,
+    dob_estimated = false,
     issue_queue_ticket = true,
     charge_registration_card = true,
   } = req.body || {};
@@ -949,9 +1463,10 @@ router.post('/patients', requireAuth, requirePermission('patient.create'), async
 
   const { patient, ticketNumber } = await withTransaction(async () => {
     const mrn = await nextSequence('MRN');
+    const cleanAllergies = String(allergies || '').trim() || 'Unknown';
     const inserted = await execute(
-      `INSERT INTO patients (mrn, first_name, last_name, sex, date_of_birth, phone, email, address, next_of_kin_name, next_of_kin_phone, blood_group, allergies, patient_type, payer_name, insurance_number, national_id, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO patients (mrn, first_name, last_name, sex, date_of_birth, phone, email, address, next_of_kin_name, next_of_kin_phone, blood_group, allergies, patient_type, payer_name, insurance_number, national_id, dob_estimated, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mrn,
         first_name.trim(),
@@ -964,11 +1479,12 @@ router.post('/patients', requireAuth, requirePermission('patient.create'), async
         next_of_kin_name || null,
         next_of_kin_phone || null,
         blood_group || null,
-        allergies || 'None known',
+        cleanAllergies,
         patient_type,
         payer_name || null,
         insurance_number || null,
         national_id || null,
+        dob_estimated ? 1 : 0,
         req.user!.id,
       ]
     );
@@ -998,6 +1514,14 @@ router.post('/patients', requireAuth, requirePermission('patient.create'), async
         "INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, 'REG-CARD', 'New Patient Registration Card', 'registration', 1, ?, ?)",
         [invRes.insertId, cardFee, cardFee]
       );
+      await postInvoiceAccrualJE({
+        invoiceId: invRes.insertId,
+        invoiceNumber: invNum,
+        payerType: patient_type,
+        totalAmount: cardFee,
+        postedBy: req.user!.id,
+        description: `Registration card fee ${invNum}`,
+      });
     }
 
     await writeAuditLog({
@@ -1006,7 +1530,7 @@ router.post('/patients', requireAuth, requirePermission('patient.create'), async
       entityType: 'patient',
       entityId: patientId,
       patientId,
-      after: { mrn, first_name, last_name, patient_type },
+      after: { mrn, first_name, last_name, patient_type, dob_estimated: Boolean(dob_estimated) },
       req,
     });
 
@@ -1026,15 +1550,44 @@ router.patch('/patients/:id', requireAuth, requirePermission('patient.update'), 
   if (!existing) return res.status(404).json({ error: 'Patient not found' });
 
   const canEditClinical = hasPermission(req.user!, 'patient.clinical.read');
-  const fields = canEditClinical
-    ? ['phone', 'email', 'address', 'next_of_kin_name', 'next_of_kin_phone', 'blood_group', 'allergies', 'patient_type', 'payer_name', 'insurance_number']
-    : ['phone', 'email', 'address', 'next_of_kin_name', 'next_of_kin_phone', 'patient_type', 'payer_name', 'insurance_number'];
+  const canEditIdentity = hasPermission(req.user!, 'patient.identity.update');
+  const canChangePayer = hasPermission(req.user!, 'patient.payer.change');
+
+  const identityFields = ['first_name', 'last_name', 'sex', 'date_of_birth', 'national_id'];
+  const payerFields = ['patient_type', 'payer_name', 'insurance_number'];
+  const generalFields = canEditClinical
+    ? ['phone', 'email', 'address', 'next_of_kin_name', 'next_of_kin_phone', 'blood_group', 'allergies']
+    : ['phone', 'email', 'address', 'next_of_kin_name', 'next_of_kin_phone'];
+
+  const requestedIdentityChanges = identityFields.filter((f) => req.body[f] !== undefined && req.body[f] !== existing[f]);
+  if (requestedIdentityChanges.length > 0) {
+    if (!canEditIdentity) {
+      return res.status(403).json({ error: 'Changing patient identity fields requires patient.identity.update permission.' });
+    }
+    const idReason = String(req.body.identity_change_reason || req.body.reason || '').trim();
+    if (idReason.length < 5) {
+      return res.status(400).json({ error: 'Identity changes require a formal reason (min 5 characters).' });
+    }
+  }
+
+  const requestedPayerChanges = payerFields.filter((f) => req.body[f] !== undefined && req.body[f] !== existing[f]);
+  let pendingExemptApprovalId: number | null = null;
+  if (requestedPayerChanges.length > 0) {
+    if (!canChangePayer) {
+      return res.status(403).json({ error: 'Changing billing payer category requires patient.payer.change permission.' });
+    }
+    const payerReason = String(req.body.payer_change_reason || req.body.reason || '').trim();
+    if (payerReason.length < 5) {
+      return res.status(400).json({ error: 'Payer category changes require a documented reason (min 5 characters).' });
+    }
+  }
+
   const updates: string[] = [];
   const params: unknown[] = [];
   const beforeDiff: Record<string, unknown> = {};
   const afterDiff: Record<string, unknown> = {};
 
-  for (const f of fields) {
+  for (const f of [...generalFields, ...requestedIdentityChanges]) {
     if (req.body[f] !== undefined && req.body[f] !== existing[f]) {
       updates.push(`${f} = ?`);
       params.push(req.body[f]);
@@ -1043,16 +1596,58 @@ router.patch('/patients/:id', requireAuth, requirePermission('patient.update'), 
     }
   }
 
+  const nextPayerType = req.body.patient_type !== undefined ? String(req.body.patient_type) : String(existing.patient_type);
+  const exemptRequested = requestedPayerChanges.includes('patient_type') && nextPayerType === 'exempt' && existing.patient_type !== 'exempt';
+  if (exemptRequested && !hasPermission(req.user!, 'approval.decide')) {
+    const payerReason = String(req.body.payer_change_reason || req.body.reason || '').trim();
+    const appRes = await execute(
+      `INSERT INTO approval_requests (request_type, entity_type, entity_id, requested_amount, reason, status, requested_by)
+       VALUES ('payer_exempt', 'patient', ?, 0, ?, 'pending', ?)`,
+      [id, payerReason, req.user!.id]
+    );
+    pendingExemptApprovalId = appRes.insertId;
+    await createNotification({
+      targetRole: 'MGR',
+      title: 'Patient Fee Exemption Approval Required',
+      message: `${req.user!.fullName} requested exempt status for patient #${id}: ${payerReason}`,
+      severity: 'warning',
+      entityType: 'approval_request',
+      entityId: pendingExemptApprovalId,
+    });
+  } else if (requestedPayerChanges.length > 0) {
+    for (const f of requestedPayerChanges) {
+      updates.push(`${f} = ?`);
+      params.push(req.body[f]);
+      beforeDiff[f] = existing[f];
+      afterDiff[f] = req.body[f];
+    }
+    const payerReason = String(req.body.payer_change_reason || req.body.reason || 'Payer update').trim();
+    await execute(
+      `INSERT INTO patient_payer_history (patient_id, from_type, to_type, payer_name, reason, changed_by, approved_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        String(existing.patient_type),
+        nextPayerType,
+        req.body.payer_name ?? existing.payer_name ?? null,
+        payerReason,
+        req.user!.id,
+        nextPayerType === 'exempt' ? req.user!.id : null,
+      ]
+    );
+  }
+
   if (updates.length > 0) {
     updates.push('updated_by = ?');
     params.push(req.user!.id, id);
     await execute(`UPDATE patients SET ${updates.join(', ')} WHERE id = ?`, params);
     await writeAuditLog({
       user: req.user,
-      action: 'patient.update',
+      action: requestedIdentityChanges.length > 0 ? 'patient.identity.update' : 'patient.update',
       entityType: 'patient',
       entityId: id,
       patientId: id,
+      reason: String(req.body.identity_change_reason || req.body.payer_change_reason || req.body.reason || '') || null,
       before: beforeDiff,
       after: afterDiff,
       req,
@@ -1060,7 +1655,7 @@ router.patch('/patients/:id', requireAuth, requirePermission('patient.update'), 
   }
 
   const updated = await queryOne<Record<string, unknown>>('SELECT * FROM patients WHERE id = ?', [id]);
-  res.json({ patient: updated ? maskPatientRecord(updated, req.user!) : null });
+  res.json({ patient: updated ? maskPatientRecord(updated, req.user!) : null, pendingExemptApprovalId });
 });
 
 // Queue Management
@@ -1095,6 +1690,9 @@ router.get('/queue', requireAuth, requirePermission('queue.manage', 'visit.read'
 router.post('/queue', requireAuth, requirePermission('queue.manage'), async (req: AuthRequest, res: Response) => {
   const { patient_id, department = 'OPD', priority = 'routine', notes } = req.body || {};
   if (!patient_id) return res.status(400).json({ error: 'patient_id is required' });
+  if (priority === 'emergency' && !hasPermission(req.user!, 'triage.emergency.set')) {
+    return res.status(403).json({ error: 'Setting emergency queue priority requires triage.emergency.set permission.' });
+  }
   const ticketNumber = await nextSequence('TICKET');
   const inserted = await execute(
     'INSERT INTO queue_tickets (ticket_number, department, patient_id, priority, status, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -1113,24 +1711,46 @@ router.post('/queue', requireAuth, requirePermission('queue.manage'), async (req
   res.status(201).json({ id: inserted.insertId, ticketNumber });
 });
 
+router.post('/queue/:dept/call-next', requireAuth, requirePermission('queue.manage'), async (req: AuthRequest, res: Response) => {
+  const dept = String(req.params.dept || 'OPD').trim().toUpperCase();
+  const nextTicket = await queryOne<Record<string, unknown>>(
+    `SELECT * FROM queue_tickets
+     WHERE department = ? AND status = 'waiting'
+     ORDER BY CASE priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, id ASC
+     LIMIT 1`,
+    [dept]
+  );
+  if (!nextTicket) return res.status(404).json({ error: `No waiting tickets in ${dept} queue.` });
+
+  await execute("UPDATE queue_tickets SET status = 'called', called_at = ? WHERE id = ?", [nowSql(), nextTicket.id]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'queue.ticket.call_next',
+    entityType: 'queue_ticket',
+    entityId: Number(nextTicket.id),
+    patientId: Number(nextTicket.patient_id),
+    after: { department: dept, ticketNumber: nextTicket.ticket_number },
+    req,
+  });
+  broadcastClinicEvent('queue:updated', { department: dept, ticketId: nextTicket.id, status: 'called' });
+  res.json({ ticket: { ...nextTicket, status: 'called' } });
+});
+
 router.patch('/queue/:id/status', requireAuth, requirePermission('queue.manage'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const { status, priority } = req.body || {};
   const ticket = await queryOne<Record<string, unknown>>('SELECT * FROM queue_tickets WHERE id = ?', [id]);
   if (!ticket) return res.status(404).json({ error: 'Queue ticket not found' });
 
+  if (priority === 'emergency' && ticket.priority !== 'emergency' && !hasPermission(req.user!, 'triage.emergency.set')) {
+    return res.status(403).json({ error: 'Escalating queue ticket to emergency requires triage.emergency.set permission.' });
+  }
+
   if (status) {
-    await execute("UPDATE queue_tickets SET status = ?, called_at = CASE WHEN ? = 'called' THEN datetime('now') ELSE called_at END WHERE id = ?", [
-      status,
-      status,
-      id,
-    ]).catch(async () => {
-      await execute('UPDATE queue_tickets SET status = ?, called_at = IF(? = "called", NOW(), called_at) WHERE id = ?', [
-        status,
-        status,
-        id,
-      ]);
-    });
+    await execute(
+      "UPDATE queue_tickets SET status = ?, called_at = CASE WHEN ? = 'called' THEN ? ELSE called_at END WHERE id = ?",
+      [status, status, nowSql(), id]
+    );
   }
   if (priority) {
     await execute('UPDATE queue_tickets SET priority = ? WHERE id = ?', [priority, id]);
@@ -1368,6 +1988,14 @@ router.patch('/appointments/:id', requireAuth, requirePermission('appointment.up
             'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, ?, ?)',
             [invRes.insertId, svc?.code || svcCode, svc?.name || `${specialty} Consultation`, 'consultation', fee, fee]
           );
+          await postInvoiceAccrualJE({
+            invoiceId: invRes.insertId,
+            invoiceNumber: invNum,
+            payerType: patient.patient_type,
+            totalAmount: fee,
+            postedBy: req.user!.id,
+            description: `Checked-in appointment ${invNum} (${specialty})`,
+          });
           consultInvId = invRes.insertId;
         }
 
@@ -1446,15 +2074,38 @@ router.patch('/appointments/:id', requireAuth, requirePermission('appointment.up
 // ---------------------------------------------------------------------------
 router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'), async (req: AuthRequest, res: Response) => {
   const stageFilter = req.query.stage ? String(req.query.stage).trim() : '';
+  const statusFilter = req.query.status ? String(req.query.status).trim() : '';
+  const doctorIdFilter = req.query.doctor_id ? Number(req.query.doctor_id) : null;
+  const dateFilter = req.query.date ? String(req.query.date).trim() : '';
+  const limit = Math.min(200, Math.max(10, Number(req.query.limit || 60)));
+  const page = Math.max(1, Number(req.query.page || 1));
+  const offset = (page - 1) * limit;
+
   const stages = stageFilter ? stageFilter.split(',').map((s) => s.trim()).filter(Boolean) : [];
-  let whereSql = '';
+  const clauses: string[] = [];
   const params: unknown[] = [];
+
   if (stages.length > 0) {
     const ph = stages.map(() => '?').join(',');
-    whereSql = ` WHERE v.workflow_stage IN (${ph})`;
+    clauses.push(`v.workflow_stage IN (${ph})`);
     params.push(...stages);
   }
+  if (statusFilter === 'open') {
+    clauses.push("v.status != 'closed'");
+  } else if (statusFilter === 'closed') {
+    clauses.push("v.status = 'closed'");
+  }
+  if (doctorIdFilter) {
+    clauses.push('v.doctor_id = ?');
+    params.push(doctorIdFilter);
+  }
+  if (dateFilter) {
+    clauses.push('substr(v.created_at, 1, 10) = ?');
+    params.push(dateFilter);
+  }
+  const whereSql = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
 
+  const countRow = await queryOne<{ cnt: number }>(`SELECT COUNT(*) AS cnt FROM visits v${whereSql}`, params);
   const rows = await query<Record<string, unknown>>(
     `SELECT v.*, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.allergies, p.blood_group, p.patient_type,
             u.full_name AS doctor_name,
@@ -1470,11 +2121,21 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
      INNER JOIN patients p ON p.id = v.patient_id
      LEFT JOIN users u ON u.id = v.doctor_id
      LEFT JOIN invoices ci ON ci.id = v.consultation_invoice_id${whereSql}
-     ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, v.id DESC LIMIT 60`,
-    params
+     ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, v.id DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
   );
 
   const canSeeClinical = hasPermission(req.user!, 'patient.clinical.read');
+  const isDoctorOnly = req.user!.roles.includes('DOC') && !req.user!.roles.includes('MGR') && !req.user!.roles.includes('ADM');
+  let activeBreakGlassPatients = new Set<number>();
+  if (isDoctorOnly && rows.length > 0) {
+    const bgRows = await query<{ patient_id: number }>(
+      'SELECT DISTINCT patient_id FROM break_glass_logs WHERE user_id = ? AND expires_at > ?',
+      [req.user!.id, nowSql()]
+    ).catch(() => []);
+    activeBreakGlassPatients = new Set(bgRows.map((b) => Number(b.patient_id)));
+  }
+
   const visits = rows.map((v) => {
     const cleared =
       v.patient_type !== 'self-pay' ||
@@ -1485,7 +2146,15 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
     const completedDiag = Number(v.verified_lab_count || 0) + Number(v.final_imaging_count || 0);
     const resultsReady =
       v.workflow_stage === 'results_ready' || (completedDiag > 0 && pendingDiag === 0 && v.status !== 'closed');
-    if (!canSeeClinical) {
+
+    const docAuthorized =
+      !isDoctorOnly ||
+      Number(v.doctor_id) === req.user!.id ||
+      Number(v.created_by) === req.user!.id ||
+      (v.doctor_id == null && v.status !== 'closed') ||
+      activeBreakGlassPatients.has(Number(v.patient_id));
+
+    if (!canSeeClinical || !docAuthorized) {
       return {
         ...v,
         allergies: 'Restricted',
@@ -1497,6 +2166,7 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
         treatment_plan: null,
         consultation_cleared: cleared,
         results_ready: resultsReady,
+        clinical_locked: canSeeClinical && !docAuthorized,
       };
     }
     return {
@@ -1505,12 +2175,17 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
       results_ready: resultsReady,
     };
   });
-  res.json({ visits, clinicalMasked: !canSeeClinical });
+  res.json({
+    visits,
+    clinicalMasked: !canSeeClinical,
+    total: Number(countRow?.cnt || 0),
+    page,
+    limit,
+  });
 });
 
 router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.read'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const canSeeClinical = hasPermission(req.user!, 'patient.clinical.read');
   const visitRow = await queryOne<Record<string, unknown>>(
     `SELECT v.*, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.allergies, p.blood_group, p.patient_type,
             u.full_name AS doctor_name,
@@ -1524,6 +2199,16 @@ router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.r
     [id]
   );
   if (!visitRow) return res.status(404).json({ error: 'Visit not found' });
+
+  const access = await assertPatientAccess(req.user!, Number(visitRow.patient_id));
+  if (!access.allowed) {
+    return res.status(403).json({
+      error: access.reason || 'Break-Glass authorization required to view unassigned clinical visit.',
+      breakGlassRequired: true,
+      patientId: Number(visitRow.patient_id),
+    });
+  }
+  const canSeeClinical = access.clinicalAuthorized;
 
   const [vitals, labOrders, imagingOrders, prescriptions, nursingProcedures] = await Promise.all([
     canSeeClinical ? query('SELECT * FROM vitals WHERE visit_id = ? ORDER BY id DESC', [id]) : Promise.resolve([]),
@@ -1619,6 +2304,7 @@ router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.r
   res.json({
     visit,
     clinicalMasked: !canSeeClinical,
+    breakGlassActive: access.breakGlassActive,
     vitals,
     labOrders: canSeeClinical ? labOrders : labOrders.map((l) => ({ ...l, result_value: null, panel_results_json: null })),
     imagingOrders: canSeeClinical ? imagingOrders : imagingOrders.map((im) => ({ ...im, findings: null, impression: null })),
@@ -1644,13 +2330,16 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
     payment_reference,
   } = req.body || {};
   if (!patient_id) return res.status(400).json({ error: 'patient_id is required' });
+  if (triage_priority === 'emergency' && !hasPermission(req.user!, 'triage.emergency.set')) {
+    return res.status(403).json({ error: 'Assigning emergency priority requires triage.emergency.set permission.' });
+  }
 
   const result = await withTransaction(async () => {
     const patient = await queryOne<{ id: number; patient_type: string; payer_name: string | null }>(
-      'SELECT id, patient_type, payer_name FROM patients WHERE id = ?',
-      [Number(patient_id)]
+      'SELECT id, patient_type, payer_name FROM patients WHERE id = ? AND status = ?',
+      [Number(patient_id), 'active']
     );
-    if (!patient) return { ok: false as const, error: 'Patient not found', httpStatus: 404 };
+    if (!patient) return { ok: false as const, error: 'Active patient record not found', httpStatus: 404 };
 
     let resolvedSpecialty = specialty ? String(specialty).trim() : 'General Medicine';
     let doctorName: string | null = null;
@@ -1706,6 +2395,14 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
         [invRes.insertId, svc?.code || svcCode, svc?.name || `${resolvedSpecialty} Consultation`, 'consultation', fee, fee]
       );
       consultInvId = invRes.insertId;
+      await postInvoiceAccrualJE({
+        invoiceId: consultInvId,
+        invoiceNumber: consultInvNum,
+        payerType: patient.patient_type,
+        totalAmount: fee,
+        postedBy: req.user!.id,
+        description: `Consultation invoice ${consultInvNum} (${resolvedSpecialty})`,
+      });
     }
 
     let receiptNumber: string | null = null;
@@ -1714,6 +2411,11 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
       if (!hasPermission(req.user!, 'billing.payment.create')) {
         return { ok: false as const, error: 'Only Cashiers with payment permission can collect upfront consultation fees.', httpStatus: 403 };
       }
+      const allowedMethods = new Set(['cash', 'card', 'mobile_money', 'bank_transfer']);
+      const method = String(payment_method || 'cash').trim().toLowerCase();
+      if (!allowedMethods.has(method)) {
+        return { ok: false as const, error: 'Invalid payment method.', httpStatus: 400 };
+      }
       const openShift = await queryOne<{ id: number }>(
         "SELECT id FROM cashier_shifts WHERE cashier_id = ? AND status = 'open'",
         [req.user!.id]
@@ -1721,7 +2423,6 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
       if (!openShift) {
         return { ok: false as const, error: 'You must open a Cashier Shift before collecting payments.', httpStatus: 409 };
       }
-      const method = String(payment_method || 'cash').trim().toLowerCase();
       const payRes = await execute(
         `INSERT INTO payments (invoice_id, patient_id, shift_id, amount, payment_method, reference_number, status, created_by)
          VALUES (?, ?, ?, ?, ?, ?, 'completed', ?)`,
@@ -1745,7 +2446,7 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
         postedBy: req.user!.id,
         lines: [
           { accountCode: cashOrBankAcct, debit: consultationFee, memo: `${method} receipt ${receiptNumber}` },
-          { accountCode: '4010', credit: consultationFee, memo: consultInvNum || 'Consultation' },
+          { accountCode: '1150', credit: consultationFee, memo: `Clear AR ${consultInvNum}` },
         ],
       });
       await writeAuditLog({
@@ -1797,6 +2498,18 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
 
     if (consultInvId) {
       await execute('UPDATE invoices SET visit_id = ? WHERE id = ?', [inserted.insertId, consultInvId]);
+    }
+
+    if (triage_priority === 'emergency' && isSelfPay && consultInvId && !paidAtCheckIn) {
+      await recordPaymentGateBypass({
+        visitId: inserted.insertId,
+        patientId: patient.id,
+        entityType: 'visit_consultation',
+        entityId: inserted.insertId,
+        user: req.user!,
+        reason: 'Emergency triage visit automatic consultation gate override',
+        req,
+      });
     }
 
     const ticketNum = await nextSequence('TICKET');
@@ -1941,6 +2654,29 @@ router.post('/visits/:id/vitals', requireAuth, requirePermission('vitals.create'
     bypass_reason,
   } = req.body || {};
 
+  if (triage_priority === 'emergency' && visit.triage_priority !== 'emergency' && !hasPermission(req.user!, 'triage.emergency.set')) {
+    return res.status(403).json({ error: 'Elevating visit priority to emergency requires triage.emergency.set permission.' });
+  }
+
+  const rangeError = validateVitalsRanges({
+    bp_systolic,
+    bp_diastolic,
+    temperature,
+    pulse,
+    respiratory_rate,
+    spo2,
+    weight_kg,
+    height_cm,
+    blood_glucose,
+  });
+  if (rangeError) return res.status(400).json({ error: rangeError });
+
+  const hasCoreVital =
+    bp_systolic != null || temperature != null || pulse != null || respiratory_rate != null || spo2 != null;
+  if (!hasCoreVital) {
+    return res.status(400).json({ error: 'At least one core clinical vital (BP, Temp, Pulse, RR, or SpO2) is required.' });
+  }
+
   const consultCleared =
     visit.patient_type !== 'self-pay' ||
     !visit.consultation_invoice_id ||
@@ -1955,12 +2691,12 @@ router.post('/visits/:id/vitals', requireAuth, requirePermission('vitals.create'
       bypass_reason
     );
     if (bypassCheck.allowed) {
-      await writeAuditLog({
-        user: req.user,
-        action: 'payment.gate.bypass',
-        entityType: 'visit',
-        entityId: visitId,
+      await recordPaymentGateBypass({
+        visitId,
         patientId: visit.patient_id,
+        entityType: 'visit_consultation',
+        entityId: visitId,
+        user: req.user!,
         reason: bypassCheck.reasonText,
         req,
       });
@@ -2078,14 +2814,137 @@ router.post('/visits/:id/vitals', requireAuth, requirePermission('vitals.create'
   res.status(201).json({ id: inserted.insertId, bmi, earlyWarningFlag: Boolean(earlyWarning), workflowStage: 'ready_for_doctor' });
 });
 
+router.post('/vitals/:id/correct', requireAuth, requirePermission('vitals.create'), async (req: AuthRequest, res: Response) => {
+  const vitalId = Number(req.params.id);
+  const existing = await queryOne<{
+    id: number;
+    visit_id: number | null;
+    admission_id: number | null;
+    patient_id: number;
+    bp_systolic: number | null;
+    bp_diastolic: number | null;
+    temperature: number | null;
+    pulse: number | null;
+    respiratory_rate: number | null;
+    spo2: number | null;
+    weight_kg: number | null;
+    height_cm: number | null;
+    blood_glucose: number | null;
+    recorded_at: string;
+  }>('SELECT * FROM vitals WHERE id = ?', [vitalId]);
+  if (!existing) return res.status(404).json({ error: 'Vitals entry not found' });
+
+  const recordedMs = new Date(`${String(existing.recorded_at).replace(' ', 'T')}Z`).getTime();
+  if (Number.isFinite(recordedMs) && Date.now() - recordedMs > 24 * 3600 * 1000) {
+    return res.status(409).json({ error: 'Vitals correction window (24 hours) has expired. Record a new observation row instead.' });
+  }
+
+  const {
+    bp_systolic = existing.bp_systolic,
+    bp_diastolic = existing.bp_diastolic,
+    temperature = existing.temperature,
+    pulse = existing.pulse,
+    respiratory_rate = existing.respiratory_rate,
+    spo2 = existing.spo2,
+    weight_kg = existing.weight_kg,
+    height_cm = existing.height_cm,
+    blood_glucose = existing.blood_glucose,
+    notes,
+    correction_reason,
+  } = req.body || {};
+  if (!correction_reason || String(correction_reason).trim().length < 5) {
+    return res.status(400).json({ error: 'Correction reason (min 5 characters) is required for vitals amendment.' });
+  }
+
+  const rangeError = validateVitalsRanges({
+    bp_systolic,
+    bp_diastolic,
+    temperature,
+    pulse,
+    respiratory_rate,
+    spo2,
+    weight_kg,
+    height_cm,
+    blood_glucose,
+  });
+  if (rangeError) return res.status(400).json({ error: rangeError });
+
+  const w = weight_kg ? Number(weight_kg) : null;
+  const h = height_cm ? Number(height_cm) : null;
+  const bmi = w && h && h > 0 ? Number((w / ((h / 100) * (h / 100))).toFixed(1)) : null;
+  const earlyWarning =
+    (spo2 && Number(spo2) < 92) ||
+    (temperature && Number(temperature) >= 38.5) ||
+    (bp_systolic && (Number(bp_systolic) >= 160 || Number(bp_systolic) < 90)) ||
+    (pulse && (Number(pulse) > 110 || Number(pulse) < 50))
+      ? 1
+      : 0;
+
+  const inserted = await execute(
+    `INSERT INTO vitals (visit_id, admission_id, patient_id, bp_systolic, bp_diastolic, temperature, pulse, respiratory_rate, spo2, weight_kg, height_cm, bmi, blood_glucose, early_warning_flag, notes, corrected_of_id, correction_reason, recorded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      existing.visit_id,
+      existing.admission_id,
+      existing.patient_id,
+      bp_systolic ?? null,
+      bp_diastolic ?? null,
+      temperature ?? null,
+      pulse ?? null,
+      respiratory_rate ?? null,
+      spo2 ?? null,
+      w,
+      h,
+      bmi,
+      blood_glucose ?? null,
+      earlyWarning,
+      notes ?? null,
+      vitalId,
+      String(correction_reason).trim(),
+      req.user!.id,
+    ]
+  );
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'vitals.correct',
+    entityType: 'vitals',
+    entityId: inserted.insertId,
+    patientId: existing.patient_id,
+    before: existing,
+    after: { correctedOfId: vitalId, bp_systolic, bp_diastolic, temperature, pulse, respiratory_rate, spo2, bmi },
+    reason: String(correction_reason).trim(),
+    req,
+  });
+
+  if (existing.visit_id) broadcastClinicEvent('vitals:recorded', { visitId: existing.visit_id });
+  res.status(201).json({ id: inserted.insertId, correctedOfId: vitalId, bmi, earlyWarningFlag: Boolean(earlyWarning) });
+});
+
 router.patch('/visits/:id/consultation', requireAuth, requirePermission('visit.update'), async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
-  const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [
-    visitId,
-  ]);
+  const licenceCheck = await checkActiveClinicianLicence(req.user!.id);
+  if (!licenceCheck.valid) {
+    return res.status(403).json({ error: licenceCheck.error });
+  }
+
+  const visit = await queryOne<{ id: number; patient_id: number; doctor_id: number | null; status: string }>(
+    'SELECT id, patient_id, doctor_id, status FROM visits WHERE id = ?',
+    [visitId]
+  );
   if (!visit) return res.status(404).json({ error: 'Visit not found' });
   if (visit.status === 'closed') {
     return res.status(409).json({ error: 'Visit is closed and locked. Manager approval is required to reopen.' });
+  }
+  if (
+    visit.doctor_id != null &&
+    Number(visit.doctor_id) !== req.user!.id &&
+    !hasPermission(req.user!, 'visit.reopen') &&
+    !req.user!.roles.includes('MGR')
+  ) {
+    return res.status(403).json({
+      error: 'This visit is assigned to another clinician. Reassignment or Manager override is required.',
+    });
   }
 
   const { chief_complaint, history_notes, exam_notes, diagnosis_code, diagnosis_text, treatment_plan, follow_up_date } = req.body || {};
@@ -2116,53 +2975,56 @@ router.patch('/visits/:id/consultation', requireAuth, requirePermission('visit.u
     ]
   );
 
+  let followUpAppointmentId: number | null = null;
+  if (follow_up_date && /^\d{4}-\d{2}-\d{2}$/.test(String(follow_up_date))) {
+    const assignedDoc = visit.doctor_id || req.user!.id;
+    const existingFu = await queryOne<{ id: number }>(
+      "SELECT id FROM appointments WHERE patient_id = ? AND appointment_date = ? AND status != 'cancelled' LIMIT 1",
+      [visit.patient_id, String(follow_up_date)]
+    );
+    if (!existingFu) {
+      const conflict = await queryOne<{ id: number }>(
+        "SELECT id FROM appointments WHERE doctor_id = ? AND appointment_date = ? AND status NOT IN ('cancelled','no_show') AND start_time = '09:00' LIMIT 1",
+        [assignedDoc, String(follow_up_date)]
+      );
+      const startTime = conflict ? '14:00' : '09:00';
+      const endTime = conflict ? '14:30' : '09:30';
+      const fuRes = await execute(
+        `INSERT INTO appointments (patient_id, doctor_id, appointment_date, start_time, end_time, visit_type, reason, status, created_by)
+         VALUES (?, ?, ?, ?, ?, 'follow-up', ?, 'scheduled', ?)`,
+        [visit.patient_id, assignedDoc, String(follow_up_date), startTime, endTime, `Follow-up for ${diagnosis_text || 'consultation'}`, req.user!.id]
+      );
+      followUpAppointmentId = fuRes.insertId;
+    }
+  }
+
   await writeAuditLog({
     user: req.user,
     action: 'visit.update',
     entityType: 'visit',
     entityId: visitId,
     patientId: visit.patient_id,
-    after: { diagnosis_code, diagnosis_text },
+    after: { diagnosis_code, diagnosis_text, follow_up_date, followUpAppointmentId },
     req,
   });
 
   broadcastClinicEvent('visit:updated', { visitId });
-  res.json({ ok: true });
+  res.json({ ok: true, followUpAppointmentId });
 });
 
 router.post('/visits/:id/close', requireAuth, requirePermission('visit.close'), async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
-  const visit = await queryOne<{ id: number; patient_id: number; appointment_id: number | null; diagnosis_text: string | null; status: string }>(
-    'SELECT id, patient_id, appointment_id, diagnosis_text, status FROM visits WHERE id = ?',
-    [visitId]
-  );
-  if (!visit) return res.status(404).json({ error: 'Visit not found' });
-  if (!visit.diagnosis_text?.trim()) {
-    return res.status(400).json({ error: 'Diagnosis is required before closing a visit.' });
-  }
-
-  await execute("UPDATE visits SET status = 'closed', workflow_stage = 'completed', closed_at = datetime('now'), closed_by = ? WHERE id = ?", [
-    req.user!.id,
+  const { force_partial_close, reason } = req.body || {};
+  const result = await closeVisit({
     visitId,
-  ]).catch(async () => {
-    await execute("UPDATE visits SET status = 'closed', workflow_stage = 'completed', closed_at = NOW(), closed_by = ? WHERE id = ?", [req.user!.id, visitId]);
-  });
-
-  await execute("UPDATE queue_tickets SET status = 'completed' WHERE visit_id = ?", [visitId]);
-  if (visit.appointment_id) {
-    await execute("UPDATE appointments SET status = 'completed' WHERE id = ? AND status != 'cancelled'", [visit.appointment_id]);
-  }
-
-  await writeAuditLog({
-    user: req.user,
-    action: 'visit.close',
-    entityType: 'visit',
-    entityId: visitId,
-    patientId: visit.patient_id,
+    user: req.user!,
     req,
+    forcePartialClose: Boolean(force_partial_close),
+    forceReason: reason ? String(reason).trim() : undefined,
   });
-  broadcastClinicEvent('visit:updated', { visitId });
-  broadcastClinicEvent('queue:updated', { visitId });
+  if (!result.ok) {
+    return res.status(result.httpStatus).json({ error: result.error });
+  }
   res.json({ ok: true });
 });
 
@@ -2193,75 +3055,88 @@ router.post('/visits/:id/orders/lab', requireAuth, requirePermission('order.lab.
   const { test_id } = req.body || {};
   if (!test_id) return res.status(400).json({ error: 'test_id is required' });
 
-  const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
-  if (!visit) return res.status(404).json({ error: 'Visit not found' });
-  if (visit.status === 'closed') return res.status(409).json({ error: 'Cannot order tests on a closed visit.' });
+  const result = await withTransaction(async () => {
+    const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
+    if (!visit) return { ok: false as const, error: 'Visit not found', httpStatus: 404 };
+    if (visit.status === 'closed') return { ok: false as const, error: 'Cannot order tests on a closed visit.', httpStatus: 409 };
 
-  const test = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM lab_tests WHERE id = ?', [test_id]);
-  if (!test) return res.status(404).json({ error: 'Lab test not found' });
+    const test = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM lab_tests WHERE id = ?', [test_id]);
+    if (!test) return { ok: false as const, error: 'Lab test not found', httpStatus: 404 };
 
-  const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
-    'SELECT patient_type, payer_name FROM patients WHERE id = ?',
-    [visit.patient_id]
-  );
+    const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
+      'SELECT patient_type, payer_name FROM patients WHERE id = ?',
+      [visit.patient_id]
+    );
 
-  const invNum = await nextSequence('INV');
-  const invStatus = patient?.patient_type === 'insurance' || patient?.patient_type === 'credit'
-    ? 'credit_billed'
-    : patient?.patient_type === 'exempt'
-      ? 'paid'
-      : 'unpaid';
-  const total = patient?.patient_type === 'exempt' ? 0 : Number(test.price);
-  const invRes = await execute(
-    `INSERT INTO invoices (invoice_number, patient_id, visit_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
-    [invNum, visit.patient_id, visitId, patient?.patient_type || 'self-pay', patient?.payer_name || null, total, total, invStatus === 'paid' ? total : 0, invStatus, `Laboratory: ${test.name}`, req.user!.id]
-  );
-  await execute(
-    'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, ?, ?)',
-    [invRes.insertId, test.code, test.name, 'lab', total, total]
-  );
-
-  const orderRes = await execute(
-    'INSERT INTO lab_orders (visit_id, patient_id, test_id, invoice_id, ordered_by, status) VALUES (?, ?, ?, ?, ?, ?)',
-    [visitId, visit.patient_id, test.id, invRes.insertId, req.user!.id, 'ordered']
-  );
-
-  await execute("UPDATE visits SET status = 'awaiting_results', workflow_stage = 'awaiting_diagnostics' WHERE id = ?", [visitId]);
-
-  if (invStatus === 'unpaid') {
-    await createNotification({
-      targetRole: 'CSH',
-      title: 'Diagnostic Payment Due (Lab)',
-      message: `${test.name} ordered (${invNum}) — collect payment to unlock Lab.`,
-      severity: 'info',
-      entityType: 'invoice',
-      entityId: invRes.insertId,
+    const invNum = await nextSequence('INV');
+    const invStatus = patient?.patient_type === 'insurance' || patient?.patient_type === 'credit'
+      ? 'credit_billed'
+      : patient?.patient_type === 'exempt'
+        ? 'paid'
+        : 'unpaid';
+    const total = patient?.patient_type === 'exempt' ? 0 : Number(test.price);
+    const invRes = await execute(
+      `INSERT INTO invoices (invoice_number, patient_id, visit_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      [invNum, visit.patient_id, visitId, patient?.patient_type || 'self-pay', patient?.payer_name || null, total, total, invStatus === 'paid' ? total : 0, invStatus, `Laboratory: ${test.name}`, req.user!.id]
+    );
+    await execute(
+      'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, ?, ?)',
+      [invRes.insertId, test.code, test.name, 'lab', total, total]
+    );
+    await postInvoiceAccrualJE({
+      invoiceId: invRes.insertId,
+      invoiceNumber: invNum,
+      payerType: patient?.patient_type || 'self-pay',
+      totalAmount: total,
+      postedBy: req.user!.id,
+      description: `Lab order accrual ${invNum} (${test.name})`,
     });
-  } else {
-    await createNotification({
-      targetRole: 'LAB',
-      title: 'New Cleared Lab Order',
-      message: `${test.name} ordered (${invNum}) — ready for sample collection.`,
-      severity: 'info',
+
+    const orderRes = await execute(
+      'INSERT INTO lab_orders (visit_id, patient_id, test_id, invoice_id, ordered_by, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [visitId, visit.patient_id, test.id, invRes.insertId, req.user!.id, 'ordered']
+    );
+
+    await execute("UPDATE visits SET status = 'awaiting_results', workflow_stage = 'awaiting_diagnostics' WHERE id = ?", [visitId]);
+
+    if (invStatus === 'unpaid') {
+      await createNotification({
+        targetRole: 'CSH',
+        title: 'Diagnostic Payment Due (Lab)',
+        message: `${test.name} ordered (${invNum}) — collect payment to unlock Lab.`,
+        severity: 'info',
+        entityType: 'invoice',
+        entityId: invRes.insertId,
+      });
+    } else {
+      await createNotification({
+        targetRole: 'LAB',
+        title: 'New Cleared Lab Order',
+        message: `${test.name} ordered (${invNum}) — ready for sample collection.`,
+        severity: 'info',
+        entityType: 'lab_order',
+        entityId: orderRes.insertId,
+      });
+    }
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'order.lab.create',
       entityType: 'lab_order',
       entityId: orderRes.insertId,
+      patientId: visit.patient_id,
+      after: { test_code: test.code, invoice_number: invNum },
+      req,
     });
-  }
 
-  await writeAuditLog({
-    user: req.user,
-    action: 'order.lab.create',
-    entityType: 'lab_order',
-    entityId: orderRes.insertId,
-    patientId: visit.patient_id,
-    after: { test_code: test.code, invoice_number: invNum },
-    req,
+    return { ok: true as const, id: orderRes.insertId, invoiceNumber: invNum, invoiceStatus: invStatus };
   });
 
-  broadcastClinicEvent('lab:updated', { visitId, orderId: orderRes.insertId });
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('lab:updated', { visitId, orderId: result.id });
   broadcastClinicEvent('visit:updated', { visitId });
-  res.status(201).json({ id: orderRes.insertId, invoiceNumber: invNum, invoiceStatus: invStatus });
+  res.status(201).json(result);
 });
 
 router.post('/visits/:id/orders/imaging', requireAuth, requirePermission('order.imaging.create'), async (req: AuthRequest, res: Response) => {
@@ -2269,69 +3144,87 @@ router.post('/visits/:id/orders/imaging', requireAuth, requirePermission('order.
   const { catalog_id, clinical_question } = req.body || {};
   if (!catalog_id) return res.status(400).json({ error: 'catalog_id is required' });
 
-  const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
-  if (!visit) return res.status(404).json({ error: 'Visit not found' });
-  if (visit.status === 'closed') return res.status(409).json({ error: 'Cannot order imaging on a closed visit.' });
+  const result = await withTransaction(async () => {
+    const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
+    if (!visit) return { ok: false as const, error: 'Visit not found', httpStatus: 404 };
+    if (visit.status === 'closed') return { ok: false as const, error: 'Cannot order imaging on a closed visit.', httpStatus: 409 };
 
-  const exam = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM imaging_catalog WHERE id = ?', [catalog_id]);
-  if (!exam) return res.status(404).json({ error: 'Imaging exam not found' });
+    const exam = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM imaging_catalog WHERE id = ?', [catalog_id]);
+    if (!exam) return { ok: false as const, error: 'Imaging exam not found', httpStatus: 404 };
 
-  const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
-    'SELECT patient_type, payer_name FROM patients WHERE id = ?',
-    [visit.patient_id]
-  );
+    const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
+      'SELECT patient_type, payer_name FROM patients WHERE id = ?',
+      [visit.patient_id]
+    );
 
-  const invNum = await nextSequence('INV');
-  const invStatus = patient?.patient_type === 'insurance' || patient?.patient_type === 'credit'
-    ? 'credit_billed'
-    : patient?.patient_type === 'exempt'
-      ? 'paid'
-      : 'unpaid';
-  const total = patient?.patient_type === 'exempt' ? 0 : Number(exam.price);
-  const invRes = await execute(
-    `INSERT INTO invoices (invoice_number, patient_id, visit_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
-    [invNum, visit.patient_id, visitId, patient?.patient_type || 'self-pay', patient?.payer_name || null, total, total, invStatus === 'paid' ? total : 0, invStatus, `Imaging: ${exam.name}`, req.user!.id]
-  );
-  await execute(
-    'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, ?, ?)',
-    [invRes.insertId, exam.code, exam.name, 'imaging', total, total]
-  );
+    const invNum = await nextSequence('INV');
+    const invStatus = patient?.patient_type === 'insurance' || patient?.patient_type === 'credit'
+      ? 'credit_billed'
+      : patient?.patient_type === 'exempt'
+        ? 'paid'
+        : 'unpaid';
+    const total = patient?.patient_type === 'exempt' ? 0 : Number(exam.price);
+    const invRes = await execute(
+      `INSERT INTO invoices (invoice_number, patient_id, visit_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      [invNum, visit.patient_id, visitId, patient?.patient_type || 'self-pay', patient?.payer_name || null, total, total, invStatus === 'paid' ? total : 0, invStatus, `Imaging: ${exam.name}`, req.user!.id]
+    );
+    await execute(
+      'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, 1, ?, ?)',
+      [invRes.insertId, exam.code, exam.name, 'imaging', total, total]
+    );
+    await postInvoiceAccrualJE({
+      invoiceId: invRes.insertId,
+      invoiceNumber: invNum,
+      payerType: patient?.patient_type || 'self-pay',
+      totalAmount: total,
+      postedBy: req.user!.id,
+      description: `Imaging order accrual ${invNum} (${exam.name})`,
+    });
 
-  const ordRes = await execute(
-    'INSERT INTO imaging_orders (visit_id, patient_id, catalog_id, invoice_id, ordered_by, clinical_question, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [visitId, visit.patient_id, exam.id, invRes.insertId, req.user!.id, clinical_question || null, 'ordered']
-  );
+    const ordRes = await execute(
+      'INSERT INTO imaging_orders (visit_id, patient_id, catalog_id, invoice_id, ordered_by, clinical_question, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [visitId, visit.patient_id, exam.id, invRes.insertId, req.user!.id, clinical_question || null, 'ordered']
+    );
 
-  await execute("UPDATE visits SET status = 'awaiting_results', workflow_stage = 'awaiting_diagnostics' WHERE id = ?", [visitId]);
+    await execute("UPDATE visits SET status = 'awaiting_results', workflow_stage = 'awaiting_diagnostics' WHERE id = ?", [visitId]);
 
-  await createNotification({
-    targetRole: invStatus === 'unpaid' ? 'CSH' : 'IMG',
-    title: invStatus === 'unpaid' ? 'Diagnostic Payment Due (Imaging)' : 'New Imaging Order',
-    message: `${exam.name} ordered (${invNum}).`,
-    severity: 'info',
-    entityType: 'imaging_order',
-    entityId: ordRes.insertId,
+    await createNotification({
+      targetRole: invStatus === 'unpaid' ? 'CSH' : 'IMG',
+      title: invStatus === 'unpaid' ? 'Diagnostic Payment Due (Imaging)' : 'New Imaging Order',
+      message: `${exam.name} ordered (${invNum}).`,
+      severity: 'info',
+      entityType: 'imaging_order',
+      entityId: ordRes.insertId,
+    });
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'imaging.order.create',
+      entityType: 'imaging_order',
+      entityId: ordRes.insertId,
+      patientId: visit.patient_id,
+      after: { exam_code: exam.code, invoice_number: invNum },
+      req,
+    });
+
+    return { ok: true as const, id: ordRes.insertId, invoiceNumber: invNum, invoiceStatus: invStatus };
   });
 
-  await writeAuditLog({
-    user: req.user,
-    action: 'imaging.order.create',
-    entityType: 'imaging_order',
-    entityId: ordRes.insertId,
-    patientId: visit.patient_id,
-    after: { exam_code: exam.code, invoice_number: invNum },
-    req,
-  });
-
-  broadcastClinicEvent('imaging:updated', { visitId, orderId: ordRes.insertId });
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('imaging:updated', { visitId, orderId: result.id });
   broadcastClinicEvent('visit:updated', { visitId });
-  res.status(201).json({ id: ordRes.insertId, invoiceNumber: invNum, invoiceStatus: invStatus });
+  res.status(201).json(result);
 });
 
 router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('prescription.create'), async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
-  const { items: rawItems, medicine_id, dosage, frequency, duration_days = 5, quantity = 1, instructions, notes } = req.body || {};
+  const licenceCheck = await checkActiveClinicianLicence(req.user!.id);
+  if (!licenceCheck.valid) {
+    return res.status(403).json({ error: licenceCheck.error });
+  }
+
+  const { items: rawItems, medicine_id, dosage, frequency, duration_days = 5, quantity = 1, instructions, notes, overrideAllergyReason, allergy_override_reason } = req.body || {};
 
   const normalizedItems = Array.isArray(rawItems) && rawItems.length > 0
     ? rawItems
@@ -2344,7 +3237,7 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
   }
 
   for (const it of normalizedItems) {
-    if (!it.medicine_id || !it.dosage || !it.frequency || !Number(it.quantity)) {
+    if (!it.medicine_id || !it.dosage || !it.frequency || Number(it.quantity) <= 0) {
       return res.status(400).json({ error: 'Every prescription item requires medicine, dosage, frequency, and positive quantity.' });
     }
   }
@@ -2371,9 +3264,20 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
     [visit.patient_id]
   );
 
+  const allergyConflicts = normalizedItems
+    .map((it) => medMap.get(Number(it.medicine_id))!.generic_name)
+    .filter((name) => findAllergyConflicts(patient?.allergies, name));
+  const cleanOverrideReason = String(overrideAllergyReason || allergy_override_reason || '').trim();
+  if (allergyConflicts.length > 0 && cleanOverrideReason.length < 5) {
+    return res.status(409).json({
+      error: `Allergy Warning: Patient has documented allergies (${patient?.allergies}) conflicting with [${allergyConflicts.join(', ')}]. Provide clinical override reason (min 5 chars) to prescribe.`,
+      allergyConflicts,
+    });
+  }
+
   const rxRes = await execute(
-    "INSERT INTO prescriptions (visit_id, patient_id, doctor_id, invoice_id, status, notes) VALUES (?, ?, ?, NULL, 'awaiting_stock_check', ?)",
-    [visitId, visit.patient_id, req.user!.id, notes || null]
+    "INSERT INTO prescriptions (visit_id, patient_id, doctor_id, invoice_id, status, allergy_override_reason, notes) VALUES (?, ?, ?, NULL, 'awaiting_stock_check', ?, ?)",
+    [visitId, visit.patient_id, req.user!.id, allergyConflicts.length > 0 ? cleanOverrideReason : null, notes || null]
   );
 
   for (const it of normalizedItems) {
@@ -2396,7 +3300,7 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
     targetRole: 'PHA',
     title: 'e-Prescription Stock Check Required',
     message: `New Rx #${rxRes.insertId} (${normalizedItems.length} item${normalizedItems.length > 1 ? 's' : ''}) awaiting pharmacy stock confirmation.`,
-    severity: 'info',
+    severity: allergyConflicts.length > 0 ? 'warning' : 'info',
     entityType: 'prescription',
     entityId: rxRes.insertId,
   });
@@ -2407,9 +3311,11 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
     entityType: 'prescription',
     entityId: rxRes.insertId,
     patientId: visit.patient_id,
+    reason: allergyConflicts.length > 0 ? cleanOverrideReason : null,
     after: {
       itemCount: normalizedItems.length,
       medicines: normalizedItems.map((it) => ({ name: medMap.get(Number(it.medicine_id))!.generic_name, quantity: Number(it.quantity) })),
+      allergyConflicts,
       status: 'awaiting_stock_check',
     },
     req,
@@ -2460,13 +3366,21 @@ router.post('/visits/:id/nursing-procedures', requireAuth, requirePermission('nu
       'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [invRes.insertId, svc.code, svc.name, 'nursing', qty, unitPrice, total]
     );
+    await postInvoiceAccrualJE({
+      invoiceId: invRes.insertId,
+      invoiceNumber: invNum,
+      payerType: patient?.patient_type || 'self-pay',
+      totalAmount: total,
+      postedBy: req.user!.id,
+      description: `Nursing procedure accrual ${invNum} (${svc.name})`,
+    });
 
     const procStatus = perform_now ? 'completed' : 'ordered';
     const rawNote = String(notes || clinical_notes || '').trim();
     const combinedNote = qty > 1 ? `Qty ${qty}${rawNote ? ` · ${rawNote}` : ''}` : rawNote || null;
     const procRes = await execute(
       `INSERT INTO nursing_procedures (visit_id, patient_id, service_id, service_code, service_name, invoice_id, ordered_by, performed_by, notes, status, performed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${perform_now ? "datetime('now')" : 'NULL'})`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         visitId,
         visit.patient_id,
@@ -2478,25 +3392,9 @@ router.post('/visits/:id/nursing-procedures', requireAuth, requirePermission('nu
         perform_now ? req.user!.id : null,
         combinedNote,
         procStatus,
+        perform_now ? nowSql() : null,
       ]
-    ).catch(async () => {
-      return execute(
-        `INSERT INTO nursing_procedures (visit_id, patient_id, service_id, service_code, service_name, invoice_id, ordered_by, performed_by, notes, status, performed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${perform_now ? 'NOW()' : 'NULL'})`,
-        [
-          visitId,
-          visit.patient_id,
-          svc.id,
-          svc.code,
-          svc.name,
-          invRes.insertId,
-          req.user!.id,
-          perform_now ? req.user!.id : null,
-          combinedNote,
-          procStatus,
-        ]
-      );
-    });
+    );
 
     await writeAuditLog({
       user: req.user,
@@ -2522,14 +3420,9 @@ router.patch('/nursing-procedures/:id/complete', requireAuth, requirePermission(
   const { notes, clinical_notes } = req.body || {};
   const finalNote = (notes || clinical_notes || '').trim() || null;
   await execute(
-    "UPDATE nursing_procedures SET status = 'completed', performed_by = ?, notes = COALESCE(?, notes), performed_at = datetime('now') WHERE id = ?",
-    [req.user!.id, finalNote, id]
-  ).catch(async () => {
-    await execute(
-      "UPDATE nursing_procedures SET status = 'completed', performed_by = ?, notes = COALESCE(?, notes), performed_at = NOW() WHERE id = ?",
-      [req.user!.id, finalNote, id]
-    );
-  });
+    "UPDATE nursing_procedures SET status = 'completed', performed_by = ?, notes = COALESCE(?, notes), performed_at = ? WHERE id = ?",
+    [req.user!.id, finalNote, nowSql(), id]
+  );
   await writeAuditLog({
     user: req.user,
     action: 'nursing.procedure.complete',
@@ -2538,6 +3431,74 @@ router.patch('/nursing-procedures/:id/complete', requireAuth, requirePermission(
     patientId: existing.patient_id,
     req,
   });
+  res.json({ ok: true });
+});
+
+router.post('/orders/:type/:id/cancel', requireAuth, requirePermission('order.lab.create', 'order.imaging.create', 'nursing.procedure.perform', 'approval.decide'), async (req: AuthRequest, res: Response) => {
+  const orderType = String(req.params.type);
+  const id = Number(req.params.id);
+  const reason = String(req.body?.reason || '').trim();
+  if (reason.length < 5) {
+    return res.status(400).json({ error: 'Cancellation reason (min 5 characters) is required.' });
+  }
+
+  const tableMap: Record<string, { table: string; allowedStatuses: string[] }> = {
+    lab: { table: 'lab_orders', allowedStatuses: ['ordered'] },
+    imaging: { table: 'imaging_orders', allowedStatuses: ['ordered', 'scheduled'] },
+    nursing: { table: 'nursing_procedures', allowedStatuses: ['ordered'] },
+  };
+  const cfg = tableMap[orderType];
+  if (!cfg) return res.status(400).json({ error: 'Invalid order type (expected lab, imaging, or nursing).' });
+
+  const result = await withTransaction(async () => {
+    const row = await queryOne<{ id: number; visit_id: number; patient_id: number; invoice_id: number | null; status: string }>(
+      `SELECT id, visit_id, patient_id, invoice_id, status FROM ${cfg.table} WHERE id = ?`,
+      [id]
+    );
+    if (!row) return { ok: false as const, error: 'Order not found', httpStatus: 404 };
+    if (!cfg.allowedStatuses.includes(row.status)) {
+      return { ok: false as const, error: `Order cannot be cancelled once in '${row.status}' state.`, httpStatus: 409 };
+    }
+    if (row.invoice_id) {
+      const inv = await queryOne<{ id: number; invoice_number: string; status: string; paid_amount: number; total_amount: number; payer_type: string }>(
+        'SELECT * FROM invoices WHERE id = ?',
+        [row.invoice_id]
+      );
+      if (inv && Number(inv.paid_amount) > 0) {
+        return { ok: false as const, error: 'Invoice already has payments. Submit a Refund/Void approval request at Cashier instead.', httpStatus: 409 };
+      }
+      if (inv && inv.status !== 'voided') {
+        await execute("UPDATE invoices SET status = 'voided', notes = ? WHERE id = ?", [`Order cancelled: ${reason}`, inv.id]);
+        if (await hasInvoiceAccrualJE(inv.id)) {
+          const arAcct = inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? '1100' : '1150';
+          const revLines = await buildPerLineRevenueLines(inv.id, Number(inv.total_amount), 'debit', `Order cancel void ${inv.invoice_number}`);
+          await postJournalEntry({
+            sourceType: 'order_cancel_void',
+            sourceId: inv.id,
+            description: `Void invoice ${inv.invoice_number} on order cancellation (${reason})`,
+            postedBy: req.user!.id,
+            lines: [...revLines, { accountCode: arAcct, credit: Number(inv.total_amount), memo: `Reverse AR ${inv.invoice_number}` }],
+          });
+        }
+      }
+    }
+    await execute(`UPDATE ${cfg.table} SET status = 'cancelled' WHERE id = ?`, [id]);
+    await writeAuditLog({
+      user: req.user,
+      action: `order.${orderType}.cancel`,
+      entityType: cfg.table,
+      entityId: id,
+      patientId: row.patient_id,
+      reason,
+      before: { status: row.status },
+      after: { status: 'cancelled' },
+      req,
+    });
+    return { ok: true as const, visitId: row.visit_id };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('visit:updated', { visitId: result.visitId });
   res.json({ ok: true });
 });
 
@@ -2562,7 +3523,7 @@ router.get('/lab/orders', requireAuth, requirePermission('lab.order.read'), asyn
   res.json({ orders });
 });
 
-router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.collect', 'lab.result.enter', 'lab.result.verify', 'visit.read'), async (req: AuthRequest, res: Response) => {
+router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.collect', 'lab.result.enter', 'lab.result.verify', 'lab.sample.recollect', 'lab.critical.ack'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const order = await queryOne<{
     id: number;
@@ -2579,11 +3540,11 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
   const visit = await queryOne<{ triage_priority: string }>('SELECT triage_priority FROM visits WHERE id = ?', [order.visit_id]);
   const { action, result_value, abnormal_flag, result_notes, rejection_reason, amend_reason, bypass_payment_gate, panel_results } = req.body || {};
 
-  // Critical result acknowledgement by doctor does not hit payment gate
   if (action === 'ack_critical') {
-    await execute("UPDATE lab_orders SET critical_ack_by = ?, critical_ack_at = datetime('now') WHERE id = ?", [req.user!.id, id]).catch(async () => {
-      await execute('UPDATE lab_orders SET critical_ack_by = ?, critical_ack_at = NOW() WHERE id = ?', [req.user!.id, id]);
-    });
+    if (!hasPermission(req.user!, 'lab.critical.ack')) {
+      return res.status(403).json({ error: 'Missing lab.critical.ack permission' });
+    }
+    await execute('UPDATE lab_orders SET critical_ack_by = ?, critical_ack_at = ? WHERE id = ?', [req.user!.id, nowSql(), id]);
     await writeAuditLog({
       user: req.user,
       action: 'lab.critical.ack',
@@ -2596,7 +3557,6 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
     return res.json({ ok: true });
   }
 
-  // Payment gate check (emergency visits or authorized clinical bypass with reason are logged & permitted)
   if (order.invoice_id) {
     const inv = await queryOne<{ status: string; payer_type: string }>('SELECT status, payer_type FROM invoices WHERE id = ?', [
       order.invoice_id,
@@ -2610,12 +3570,12 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
         req.body?.bypass_reason
       );
       if (bypassCheck.allowed) {
-        await writeAuditLog({
-          user: req.user,
-          action: 'payment.gate.bypass',
+        await recordPaymentGateBypass({
+          visitId: order.visit_id,
+          patientId: order.patient_id,
           entityType: 'lab_order',
           entityId: id,
-          patientId: order.patient_id,
+          user: req.user!,
           reason: bypassCheck.reasonText,
           req,
         });
@@ -2633,7 +3593,12 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
       return res.status(409).json({ error: `Cannot collect sample from current status '${order.status}'.` });
     }
     const barcode = `SMP-${String(id).padStart(6, '0')}`;
-    await execute("UPDATE lab_orders SET status = 'collected', sample_barcode = ? WHERE id = ?", [barcode, id]);
+    await execute("UPDATE lab_orders SET status = 'collected', sample_barcode = ?, collected_by = ?, collected_at = ? WHERE id = ?", [
+      barcode,
+      req.user!.id,
+      nowSql(),
+      id,
+    ]);
     await writeAuditLog({
       user: req.user,
       action: 'lab.sample.collect',
@@ -2676,10 +3641,16 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
   }
 
   if (action === 'recollect') {
+    if (!hasPermission(req.user!, 'lab.sample.recollect', 'lab.sample.collect')) {
+      return res.status(403).json({ error: 'Missing lab.sample.recollect permission' });
+    }
     if (order.status !== 'rejected') {
       return res.status(409).json({ error: 'Only rejected samples can be reset for recollection.' });
     }
-    await execute("UPDATE lab_orders SET status = 'ordered', sample_barcode = NULL, rejection_reason = NULL WHERE id = ?", [id]);
+    await execute(
+      "UPDATE lab_orders SET status = 'ordered', sample_barcode = NULL, rejection_reason = NULL, collected_by = NULL, collected_at = NULL WHERE id = ?",
+      [id]
+    );
     await writeAuditLog({
       user: req.user,
       action: 'lab.sample.recollect',
@@ -2715,6 +3686,16 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
       "UPDATE lab_orders SET result_value = ?, abnormal_flag = ?, result_notes = ?, panel_results_json = ?, status = 'resulted', entered_by = ? WHERE id = ?",
       [computedSummary, derivedFlag, result_notes || null, panelJson, req.user!.id, id]
     );
+    if (derivedFlag === 'critical') {
+      await createNotification({
+        targetRole: 'DOC',
+        title: 'CRITICAL Lab Finding Entered',
+        message: `Lab order #${id} flagged CRITICAL (${computedSummary}). Pending senior verification.`,
+        severity: 'critical',
+        entityType: 'lab_order',
+        entityId: id,
+      });
+    }
     await writeAuditLog({
       user: req.user,
       action: 'lab.result.enter',
@@ -2739,12 +3720,11 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
         error: 'Two-Person Verification Rule: The verifier cannot be the same technician who entered the result. Sign in as Senior Lab Verifier (lab2@clinic360.local).',
       });
     }
-    await execute("UPDATE lab_orders SET status = 'verified', verified_by = ?, verified_at = datetime('now') WHERE id = ?", [
+    await execute("UPDATE lab_orders SET status = 'verified', verified_by = ?, verified_at = ? WHERE id = ?", [
       req.user!.id,
+      nowSql(),
       id,
-    ]).catch(async () => {
-      await execute("UPDATE lab_orders SET status = 'verified', verified_by = ?, verified_at = NOW() WHERE id = ?", [req.user!.id, id]);
-    });
+    ]);
 
     const remLab = await queryOne<{ cnt: number }>(
       "SELECT COUNT(*) AS cnt FROM lab_orders WHERE visit_id = ? AND status IN ('ordered','collected','resulted')",
@@ -2852,15 +3832,40 @@ router.get('/imaging/orders/:id/attachments', requireAuth, requirePermission('im
   res.json({ attachments });
 });
 
+function validateDataUrlSignature(mimeType: string, dataUrl: string): boolean {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
+  if (!match) return false;
+  const headerMime = match[1].toLowerCase();
+  if (headerMime !== mimeType) return false;
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(match[2].slice(0, 64), 'base64');
+  } catch {
+    return false;
+  }
+  if (buf.length < 4) return false;
+  if (mimeType === 'image/png') return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  if (mimeType === 'image/jpeg') return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  if (mimeType === 'image/gif') return buf.slice(0, 3).toString('ascii') === 'GIF';
+  if (mimeType === 'image/webp') return buf.slice(0, 4).toString('ascii') === 'RIFF';
+  if (mimeType === 'application/pdf') return buf.slice(0, 4).toString('ascii') === '%PDF';
+  if (mimeType === 'image/svg+xml') {
+    const txt = buf.toString('utf8').toLowerCase();
+    return txt.includes('<svg') || txt.includes('<?xml');
+  }
+  return false;
+}
+
 router.post('/imaging/orders/:id/attachments', requireAuth, requirePermission('imaging.exam.perform', 'imaging.report.finalise'), async (req: AuthRequest, res: Response) => {
   const orderId = Number(req.params.id);
   const { file_name, mime_type, data_url, caption } = req.body || {};
   if (!file_name || !mime_type || !data_url) {
     return res.status(400).json({ error: 'file_name, mime_type, and data_url are required.' });
   }
+  const normMime = String(mime_type).trim().toLowerCase();
   const allowedMimes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf']);
-  if (!allowedMimes.has(String(mime_type).trim().toLowerCase()) || !String(data_url).startsWith('data:')) {
-    return res.status(400).json({ error: 'Unsupported file format. Only PNG, JPEG, WEBP, GIF, SVG, or PDF data URLs are allowed.' });
+  if (!allowedMimes.has(normMime) || !validateDataUrlSignature(normMime, String(data_url))) {
+    return res.status(400).json({ error: 'Unsupported or corrupted file payload. Valid PNG, JPEG, WEBP, GIF, SVG, or PDF base64 required.' });
   }
   if (String(data_url).length > 4_200_000) {
     return res.status(400).json({ error: 'File exceeds maximum allowed 3 MB attachment limit.' });
@@ -2870,7 +3875,7 @@ router.post('/imaging/orders/:id/attachments', requireAuth, requirePermission('i
 
   const inserted = await execute(
     'INSERT INTO imaging_attachments (imaging_order_id, file_name, mime_type, data_url, caption, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)',
-    [orderId, String(file_name).trim(), String(mime_type).trim(), String(data_url), caption || null, req.user!.id]
+    [orderId, String(file_name).trim(), normMime, String(data_url), caption || null, req.user!.id]
   );
   await writeAuditLog({
     user: req.user,
@@ -2878,7 +3883,7 @@ router.post('/imaging/orders/:id/attachments', requireAuth, requirePermission('i
     entityType: 'imaging_order',
     entityId: orderId,
     patientId: order.patient_id,
-    after: { attachmentId: inserted.insertId, file_name, mime_type },
+    after: { attachmentId: inserted.insertId, file_name, mime_type: normMime },
     req,
   });
   res.status(201).json({ id: inserted.insertId });
@@ -2893,7 +3898,7 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
   if (!order) return res.status(404).json({ error: 'Imaging order not found' });
 
   const visit = await queryOne<{ triage_priority: string }>('SELECT triage_priority FROM visits WHERE id = ?', [order.visit_id]);
-  const { action, pregnancy_checked, exam_notes, findings, impression, addendum, bypass_payment_gate, bypass_reason } = req.body || {};
+  const { action, pregnancy_checked, exam_notes, findings, impression, addendum, repeat_reason, bypass_payment_gate, bypass_reason } = req.body || {};
 
   if (order.invoice_id) {
     const inv = await queryOne<{ status: string; payer_type: string }>('SELECT status, payer_type FROM invoices WHERE id = ?', [
@@ -2907,12 +3912,12 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
         bypass_reason
       );
       if (bypassCheck.allowed) {
-        await writeAuditLog({
-          user: req.user,
-          action: 'payment.gate.bypass',
+        await recordPaymentGateBypass({
+          visitId: order.visit_id,
+          patientId: order.patient_id,
           entityType: 'imaging_order',
           entityId: id,
-          patientId: order.patient_id,
+          user: req.user!,
           reason: bypassCheck.reasonText,
           req,
         });
@@ -2925,8 +3930,12 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
   }
 
   if (action === 'perform') {
-    if (!['ordered', 'scheduled'].includes(order.status)) {
+    const isRepeat = order.status === 'performed';
+    if (!['ordered', 'scheduled', 'performed'].includes(order.status)) {
       return res.status(409).json({ error: `Cannot perform exam from current status '${order.status}'.` });
+    }
+    if (isRepeat && !String(repeat_reason || '').trim()) {
+      return res.status(400).json({ error: 'A repeat scan reason is required when repeating a performed scan.' });
     }
     const [cat, pat] = await Promise.all([
       queryOne<{ modality: string }>('SELECT modality FROM imaging_catalog WHERE id = ?', [order.catalog_id]),
@@ -2944,8 +3953,8 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
       }
     }
     await execute(
-      "UPDATE imaging_orders SET status = 'performed', pregnancy_checked = ?, exam_notes = ?, performed_by = ? WHERE id = ?",
-      [pregnancy_checked ? 1 : 0, exam_notes || null, req.user!.id, id]
+      "UPDATE imaging_orders SET status = 'performed', pregnancy_checked = ?, exam_notes = ?, repeat_reason = COALESCE(?, repeat_reason), performed_by = ? WHERE id = ?",
+      [pregnancy_checked ? 1 : 0, exam_notes || null, isRepeat ? String(repeat_reason).trim() : null, req.user!.id, id]
     );
     await writeAuditLog({
       user: req.user,
@@ -2953,7 +3962,31 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
       entityType: 'imaging_order',
       entityId: id,
       patientId: order.patient_id,
-      after: { pregnancy_checked: Boolean(pregnancy_checked), exam_notes },
+      after: { pregnancy_checked: Boolean(pregnancy_checked), exam_notes, isRepeat },
+      reason: isRepeat ? String(repeat_reason).trim() : null,
+      req,
+    });
+    broadcastClinicEvent('imaging:updated', { visitId: order.visit_id, orderId: id });
+    return res.json({ ok: true });
+  }
+
+  if (action === 'draft_report') {
+    if (!hasPermission(req.user!, 'imaging.report.finalise')) {
+      return res.status(403).json({ error: 'Missing imaging.report.finalise permission' });
+    }
+    if (!['performed', 'reported_draft'].includes(order.status)) {
+      return res.status(409).json({ error: 'Exam scan must be performed before saving a draft report.' });
+    }
+    await execute(
+      "UPDATE imaging_orders SET status = 'reported_draft', findings = ?, impression = ?, reported_by = ? WHERE id = ?",
+      [findings?.trim() || null, impression?.trim() || null, req.user!.id, id]
+    );
+    await writeAuditLog({
+      user: req.user,
+      action: 'imaging.report.draft',
+      entityType: 'imaging_order',
+      entityId: id,
+      patientId: order.patient_id,
       req,
     });
     broadcastClinicEvent('imaging:updated', { visitId: order.visit_id, orderId: id });
@@ -2961,6 +3994,9 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
   }
 
   if (action === 'finalise') {
+    if (!hasPermission(req.user!, 'imaging.report.finalise')) {
+      return res.status(403).json({ error: 'Missing imaging.report.finalise permission' });
+    }
     if (!['performed', 'reported_draft'].includes(order.status)) {
       return res.status(409).json({ error: 'Exam scan must be performed before finalising the radiology report.' });
     }
@@ -2968,14 +4004,9 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
       return res.status(400).json({ error: 'Findings and impression are required to finalise report.' });
     }
     await execute(
-      "UPDATE imaging_orders SET status = 'reported_final', findings = ?, impression = ?, reported_by = ?, finalised_at = datetime('now') WHERE id = ?",
-      [findings.trim(), impression.trim(), req.user!.id, id]
-    ).catch(async () => {
-      await execute(
-        "UPDATE imaging_orders SET status = 'reported_final', findings = ?, impression = ?, reported_by = ?, finalised_at = NOW() WHERE id = ?",
-        [findings.trim(), impression.trim(), req.user!.id, id]
-      );
-    });
+      "UPDATE imaging_orders SET status = 'reported_final', findings = ?, impression = ?, reported_by = ?, finalised_at = ? WHERE id = ?",
+      [findings.trim(), impression.trim(), req.user!.id, nowSql(), id]
+    );
 
     const remLab = await queryOne<{ cnt: number }>(
       "SELECT COUNT(*) AS cnt FROM lab_orders WHERE visit_id = ? AND status IN ('ordered','collected','resulted')",
@@ -3037,7 +4068,6 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
   res.status(400).json({ error: 'Unsupported imaging action' });
 });
 
-// Printable Verified Lab Report
 router.get('/lab/orders/:id/report', requireAuth, requirePermission('lab.order.read', 'visit.read'), async (req, res) => {
   const id = Number(req.params.id);
   const report = await queryOne(
@@ -3059,7 +4089,6 @@ router.get('/lab/orders/:id/report', requireAuth, requirePermission('lab.order.r
   res.json({ report });
 });
 
-// Printable Imaging Report
 router.get('/imaging/orders/:id/report', requireAuth, requirePermission('imaging.order.read', 'visit.read'), async (req, res) => {
   const id = Number(req.params.id);
   const report = await queryOne(
@@ -3082,7 +4111,7 @@ router.get('/imaging/orders/:id/report', requireAuth, requirePermission('imaging
 });
 
 // ---------------------------------------------------------------------------
-// PHARMACY DISPENSING (Batched Query + Multi-Batch FEFO + Partial Dispense)
+// PHARMACY DISPENSING (Batched Query + Multi-Batch FEFO + COGS + Partial)
 // ---------------------------------------------------------------------------
 router.get('/pharmacy/prescriptions', requireAuth, requirePermission('pharmacy.prescription.read'), async (_req, res) => {
   const prescriptions = await query<Record<string, unknown>>(
@@ -3110,7 +4139,7 @@ router.get('/pharmacy/prescriptions', requireAuth, requirePermission('pharmacy.p
       rxIds
     );
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = await getClinicToday();
     const itemIds = [...new Set(allItems.map((i) => i.store_item_id).filter(Boolean))];
     const batchesByItem = new Map<number, Array<{ id: number; batch_number: string; expiry_date: string; qty_on_hand: number }>>();
     if (itemIds.length > 0) {
@@ -3159,6 +4188,8 @@ router.get('/pharmacy/prescriptions', requireAuth, requirePermission('pharmacy.p
 router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('pharmacy.dispense'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const { items: requestedItems } = req.body || {};
+  const settings = await getClinicSettings();
+  const today = await getClinicToday();
 
   const result = await withTransaction(async () => {
     const rx = await queryOne<{ id: number; visit_id: number; patient_id: number; invoice_id: number | null; status: string }>(
@@ -3206,7 +4237,6 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
       }
     }
 
-    const today = new Date().toISOString().slice(0, 10);
     const billLines: Array<{ code: string; desc: string; qty: number; unitPrice: number; lineTotal: number }> = [];
     let totalSelectedQty = 0;
 
@@ -3270,12 +4300,8 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
 
     const subtotal = Number(billLines.reduce((s, l) => s + l.lineTotal, 0).toFixed(2));
     const invNum = await nextSequence('INV');
-    const invStatus =
-      patient?.patient_type === 'insurance' || patient?.patient_type === 'credit'
-        ? 'credit_billed'
-        : patient?.patient_type === 'exempt'
-          ? 'paid'
-          : 'unpaid';
+    const payerType = patient?.patient_type || 'self-pay';
+    const invStatus = payerType === 'insurance' || payerType === 'credit' ? 'credit_billed' : payerType === 'exempt' ? 'paid' : 'unpaid';
 
     const invRes = await execute(
       `INSERT INTO invoices (invoice_number, patient_id, visit_id, payer_type, payer_name, subtotal, discount_amount, total_amount, paid_amount, status, notes, created_by)
@@ -3284,7 +4310,7 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
         invNum,
         rx.patient_id,
         rx.visit_id,
-        patient?.patient_type || 'self-pay',
+        payerType,
         patient?.payer_name || null,
         subtotal,
         subtotal,
@@ -3301,6 +4327,16 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
       );
     }
 
+    if (subtotal > 0 && payerType !== 'exempt') {
+      await postInvoiceAccrualJE({
+        invoiceId: invRes.insertId,
+        invoiceNumber: invNum,
+        payerType,
+        totalAmount: subtotal,
+        postedBy: req.user!.id,
+      });
+    }
+
     const rxStatus = invStatus === 'paid' || invStatus === 'credit_billed' ? 'paid_ready_to_dispense' : 'pending_payment';
     await execute('UPDATE prescriptions SET invoice_id = ?, status = ? WHERE id = ?', [invRes.insertId, rxStatus, id]);
 
@@ -3309,7 +4345,7 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
       title: rxStatus === 'pending_payment' ? 'Pharmacy Bill Ready at Cashier' : 'Paid - Ready to Dispense',
       message:
         rxStatus === 'pending_payment'
-          ? `Pharmacy invoice ${invNum} ($${subtotal.toFixed(2)}) awaiting payment.`
+          ? `Pharmacy invoice ${invNum} (${settings.currencySymbol}${subtotal.toFixed(2)}) awaiting payment.`
           : `Prescription #${id} (${invNum}) cleared for dispensing.`,
       severity: 'info',
       entityType: 'prescription',
@@ -3346,6 +4382,7 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
 router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.dispense'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const { overrideAllergyReason, bypass_payment_gate, complete_visit, items: requestedItems } = req.body || {};
+  const today = await getClinicToday();
 
   const result = await withTransaction(async () => {
     const rx = await queryOne<{ id: number; visit_id: number; patient_id: number; invoice_id: number | null; status: string }>(
@@ -3362,10 +4399,9 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       };
     }
 
-    const visit = await queryOne<{ triage_priority: string; diagnosis_text: string | null; status: string; appointment_id: number | null }>(
-      'SELECT triage_priority, diagnosis_text, status, appointment_id FROM visits WHERE id = ?',
-      [rx.visit_id]
-    );
+    const visit = await queryOne<{ triage_priority: string; status: string }>('SELECT triage_priority, status FROM visits WHERE id = ?', [
+      rx.visit_id,
+    ]);
 
     if (rx.invoice_id) {
       const inv = await queryOne<{ status: string; payer_type: string }>('SELECT status, payer_type FROM invoices WHERE id = ?', [
@@ -3379,12 +4415,12 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
           req.body?.bypass_reason
         );
         if (bypassCheck.allowed) {
-          await writeAuditLog({
-            user: req.user,
-            action: 'payment.gate.bypass',
+          await recordPaymentGateBypass({
+            visitId: rx.visit_id,
+            patientId: rx.patient_id,
             entityType: 'prescription',
             entityId: id,
-            patientId: rx.patient_id,
+            user: req.user!,
             reason: bypassCheck.reasonText,
             req,
           });
@@ -3426,8 +4462,8 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       }
     }
 
-    const today = new Date().toISOString().slice(0, 10);
     const batchAllocations: Array<{ medicine: string; qty: number; batches: Array<{ batch: string; expiry: string; taken: number }> }> = [];
+    let totalCogs = 0;
 
     for (const item of items) {
       const targetOnSiteQty = item.selected_qty !== null && item.selected_qty !== undefined ? Number(item.selected_qty) : Number(item.quantity);
@@ -3448,8 +4484,8 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       }
 
       if (item.store_item_id) {
-        const activeBatches = await query<{ id: number; batch_number: string; expiry_date: string; qty_on_hand: number }>(
-          `SELECT id, batch_number, expiry_date, qty_on_hand
+        const activeBatches = await query<{ id: number; batch_number: string; expiry_date: string; qty_on_hand: number; unit_cost: number }>(
+          `SELECT id, batch_number, expiry_date, qty_on_hand, unit_cost
            FROM stock_batches
            WHERE item_id = ? AND location = 'dispensary' AND status = 'active' AND qty_on_hand > 0 AND expiry_date >= ?
            ORDER BY expiry_date ASC, id ASC`,
@@ -3469,12 +4505,20 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
         for (const b of activeBatches) {
           if (need <= 0) break;
           const take = Math.min(need, Number(b.qty_on_hand));
-          const left = Number(b.qty_on_hand) - take;
-          await execute("UPDATE stock_batches SET qty_on_hand = ?, status = CASE WHEN ? <= 0 THEN 'depleted' ELSE 'active' END WHERE id = ?", [
-            left,
-            left,
-            b.id,
-          ]);
+          const upd = await execute(
+            "UPDATE stock_batches SET qty_on_hand = qty_on_hand - ?, status = CASE WHEN qty_on_hand - ? <= 0 THEN 'depleted' ELSE 'active' END WHERE id = ? AND qty_on_hand >= ?",
+            [take, take, b.id, take]
+          );
+          if (upd.affectedRows === 0) {
+            return { ok: false as const, error: `Concurrent stock update on batch ${b.batch_number}; retry.`, httpStatus: 409 };
+          }
+          const lineCost = Number((take * Number(b.unit_cost || 0)).toFixed(2));
+          totalCogs = Number((totalCogs + lineCost).toFixed(2));
+          await execute(
+            `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, created_by)
+             VALUES (?, ?, 'dispensary', 'dispense', ?, ?, ?, 'prescription', ?, ?)`,
+            [item.store_item_id, b.id, -take, Number(b.unit_cost || 0), lineCost, id, req.user!.id]
+          );
           usedBatches.push({ batch: b.batch_number, expiry: b.expiry_date, taken: take });
           need -= take;
         }
@@ -3503,6 +4547,19 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       return { ok: false as const, error: 'Specify at least 1 unit to dispense.', httpStatus: 400 };
     }
 
+    if (totalCogs > 0) {
+      await postJournalEntry({
+        sourceType: 'cogs',
+        sourceId: id,
+        description: `Pharmacy Dispense COGS Rx #${id}`,
+        postedBy: req.user!.id,
+        lines: [
+          { accountCode: '5010', debit: totalCogs, memo: `Rx #${id} COGS` },
+          { accountCode: '1200', credit: totalCogs, memo: 'Dispensary inventory consumed' },
+        ],
+      });
+    }
+
     const updatedItems = await query<{ quantity: number; selected_qty: number | null; dispensed_qty: number }>(
       'SELECT quantity, selected_qty, dispensed_qty FROM prescription_items WHERE prescription_id = ?',
       [id]
@@ -3513,43 +4570,15 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
     });
     const nextStatus = allComplete ? 'dispensed' : 'partial';
 
-    await execute("UPDATE prescriptions SET status = ?, dispensed_at = datetime('now'), dispensed_by = ? WHERE id = ?", [
-      nextStatus,
-      req.user!.id,
-      id,
-    ]).catch(async () => {
-      await execute('UPDATE prescriptions SET status = ?, dispensed_at = NOW(), dispensed_by = ? WHERE id = ?', [
-        nextStatus,
-        req.user!.id,
-        id,
-      ]);
-    });
+    await execute(
+      'UPDATE prescriptions SET status = ?, dispensed_at = ?, dispensed_by = ?, allergy_override_reason = COALESCE(?, allergy_override_reason) WHERE id = ?',
+      [nextStatus, nowSql(), req.user!.id, overrideAllergyReason?.trim() || null, id]
+    );
 
     let visitCompleted = false;
-    if (complete_visit && nextStatus === 'dispensed' && visit?.status !== 'closed') {
-      await execute("UPDATE visits SET status = 'closed', workflow_stage = 'completed', closed_at = datetime('now'), closed_by = ? WHERE id = ?", [
-        req.user!.id,
-        rx.visit_id,
-      ]).catch(async () => {
-        await execute("UPDATE visits SET status = 'closed', workflow_stage = 'completed', closed_at = NOW(), closed_by = ? WHERE id = ?", [
-          req.user!.id,
-          rx.visit_id,
-        ]);
-      });
-      await execute("UPDATE queue_tickets SET status = 'completed' WHERE visit_id = ?", [rx.visit_id]);
-      if (visit?.appointment_id) {
-        await execute("UPDATE appointments SET status = 'completed' WHERE id = ? AND status != 'cancelled'", [visit.appointment_id]);
-      }
-      await writeAuditLog({
-        user: req.user,
-        action: 'visit.close',
-        entityType: 'visit',
-        entityId: rx.visit_id,
-        patientId: rx.patient_id,
-        after: { closedByPharmacy: true, prescriptionId: id },
-        req,
-      });
-      visitCompleted = true;
+    if (complete_visit && nextStatus === 'dispensed' && rx.visit_id && visit?.status !== 'closed') {
+      const closed = await closeVisit({ visitId: rx.visit_id, user: req.user!, req, forcePartialClose: false });
+      visitCompleted = closed.ok;
     }
 
     await writeAuditLog({
@@ -3558,7 +4587,7 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       entityType: 'prescription',
       entityId: id,
       patientId: rx.patient_id,
-      after: { status: nextStatus, visitCompleted, fefoAllocations: batchAllocations },
+      after: { status: nextStatus, visitCompleted, totalCogs, fefoAllocations: batchAllocations },
       reason: overrideAllergyReason || null,
       req,
     });
@@ -3581,7 +4610,7 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
 // STORE & FEFO INVENTORY (Main Store, GRN, Requisitions, Expiry Quarantine)
 // ---------------------------------------------------------------------------
 router.get('/store/overview', requireAuth, requirePermission('store.item.read'), async (_req, res) => {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = await getClinicToday();
   const in30 = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
   const in90 = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
 
@@ -3648,12 +4677,12 @@ router.get('/store/overview', requireAuth, requirePermission('store.item.read'),
     reqRow.items = reqItemMap.get(Number(reqRow.id)) || [];
   }
 
-  const expiryAlerts = batches.filter(
-    (b) => b.status === 'active' && Number(b.qty_on_hand) > 0 && String(b.expiry_date) <= in90
-  ).map((b) => ({
-    ...b,
-    alert_band: String(b.expiry_date) < today ? 'expired' : String(b.expiry_date) <= in30 ? 'critical_30d' : 'warning_90d',
-  }));
+  const expiryAlerts = batches
+    .filter((b) => b.status === 'active' && Number(b.qty_on_hand) > 0 && String(b.expiry_date) <= in90)
+    .map((b) => ({
+      ...b,
+      alert_band: String(b.expiry_date) < today ? 'expired' : String(b.expiry_date) <= in30 ? 'critical_30d' : 'warning_90d',
+    }));
 
   res.json({ items, batches, grns, requisitions, expiryAlerts });
 });
@@ -3665,6 +4694,7 @@ router.post('/store/grn', requireAuth, requirePermission('store.grn.create'), as
   if (!supplier_name?.trim() || !item_id || !batch_number?.trim() || !expiry_date || qty <= 0) {
     return res.status(400).json({ error: 'Supplier, item, batch number, expiry date, and positive quantity are required.' });
   }
+  const todayStr = await getClinicToday();
 
   const result = await withTransaction(async () => {
     const item = await queryOne<{ id: number; code: string; name: string }>('SELECT id, code, name FROM store_items WHERE id = ?', [
@@ -3682,21 +4712,21 @@ router.post('/store/grn', requireAuth, requirePermission('store.grn.create'), as
       'INSERT INTO grn_items (grn_id, item_id, batch_number, expiry_date, quantity, unit_cost) VALUES (?, ?, ?, ?, ?, ?)',
       [grnRes.insertId, item.id, batch_number.trim(), expiry_date, qty, cost]
     );
-    await execute(
+    const batchRes = await execute(
       "INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, 'main_store', ?, ?, ?, ?, 'active')",
       [item.id, batch_number.trim(), expiry_date, qty, cost]
     );
 
+    let jeId: number | null = null;
     if (totalCost > 0) {
       const billNumber = await nextSequence('AP');
-      const todayStr = new Date().toISOString().slice(0, 10);
       const dueStr = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
       await execute(
         `INSERT INTO supplier_bills (bill_number, grn_id, supplier_name, invoice_ref, bill_date, due_date, total_amount, paid_amount, status, notes)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)`,
         [billNumber, grnRes.insertId, supplier_name.trim(), invoice_ref || null, todayStr, dueStr, totalCost, `Auto-posted from ${grnNumber}`]
       );
-      await postJournalEntry({
+      const je = await postJournalEntry({
         sourceType: 'grn',
         sourceId: grnRes.insertId,
         description: `Inventory receipt ${grnNumber} (${supplier_name.trim()})`,
@@ -3706,7 +4736,14 @@ router.post('/store/grn', requireAuth, requirePermission('store.grn.create'), as
           { accountCode: '2100', credit: totalCost, memo: `${billNumber} payable to ${supplier_name.trim()}` },
         ],
       });
+      jeId = je.entryId;
     }
+
+    await execute(
+      `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, journal_entry_id, created_by)
+       VALUES (?, ?, 'main_store', 'grn_receive', ?, ?, ?, 'goods_receipt', ?, ?, ?)`,
+      [item.id, batchRes.insertId, qty, cost, totalCost, grnRes.insertId, jeId, req.user!.id]
+    );
 
     await writeAuditLog({
       user: req.user,
@@ -3772,7 +4809,7 @@ router.post('/store/requisitions', requireAuth, requirePermission('store.requisi
 
 router.post('/store/requisitions/:id/issue', requireAuth, requirePermission('store.requisition.issue'), async (req: AuthRequest, res: Response) => {
   const reqId = Number(req.params.id);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = await getClinicToday();
 
   const result = await withTransaction(async () => {
     const reqRow = await queryOne<{ id: number; req_number: string; to_location: string; status: string }>(
@@ -3813,15 +4850,27 @@ router.post('/store/requisitions/:id/issue', requireAuth, requirePermission('sto
       for (const b of batches) {
         if (need <= 0) break;
         const take = Math.min(need, Number(b.qty_on_hand));
-        const left = Number(b.qty_on_hand) - take;
-        await execute("UPDATE stock_batches SET qty_on_hand = ?, status = CASE WHEN ? <= 0 THEN 'depleted' ELSE 'active' END WHERE id = ?", [
-          left,
-          left,
-          b.id,
-        ]);
-        await execute(
+        const upd = await execute(
+          "UPDATE stock_batches SET qty_on_hand = qty_on_hand - ?, status = CASE WHEN qty_on_hand - ? <= 0 THEN 'depleted' ELSE 'active' END WHERE id = ? AND qty_on_hand >= ?",
+          [take, take, b.id, take]
+        );
+        if (upd.affectedRows === 0) {
+          return { ok: false as const, error: `Concurrent update on batch ${b.batch_number}; retry.`, httpStatus: 409 };
+        }
+        const destBatchRes = await execute(
           "INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, ?, ?, ?, ?, ?, 'active')",
           [ri.item_id, reqRow.to_location, b.batch_number, b.expiry_date, take, b.unit_cost]
+        );
+        const moveCost = Number((take * Number(b.unit_cost || 0)).toFixed(2));
+        await execute(
+          `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, created_by)
+           VALUES (?, ?, 'main_store', 'transfer_out', ?, ?, ?, 'stock_requisition', ?, ?)`,
+          [ri.item_id, b.id, -take, Number(b.unit_cost || 0), moveCost, reqId, req.user!.id]
+        );
+        await execute(
+          `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, created_by)
+           VALUES (?, ?, ?, 'transfer_in', ?, ?, ?, 'stock_requisition', ?, ?)`,
+          [ri.item_id, destBatchRes.insertId, reqRow.to_location, take, Number(b.unit_cost || 0), moveCost, reqId, req.user!.id]
         );
         movedBatches.push(`${b.batch_number} (${take})`);
         need -= take;
@@ -3834,15 +4883,11 @@ router.post('/store/requisitions/:id/issue', requireAuth, requirePermission('sto
       fefoTransfers.push({ item: ri.item_name, issued: ri.requested_qty, batches: movedBatches });
     }
 
-    await execute("UPDATE stock_requisitions SET status = 'issued', issued_by = ?, issued_at = datetime('now') WHERE id = ?", [
+    await execute("UPDATE stock_requisitions SET status = 'issued', issued_by = ?, issued_at = ? WHERE id = ?", [
       req.user!.id,
+      nowSql(),
       reqId,
-    ]).catch(async () => {
-      await execute("UPDATE stock_requisitions SET status = 'issued', issued_by = ?, issued_at = NOW() WHERE id = ?", [
-        req.user!.id,
-        reqId,
-      ]);
-    });
+    ]);
 
     await createNotification({
       targetRole: reqRow.to_location === 'lab' ? 'LAB' : reqRow.to_location === 'ward' ? 'WRD' : 'PHA',
@@ -3877,11 +4922,19 @@ router.post('/store/batches/:id/block', requireAuth, requirePermission('store.ex
   }
 
   const result = await withTransaction(async () => {
-    const batch = await queryOne<{ id: number; item_id: number; batch_number: string; location: string; qty_on_hand: number; status: string }>(
-      'SELECT * FROM stock_batches WHERE id = ?',
-      [batchId]
-    );
+    const batch = await queryOne<{
+      id: number;
+      item_id: number;
+      batch_number: string;
+      location: string;
+      qty_on_hand: number;
+      unit_cost: number;
+      status: string;
+    }>('SELECT * FROM stock_batches WHERE id = ?', [batchId]);
     if (!batch) return { ok: false as const, error: 'Stock batch not found', httpStatus: 404 };
+    if (batch.status === 'blocked_expired') {
+      return { ok: false as const, error: 'Stock batch is already blocked/quarantined.', httpStatus: 409 };
+    }
 
     await execute("UPDATE stock_batches SET status = 'blocked_expired', block_reason = ? WHERE id = ?", [
       reason.trim(),
@@ -3893,17 +4946,41 @@ router.post('/store/batches/:id/block', requireAuth, requirePermission('store.ex
       await syncMedicineFromBatches(item.medicine_id);
     }
 
+    const writeOffVal = Number((Number(batch.qty_on_hand) * Number(batch.unit_cost || 0)).toFixed(2));
+    let jeId: number | null = null;
+    if (batch.status === 'active' && Number(batch.qty_on_hand) > 0 && writeOffVal > 0) {
+      const je = await postJournalEntry({
+        sourceType: 'stock_writeoff',
+        sourceId: batchId,
+        description: `Expired/damaged batch quarantine write-off (${batch.batch_number})`,
+        postedBy: req.user!.id,
+        lines: [
+          { accountCode: '5020', debit: writeOffVal, memo: `Quarantine ${batch.batch_number}: ${reason.trim()}` },
+          { accountCode: '1200', credit: writeOffVal, memo: `${batch.qty_on_hand} units blocked` },
+        ],
+      });
+      jeId = je.entryId;
+    }
+
+    if (Number(batch.qty_on_hand) > 0) {
+      await execute(
+        `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, journal_entry_id, created_by)
+         VALUES (?, ?, ?, 'write_off', ?, ?, ?, 'stock_batch', ?, ?, ?)`,
+        [batch.item_id, batchId, batch.location, -Number(batch.qty_on_hand), Number(batch.unit_cost || 0), writeOffVal, batchId, jeId, req.user!.id]
+      );
+    }
+
     await writeAuditLog({
       user: req.user,
       action: 'store.batch.block',
       entityType: 'stock_batch',
       entityId: batchId,
       before: { status: batch.status, qty_on_hand: batch.qty_on_hand },
-      after: { status: 'blocked_expired', batch_number: batch.batch_number },
+      after: { status: 'blocked_expired', batch_number: batch.batch_number, writeOffVal },
       reason: reason.trim(),
       req,
     });
-    return { ok: true as const };
+    return { ok: true as const, writeOffVal };
   });
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
@@ -3994,10 +5071,49 @@ router.get('/ipd/admissions/:id/statement', requireAuth, requirePermission('ipd.
   );
   if (!admission) return res.status(404).json({ error: 'Admission not found' });
 
-  const [invoices, deposits, marHistory] = await Promise.all([
+  // Auto-flag overdue scheduled MAR doses created on an earlier date as missed
+  const today = await getClinicToday();
+  await execute(
+    "UPDATE medication_administrations SET status = 'missed' WHERE admission_id = ? AND status = 'due' AND substr(created_at, 1, 10) < ?",
+    [admId, today]
+  ).catch(() => {});
+
+  const [invoices, deposits, marHistory, medicationOrders, wardRounds, nursingNotes, vitals] = await Promise.all([
     query<Record<string, unknown>>('SELECT * FROM invoices WHERE patient_id = ? ORDER BY id DESC LIMIT 20', [admission.patient_id]),
     query<Record<string, unknown>>('SELECT * FROM patient_deposits WHERE patient_id = ? ORDER BY id DESC', [admission.patient_id]),
     query('SELECT * FROM medication_administrations WHERE admission_id = ? ORDER BY id ASC', [admId]),
+    query(
+      `SELECT mo.*, u.full_name AS ordered_by_name
+       FROM medication_orders mo
+       LEFT JOIN users u ON u.id = mo.ordered_by
+       WHERE mo.admission_id = ?
+       ORDER BY mo.id DESC`,
+      [admId]
+    ),
+    query(
+      `SELECT wr.*, u.full_name AS doctor_name
+       FROM ward_rounds wr
+       LEFT JOIN users u ON u.id = wr.doctor_id
+       WHERE wr.admission_id = ?
+       ORDER BY wr.id DESC`,
+      [admId]
+    ),
+    query(
+      `SELECT nn.*, u.full_name AS nurse_name
+       FROM nursing_notes nn
+       LEFT JOIN users u ON u.id = nn.nurse_id
+       WHERE nn.admission_id = ?
+       ORDER BY nn.id DESC`,
+      [admId]
+    ),
+    query(
+      `SELECT v.*, u.full_name AS recorded_by_name
+       FROM vitals v
+       LEFT JOIN users u ON u.id = v.recorded_by
+       WHERE v.admission_id = ? OR (v.visit_id IS NOT NULL AND v.visit_id = ?)
+       ORDER BY v.id DESC LIMIT 20`,
+      [admId, admission.visit_id || -1]
+    ),
   ]);
 
   if (invoices.length > 0) {
@@ -4013,7 +5129,7 @@ router.get('/ipd/admissions/:id/statement', requireAuth, requirePermission('ipd.
     for (const inv of invoices) inv.items = byInv.get(Number(inv.id)) || [];
   }
 
-  res.json({ admission, invoices, deposits, marHistory });
+  res.json({ admission, invoices, deposits, marHistory, medicationOrders, wardRounds, nursingNotes, vitals });
 });
 
 router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ipd.bed.bill'), async (req: AuthRequest, res: Response) => {
@@ -4077,7 +5193,6 @@ router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ip
       [invRes.insertId, `${adm.ward_name} Bed Stay (${daysToBill} day${daysToBill > 1 ? 's' : ''})`, daysToBill, adm.daily_tariff, total]
     );
 
-    // Auto-apply active patient advance deposits if self-pay
     let depositApplied = 0;
     if (baseStatus === 'unpaid' && total > 0) {
       const activeDeps = await query<{ id: number; remaining_amount: number }>(
@@ -4108,17 +5223,17 @@ router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ip
     }
 
     if (total > 0) {
-      await postJournalEntry({
-        sourceType: 'ipd_bed',
-        sourceId: invRes.insertId,
-        description: `Inpatient bed charge ${adm.admission_number} (${daysToBill}d)`,
+      await postInvoiceAccrualJE({
+        invoiceId: invRes.insertId,
+        invoiceNumber: invNum,
+        payerType: adm.patient_type,
+        totalAmount: total,
         postedBy: req.user!.id,
-        lines: [
-          { accountCode: '1100', debit: total, memo: invNum },
-          { accountCode: '4040', credit: total, memo: `${adm.ward_name} tariff` },
-        ],
+        sourceType: 'ipd_bed',
+        description: `Inpatient bed charge ${adm.admission_number} (${daysToBill}d)`,
       });
       if (depositApplied > 0) {
+        const receivableAcct = adm.patient_type === 'insurance' || adm.patient_type === 'credit' ? '1100' : '1150';
         await postJournalEntry({
           sourceType: 'deposit_apply',
           sourceId: invRes.insertId,
@@ -4126,21 +5241,17 @@ router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ip
           postedBy: req.user!.id,
           lines: [
             { accountCode: '2010', debit: depositApplied, memo: invNum },
-            { accountCode: '1100', credit: depositApplied, memo: 'Receivable offset' },
+            { accountCode: receivableAcct, credit: depositApplied, memo: 'Receivable offset' },
           ],
         });
       }
     }
 
-    await execute(
-      "UPDATE admissions SET bed_days_billed = bed_days_billed + ?, last_bed_billed_at = datetime('now') WHERE id = ?",
-      [daysToBill, admId]
-    ).catch(async () => {
-      await execute('UPDATE admissions SET bed_days_billed = bed_days_billed + ?, last_bed_billed_at = NOW() WHERE id = ?', [
-        daysToBill,
-        admId,
-      ]);
-    });
+    await execute('UPDATE admissions SET bed_days_billed = bed_days_billed + ?, last_bed_billed_at = ? WHERE id = ?', [
+      daysToBill,
+      nowSql(),
+      admId,
+    ]);
 
     await writeAuditLog({
       user: req.user,
@@ -4172,9 +5283,13 @@ router.post('/ipd/admissions', requireAuth, requirePermission('ipd.admission.cre
   );
 
   if (initial_medication?.trim()) {
+    const orderRes = await execute(
+      "INSERT INTO medication_orders (admission_id, patient_id, medicine_name, dose, route, frequency, prn, ordered_by) VALUES (?, ?, ?, ?, 'Oral', 'OD', 0, ?)",
+      [resAdm.insertId, Number(patient_id), initial_medication.trim(), initial_dose || 'Per order', req.user!.id]
+    );
     await execute(
-      "INSERT INTO medication_administrations (admission_id, patient_id, medicine_name, dose, scheduled_time, status) VALUES (?, ?, ?, ?, '08:00', 'due')",
-      [resAdm.insertId, Number(patient_id), initial_medication.trim(), initial_dose || 'Per order']
+      "INSERT INTO medication_administrations (admission_id, patient_id, medication_order_id, medicine_name, dose, scheduled_time, status) VALUES (?, ?, ?, ?, ?, '08:00', 'due')",
+      [resAdm.insertId, Number(patient_id), orderRes.insertId, initial_medication.trim(), initial_dose || 'Per order']
     );
   }
 
@@ -4198,6 +5313,178 @@ router.post('/ipd/admissions', requireAuth, requirePermission('ipd.admission.cre
   });
 
   res.status(201).json({ id: resAdm.insertId, admissionNumber: admNum });
+});
+
+router.post('/ipd/admissions/:id/medication-orders', requireAuth, requirePermission('ipd.admission.create', 'prescription.create'), async (req: AuthRequest, res: Response) => {
+  const admId = Number(req.params.id);
+  const { medicine_id, medicine_name, dose, route = 'Oral', frequency = 'BID', prn = false } = req.body || {};
+  if (!medicine_name?.trim() || !dose?.trim()) {
+    return res.status(400).json({ error: 'Medication name and dose are required.' });
+  }
+  const adm = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM admissions WHERE id = ?', [admId]);
+  if (!adm || adm.status === 'discharged') return res.status(404).json({ error: 'Active admission not found.' });
+
+  const scheduleByFreq: Record<string, string[]> = {
+    OD: ['08:00'],
+    BID: ['08:00', '20:00'],
+    TID: ['08:00', '14:00', '20:00'],
+    QID: ['06:00', '12:00', '18:00', '23:00'],
+    STAT: [new Date().toISOString().slice(11, 16)],
+    PRN: ['PRN'],
+  };
+  const slots = prn ? ['PRN'] : scheduleByFreq[String(frequency).toUpperCase()] || ['08:00'];
+
+  const orderId = await withTransaction(async () => {
+    const inserted = await execute(
+      `INSERT INTO medication_orders (admission_id, patient_id, medicine_id, medicine_name, dose, route, frequency, prn, ordered_by, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+      [admId, adm.patient_id, medicine_id ? Number(medicine_id) : null, medicine_name.trim(), dose.trim(), route, frequency, prn ? 1 : 0, req.user!.id]
+    );
+    for (const slot of slots) {
+      await execute(
+        "INSERT INTO medication_administrations (admission_id, patient_id, medication_order_id, medicine_name, dose, scheduled_time, status) VALUES (?, ?, ?, ?, ?, ?, 'due')",
+        [admId, adm.patient_id, inserted.insertId, medicine_name.trim(), `${dose.trim()} (${route})`, slot]
+      );
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'ipd.medication_order.create',
+      entityType: 'medication_order',
+      entityId: inserted.insertId,
+      patientId: adm.patient_id,
+      after: { medicine_name: medicine_name.trim(), dose: dose.trim(), frequency, slots },
+      req,
+    });
+    return inserted.insertId;
+  });
+
+  res.status(201).json({ id: orderId, scheduledSlots: slots });
+});
+
+router.post('/ipd/admissions/:id/rounds', requireAuth, requirePermission('ipd.admission.create', 'visit.update'), async (req: AuthRequest, res: Response) => {
+  const admId = Number(req.params.id);
+  const { subjective, objective, assessment, plan } = req.body || {};
+  if (!assessment?.trim() || !plan?.trim()) {
+    return res.status(400).json({ error: 'Ward round assessment and plan are required.' });
+  }
+  const adm = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM admissions WHERE id = ?', [admId]);
+  if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+
+  const inserted = await execute(
+    `INSERT INTO ward_rounds (admission_id, patient_id, doctor_id, subjective, objective, assessment, plan)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [admId, adm.patient_id, req.user!.id, subjective?.trim() || null, objective?.trim() || null, assessment.trim(), plan.trim()]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'ipd.round.create',
+    entityType: 'ward_round',
+    entityId: inserted.insertId,
+    patientId: adm.patient_id,
+    req,
+  });
+  res.status(201).json({ id: inserted.insertId });
+});
+
+router.post('/ipd/admissions/:id/nursing-notes', requireAuth, requirePermission('ipd.mar.give', 'ipd.bed.assign', 'nursing.procedure.perform'), async (req: AuthRequest, res: Response) => {
+  const admId = Number(req.params.id);
+  const { note_type = 'Shift Note', note } = req.body || {};
+  if (!note?.trim()) return res.status(400).json({ error: 'Nursing note content is required.' });
+  const adm = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM admissions WHERE id = ?', [admId]);
+  if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+
+  const inserted = await execute(
+    'INSERT INTO nursing_notes (admission_id, patient_id, nurse_id, note_type, note) VALUES (?, ?, ?, ?, ?)',
+    [admId, adm.patient_id, req.user!.id, String(note_type).trim(), note.trim()]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'ipd.nursing_note.create',
+    entityType: 'nursing_note',
+    entityId: inserted.insertId,
+    patientId: adm.patient_id,
+    req,
+  });
+  res.status(201).json({ id: inserted.insertId });
+});
+
+router.post('/ipd/admissions/:id/vitals', requireAuth, requirePermission('vitals.create', 'ipd.mar.give'), async (req: AuthRequest, res: Response) => {
+  const admId = Number(req.params.id);
+  const {
+    bp_systolic,
+    bp_diastolic,
+    heart_rate,
+    pulse,
+    respiratory_rate,
+    temperature_c,
+    temperature,
+    spo2,
+    weight_kg,
+    height_cm,
+    notes,
+  } = req.body || {};
+  const adm = await queryOne<{ id: number; patient_id: number; visit_id: number | null }>(
+    'SELECT id, patient_id, visit_id FROM admissions WHERE id = ?',
+    [admId]
+  );
+  if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+
+  const sys = bp_systolic !== undefined && bp_systolic !== '' ? Number(bp_systolic) : null;
+  const dia = bp_diastolic !== undefined && bp_diastolic !== '' ? Number(bp_diastolic) : null;
+  const rawHr = pulse ?? heart_rate;
+  const hr = rawHr !== undefined && rawHr !== '' ? Number(rawHr) : null;
+  const rawTemp = temperature ?? temperature_c;
+  const temp = rawTemp !== undefined && rawTemp !== '' ? Number(rawTemp) : null;
+  const o2 = spo2 !== undefined && spo2 !== '' ? Number(spo2) : null;
+  if (sys !== null && (sys < 40 || sys > 300)) return res.status(400).json({ error: 'Systolic BP out of physiological range (40-300).' });
+  if (dia !== null && (dia < 20 || dia > 200)) return res.status(400).json({ error: 'Diastolic BP out of physiological range (20-200).' });
+  if (sys !== null && dia !== null && sys <= dia) return res.status(400).json({ error: 'Systolic BP must exceed Diastolic BP.' });
+  if (temp !== null && (temp < 25 || temp > 45)) return res.status(400).json({ error: 'Temperature out of range (25-45 °C).' });
+  if (o2 !== null && (o2 < 40 || o2 > 100)) return res.status(400).json({ error: 'SpO2 out of range (40-100%).' });
+  if (hr !== null && (hr < 20 || hr > 260)) return res.status(400).json({ error: 'Heart rate out of range (20-260 bpm).' });
+
+  const w = weight_kg !== undefined && weight_kg !== '' ? Number(weight_kg) : null;
+  const h = height_cm !== undefined && height_cm !== '' ? Number(height_cm) : null;
+  const bmi = w && h && h > 0 ? Number((w / ((h / 100) * (h / 100))).toFixed(1)) : null;
+  const earlyWarning =
+    (o2 !== null && o2 < 92) ||
+    (temp !== null && temp >= 38.5) ||
+    (sys !== null && (sys >= 160 || sys < 90)) ||
+    (hr !== null && (hr > 110 || hr < 50))
+      ? 1
+      : 0;
+
+  const inserted = await execute(
+    `INSERT INTO vitals (visit_id, patient_id, admission_id, bp_systolic, bp_diastolic, pulse, respiratory_rate, temperature, spo2, weight_kg, height_cm, bmi, early_warning_flag, notes, recorded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      adm.visit_id,
+      adm.patient_id,
+      admId,
+      sys,
+      dia,
+      hr,
+      respiratory_rate !== undefined && respiratory_rate !== '' ? Number(respiratory_rate) : null,
+      temp,
+      o2,
+      w,
+      h,
+      bmi,
+      earlyWarning,
+      notes || null,
+      req.user!.id,
+    ]
+  );
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'ipd.vitals.create',
+    entityType: 'vitals',
+    entityId: inserted.insertId,
+    patientId: adm.patient_id,
+    req,
+  });
+  res.status(201).json({ id: inserted.insertId, bmi, earlyWarningFlag: Boolean(earlyWarning) });
 });
 
 router.post('/ipd/admissions/:id/assign-bed', requireAuth, requirePermission('ipd.bed.assign'), async (req: AuthRequest, res: Response) => {
@@ -4261,14 +5548,9 @@ router.post('/ipd/mar/:id/administer', requireAuth, requirePermission('ipd.mar.g
   if (!row) return res.status(404).json({ error: 'MAR entry not found' });
 
   await execute(
-    "UPDATE medication_administrations SET status = ?, reason_not_given = ?, administered_by_name = ?, administered_at = datetime('now') WHERE id = ?",
-    [status, reason_not_given || null, req.user!.fullName, marId]
-  ).catch(async () => {
-    await execute(
-      'UPDATE medication_administrations SET status = ?, reason_not_given = ?, administered_by_name = ?, administered_at = NOW() WHERE id = ?',
-      [status, reason_not_given || null, req.user!.fullName, marId]
-    );
-  });
+    'UPDATE medication_administrations SET status = ?, reason_not_given = ?, administered_by_name = ?, administered_at = ? WHERE id = ?',
+    [status, reason_not_given || null, req.user!.fullName, nowSql(), marId]
+  );
 
   await writeAuditLog({
     user: req.user,
@@ -4320,7 +5602,7 @@ router.post('/ipd/admissions/:id/discharge-order', requireAuth, requirePermissio
   res.json({ ok: true });
 });
 
-router.post('/ipd/admissions/:id/clear', requireAuth, requirePermission('ipd.discharge.clear'), async (req: AuthRequest, res: Response) => {
+router.post('/ipd/admissions/:id/clear', requireAuth, requirePermission('ipd.discharge.clear', 'ipd.discharge.override'), async (req: AuthRequest, res: Response) => {
   const admId = Number(req.params.id);
   const { force_clearance_reason } = req.body || {};
 
@@ -4341,33 +5623,41 @@ router.post('/ipd/admissions/:id/clear', requireAuth, requirePermission('ipd.dis
     );
     if (!adm) return { ok: false as const, error: 'Admission not found', httpStatus: 404 };
 
-    if (adm.patient_type === 'self-pay' && !force_clearance_reason?.trim()) {
-      const daysStayed = Math.max(1, Math.ceil((Date.now() - new Date(adm.admitted_at).getTime()) / 86400000));
-      if (Number(adm.bed_days_billed || 0) < daysStayed) {
-        return {
-          ok: false as const,
-          error: `Unbilled inpatient stay: ${daysStayed - Number(adm.bed_days_billed || 0)} day(s) of bed tariff have not been posted yet. Click "Post Bed Charge" first.`,
-          httpStatus: 409,
-        };
-      }
-      const unpaid = await queryOne<{ bal: number }>(
-        "SELECT COALESCE(SUM(total_amount - paid_amount), 0) AS bal FROM invoices WHERE patient_id = ? AND status IN ('unpaid','partial')",
-        [adm.patient_id]
+    const daysStayed = Math.max(1, Math.ceil((Date.now() - new Date(adm.admitted_at).getTime()) / 86400000));
+    const unbilledDays = Math.max(0, daysStayed - Number(adm.bed_days_billed || 0));
+    const unpaid = await queryOne<{ bal: number }>(
+      "SELECT COALESCE(SUM(total_amount - paid_amount), 0) AS bal FROM invoices WHERE patient_id = ? AND status IN ('unpaid','partial')",
+      [adm.patient_id]
+    );
+    const unpaidBal = Number(unpaid?.bal || 0);
+
+    const hasFinancialGap = (adm.patient_type === 'self-pay' || adm.patient_type === 'credit') && (unbilledDays > 0 || unpaidBal > 0.01);
+    if (hasFinancialGap) {
+      const approvedOverride = await queryOne<{ id: number }>(
+        "SELECT id FROM approval_requests WHERE request_type = 'discharge_override' AND entity_type = 'admission' AND entity_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
+        [admId]
       );
-      if (Number(unpaid?.bal || 0) > 0.01) {
+      const canSelfOverride = hasPermission(req.user!, 'ipd.discharge.override') && Boolean(force_clearance_reason?.trim());
+      if (!approvedOverride && !canSelfOverride) {
+        if (unbilledDays > 0) {
+          return {
+            ok: false as const,
+            error: `Unbilled inpatient stay: ${unbilledDays} day(s) of bed tariff not posted yet. Post Bed Charge or obtain Manager/Finance Discharge Override approval.`,
+            httpStatus: 409,
+          };
+        }
         return {
           ok: false as const,
-          error: `Outstanding balance of $${Number(unpaid?.bal).toFixed(2)} remains unpaid. Collect payment or apply patient deposit before discharge clearance.`,
+          error: `Outstanding balance of $${unpaidBal.toFixed(2)} remains unpaid. Collect payment, apply deposit, or obtain Discharge Override approval.`,
           httpStatus: 402,
         };
       }
     }
 
-    await execute("UPDATE admissions SET discharge_cleared = 1, status = 'discharged', discharged_at = datetime('now') WHERE id = ?", [
+    await execute("UPDATE admissions SET discharge_cleared = 1, status = 'discharged', discharged_at = ? WHERE id = ?", [
+      nowSql(),
       admId,
-    ]).catch(async () => {
-      await execute("UPDATE admissions SET discharge_cleared = 1, status = 'discharged', discharged_at = NOW() WHERE id = ?", [admId]);
-    });
+    ]);
 
     if (adm.bed_id) {
       await execute("UPDATE beds SET status = 'cleaning' WHERE id = ?", [adm.bed_id]);
@@ -4409,7 +5699,7 @@ router.patch('/ipd/beds/:id/status', requireAuth, requirePermission('ipd.bed.ass
 });
 
 // ---------------------------------------------------------------------------
-// SECURE BILLING, SHIFTS, RECEIPTS (REPRINTS) & APPROVALS
+// SECURE BILLING, SHIFTS, RECEIPTS (REPRINTS), BYPASSES & APPROVALS
 // ---------------------------------------------------------------------------
 router.get('/billing/shifts', requireAuth, requirePermission('billing.shift.manage', 'finance.report.view'), async (req: AuthRequest, res: Response) => {
   const isCashierOnly = req.user!.roles.includes('CSH') && !req.user!.roles.includes('ACC') && !req.user!.roles.includes('MGR');
@@ -4470,15 +5760,13 @@ router.post('/billing/shifts/close', requireAuth, requirePermission('billing.shi
     });
   }
 
-  await execute(
-    "UPDATE cashier_shifts SET counted_cash = ?, variance = ?, status = 'closed', closed_at = datetime('now'), notes = ? WHERE id = ?",
-    [counted, variance, notes || null, shift.id]
-  ).catch(async () => {
-    await execute(
-      "UPDATE cashier_shifts SET counted_cash = ?, variance = ?, status = 'closed', closed_at = NOW(), notes = ? WHERE id = ?",
-      [counted, variance, notes || null, shift.id]
-    );
-  });
+  await execute("UPDATE cashier_shifts SET counted_cash = ?, variance = ?, status = 'closed', closed_at = ?, notes = ? WHERE id = ?", [
+    counted,
+    variance,
+    nowSql(),
+    notes || null,
+    shift.id,
+  ]);
 
   if (Math.abs(variance) > 0.01) {
     await createNotification({
@@ -4632,6 +5920,16 @@ router.post('/billing/invoices', requireAuth, requirePermission('billing.invoice
       );
     }
 
+    if (finalTotal > 0 && patient.patient_type !== 'exempt') {
+      await postInvoiceAccrualJE({
+        invoiceId: invRes.insertId,
+        invoiceNumber: invNum,
+        payerType: patient.patient_type,
+        totalAmount: finalTotal,
+        postedBy: req.user!.id,
+      });
+    }
+
     await writeAuditLog({
       user: req.user,
       action: 'billing.invoice.create',
@@ -4655,6 +5953,9 @@ router.post('/billing/payments', requireAuth, requirePermission('billing.payment
   if (!invoice_id || payAmount <= 0) {
     return res.status(400).json({ error: 'Valid invoice_id and positive payment amount are required.' });
   }
+  if (!['cash', 'card', 'mobile_money', 'bank_transfer'].includes(String(payment_method))) {
+    return res.status(400).json({ error: 'Invalid payment method.' });
+  }
 
   const result = await withTransaction(async () => {
     const openShift = await queryOne<{ id: number }>("SELECT id FROM cashier_shifts WHERE cashier_id = ? AND status = 'open'", [
@@ -4664,12 +5965,19 @@ router.post('/billing/payments', requireAuth, requirePermission('billing.payment
       return { ok: false as const, error: 'You must open a Cashier Shift before collecting payments.', httpStatus: 409 };
     }
 
-    const inv = await queryOne<{ id: number; invoice_number: string; patient_id: number; total_amount: number; paid_amount: number; status: string }>(
-      'SELECT * FROM invoices WHERE id = ?',
-      [invoice_id]
-    );
+    const inv = await queryOne<{
+      id: number;
+      invoice_number: string;
+      patient_id: number;
+      payer_type: string;
+      total_amount: number;
+      paid_amount: number;
+      status: string;
+    }>('SELECT * FROM invoices WHERE id = ?', [invoice_id]);
     if (!inv) return { ok: false as const, error: 'Invoice not found', httpStatus: 404 };
-    if (inv.status === 'voided') return { ok: false as const, error: 'Cannot pay a voided invoice.', httpStatus: 409 };
+    if (inv.status === 'voided' || inv.status === 'refunded') {
+      return { ok: false as const, error: `Cannot pay a ${inv.status} invoice.`, httpStatus: 409 };
+    }
 
     const remaining = Number((Number(inv.total_amount) - Number(inv.paid_amount)).toFixed(2));
     if (payAmount > remaining + 0.01) {
@@ -4697,28 +6005,24 @@ router.post('/billing/payments', requireAuth, requirePermission('billing.payment
       await execute('UPDATE cashier_shifts SET expected_cash = expected_cash + ? WHERE id = ?', [payAmount, openShift.id]);
     }
 
-    // Automated double-entry GL posting for collected revenue
-    const invFull = await queryOne<{ payer_type: string }>('SELECT payer_type FROM invoices WHERE id = ?', [inv.id]);
     const cashOrBankAcct = payment_method === 'cash' ? '1010' : '1020';
-    let creditAcct = '4010';
-    if (invFull?.payer_type === 'insurance' || invFull?.payer_type === 'credit') {
-      creditAcct = '1100';
-    } else {
-      const firstItem = await queryOne<{ category: string }>(
-        'SELECT category FROM invoice_items WHERE invoice_id = ? ORDER BY line_total DESC LIMIT 1',
-        [inv.id]
-      );
-      if (firstItem) creditAcct = revenueAccountForCategory(firstItem.category);
-    }
+    const hasAccrual = await hasInvoiceAccrualJE(inv.id);
+    const creditLines = hasAccrual
+      ? [
+          {
+            accountCode: inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? '1100' : '1150',
+            credit: payAmount,
+            memo: inv.invoice_number,
+          },
+        ]
+      : await buildPerLineRevenueLines(inv.id, payAmount, 'credit', inv.invoice_number);
+
     await postJournalEntry({
       sourceType: 'payment',
       sourceId: payRes.insertId,
       description: `Cashier payment ${receiptNumber} for ${inv.invoice_number}`,
       postedBy: req.user!.id,
-      lines: [
-        { accountCode: cashOrBankAcct, debit: payAmount, memo: `${payment_method} receipt ${receiptNumber}` },
-        { accountCode: creditAcct, credit: payAmount, memo: inv.invoice_number },
-      ],
+      lines: [{ accountCode: cashOrBankAcct, debit: payAmount, memo: `${payment_method} receipt ${receiptNumber}` }, ...creditLines],
     });
 
     let gatesUnlocked = { unlockedConsultVisits: 0, unlockedRx: 0, unlockedLab: 0, unlockedImaging: 0 };
@@ -4847,14 +6151,19 @@ router.post('/billing/deposits/:id/apply', requireAuth, requirePermission('billi
       return { ok: false as const, error: 'Active deposit with positive balance not found.', httpStatus: 404 };
     }
 
-    const inv = await queryOne<{ id: number; invoice_number: string; patient_id: number; total_amount: number; paid_amount: number; status: string }>(
-      'SELECT * FROM invoices WHERE id = ?',
-      [Number(invoice_id)]
-    );
+    const inv = await queryOne<{
+      id: number;
+      invoice_number: string;
+      patient_id: number;
+      payer_type: string;
+      total_amount: number;
+      paid_amount: number;
+      status: string;
+    }>('SELECT * FROM invoices WHERE id = ?', [Number(invoice_id)]);
     if (!inv || inv.patient_id !== dep.patient_id) {
       return { ok: false as const, error: 'Matching patient invoice not found.', httpStatus: 404 };
     }
-    if (inv.status === 'paid' || inv.status === 'voided') {
+    if (inv.status === 'paid' || inv.status === 'voided' || inv.status === 'refunded') {
       return { ok: false as const, error: 'Invoice is already settled or voided.', httpStatus: 409 };
     }
 
@@ -4871,20 +6180,23 @@ router.post('/billing/deposits/:id/apply', requireAuth, requirePermission('billi
     ]);
     await execute('UPDATE invoices SET paid_amount = ?, status = ? WHERE id = ?', [newPaid, newInvStatus, inv.id]);
 
-    const topItem = await queryOne<{ category: string }>(
-      'SELECT category FROM invoice_items WHERE invoice_id = ? ORDER BY line_total DESC LIMIT 1',
-      [inv.id]
-    );
-    const revAcct = topItem ? revenueAccountForCategory(topItem.category) : '4040';
+    const hasAccrual = await hasInvoiceAccrualJE(inv.id);
+    const creditLines = hasAccrual
+      ? [
+          {
+            accountCode: inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? '1100' : '1150',
+            credit: applyAmt,
+            memo: inv.invoice_number,
+          },
+        ]
+      : await buildPerLineRevenueLines(inv.id, applyAmt, 'credit', inv.invoice_number);
+
     await postJournalEntry({
       sourceType: 'deposit_apply',
       sourceId: inv.id,
       description: `Apply deposit ${dep.deposit_number} to ${inv.invoice_number}`,
       postedBy: req.user!.id,
-      lines: [
-        { accountCode: '2010', debit: applyAmt, memo: dep.deposit_number },
-        { accountCode: revAcct, credit: applyAmt, memo: inv.invoice_number },
-      ],
+      lines: [{ accountCode: '2010', debit: applyAmt, memo: dep.deposit_number }, ...creditLines],
     });
 
     let gatesUnlocked = { unlockedConsultVisits: 0, unlockedRx: 0, unlockedLab: 0, unlockedImaging: 0 };
@@ -4957,35 +6269,86 @@ router.post('/billing/receipts/:receiptNumber/reprint', requireAuth, requirePerm
   res.json({ reprintCount: nextCount });
 });
 
+router.get('/billing/bypasses', requireAuth, requirePermission('billing.invoice.read', 'finance.report.view', 'audit.read'), async (_req, res) => {
+  const bypasses = await query(
+    `SELECT pgb.*, p.mrn, p.first_name, p.last_name, v.visit_number,
+            u1.full_name AS set_by_name, u2.full_name AS resolved_by_name
+     FROM payment_gate_bypasses pgb
+     INNER JOIN patients p ON p.id = pgb.patient_id
+     LEFT JOIN visits v ON v.id = pgb.visit_id
+     LEFT JOIN users u1 ON u1.id = pgb.set_by
+     LEFT JOIN users u2 ON u2.id = pgb.resolved_by
+     ORDER BY CASE WHEN pgb.follow_up_status = 'pending_billing' THEN 0 ELSE 1 END, pgb.id DESC
+     LIMIT 80`
+  );
+  res.json({ bypasses });
+});
+
+router.post('/billing/bypasses/:id/resolve', requireAuth, requirePermission('billing.invoice.create', 'billing.payment.create', 'finance.report.view'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const resolutionNote = String(req.body?.resolution_note || 'Settled / billed post-emergency').trim();
+  const row = await queryOne<{ id: number; patient_id: number; follow_up_status: string }>(
+    'SELECT id, patient_id, follow_up_status FROM payment_gate_bypasses WHERE id = ?',
+    [id]
+  );
+  if (!row) return res.status(404).json({ error: 'Bypass record not found' });
+  if (row.follow_up_status === 'resolved') return res.status(409).json({ error: 'Bypass already resolved.' });
+
+  await execute(
+    "UPDATE payment_gate_bypasses SET follow_up_status = 'resolved', resolved_by = ?, resolution_note = ?, resolved_at = ? WHERE id = ?",
+    [req.user!.id, resolutionNote, nowSql(), id]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'payment.gate.bypass.resolved',
+    entityType: 'payment_gate_bypass',
+    entityId: id,
+    patientId: row.patient_id,
+    reason: resolutionNote,
+    req,
+  });
+  res.json({ ok: true });
+});
+
 router.get('/billing/approvals', requireAuth, requirePermission('billing.approval.request', 'billing.approval.decide', 'finance.report.view'), async (_req, res) => {
   const approvals = await query(
     `SELECT ar.*, u1.full_name AS requested_by_name, u2.full_name AS decided_by_name,
-            i.invoice_number, i.total_amount, p.first_name, p.last_name, p.mrn
+            i.invoice_number, i.total_amount, a.admission_number,
+            COALESCE(p.first_name, p2.first_name, p3.first_name) AS first_name,
+            COALESCE(p.last_name, p2.last_name, p3.last_name) AS last_name,
+            COALESCE(p.mrn, p2.mrn, p3.mrn) AS mrn
      FROM approval_requests ar
      INNER JOIN users u1 ON u1.id = ar.requested_by
      LEFT JOIN users u2 ON u2.id = ar.decided_by
      LEFT JOIN invoices i ON ar.entity_type = 'invoice' AND i.id = ar.entity_id
      LEFT JOIN patients p ON p.id = i.patient_id
-     ORDER BY ar.id DESC LIMIT 40`
+     LEFT JOIN admissions a ON ar.entity_type = 'admission' AND a.id = ar.entity_id
+     LEFT JOIN patients p2 ON p2.id = a.patient_id
+     LEFT JOIN patients p3 ON ar.entity_type = 'patient' AND p3.id = ar.entity_id
+     ORDER BY ar.id DESC LIMIT 50`
   );
   res.json({ approvals });
 });
 
 router.post('/billing/approvals', requireAuth, requirePermission('billing.approval.request'), async (req: AuthRequest, res: Response) => {
-  const { request_type, entity_id, requested_amount, reason } = req.body || {};
-  if (!request_type || !entity_id || !reason?.trim()) {
-    return res.status(400).json({ error: 'Request type, invoice ID, and formal reason are required.' });
+  const { request_type, entity_type, entity_id, requested_amount, reason } = req.body || {};
+  const allowedTypes = ['discount', 'refund', 'void_invoice', 'discharge_override', 'payer_exempt'];
+  if (!allowedTypes.includes(String(request_type)) || !entity_id || !reason?.trim()) {
+    return res.status(400).json({ error: 'Valid request type, target entity ID, and formal reason are required.' });
   }
+  const resolvedEntityType =
+    entity_type || (request_type === 'discharge_override' ? 'admission' : request_type === 'payer_exempt' ? 'patient' : 'invoice');
+
   const inserted = await execute(
     `INSERT INTO approval_requests (request_type, entity_type, entity_id, requested_amount, reason, status, requested_by)
-     VALUES (?, 'invoice', ?, ?, ?, 'pending', ?)`,
-    [request_type, entity_id, requested_amount ? Number(requested_amount) : null, reason.trim(), req.user!.id]
+     VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+    [request_type, resolvedEntityType, Number(entity_id), requested_amount ? Number(requested_amount) : null, reason.trim(), req.user!.id]
   );
 
   await createNotification({
-    targetRole: 'ACC',
-    title: `Approval Needed: ${request_type.replace('_', ' ')}`,
-    message: `${req.user!.fullName} requested ${request_type.replace('_', ' ')} on invoice #${entity_id}.`,
+    targetRole: request_type === 'discharge_override' ? 'MGR' : 'ACC',
+    title: `Approval Needed: ${String(request_type).replace(/_/g, ' ')}`,
+    message: `${req.user!.fullName} requested ${String(request_type).replace(/_/g, ' ')} on ${resolvedEntityType} #${entity_id}.`,
     severity: 'warning',
     entityType: 'approval_request',
     entityId: inserted.insertId,
@@ -4996,7 +6359,7 @@ router.post('/billing/approvals', requireAuth, requirePermission('billing.approv
     action: 'billing.approval.request',
     entityType: 'approval_request',
     entityId: inserted.insertId,
-    after: { request_type, invoice_id: entity_id, requested_amount },
+    after: { request_type, entity_type: resolvedEntityType, entity_id, requested_amount },
     reason: reason.trim(),
     req,
   });
@@ -5014,8 +6377,10 @@ router.post('/billing/approvals/:id/decide', requireAuth, requirePermission('bil
     const reqRow = await queryOne<{
       id: number;
       request_type: string;
+      entity_type: string;
       entity_id: number;
       requested_amount: number | null;
+      reason: string;
       requested_by: number;
       status: string;
     }>('SELECT * FROM approval_requests WHERE id = ?', [id]);
@@ -5032,87 +6397,161 @@ router.post('/billing/approvals/:id/decide', requireAuth, requirePermission('bil
         reason: 'Attempted self-approval',
         req,
       });
-      return {
-        ok: false as const,
-        error: 'Segregation of Duties Violation: You cannot approve your own discount, refund, or void request.',
-        httpStatus: 403,
-      };
+      assertDifferentUser(req.user!.id, reqRow.requested_by, 'approval request');
     }
 
-    await execute(
-      "UPDATE approval_requests SET status = ?, decided_by = ?, decision_note = ?, decided_at = datetime('now') WHERE id = ?",
-      [decision, req.user!.id, decision_note || null, id]
-    ).catch(async () => {
-      await execute('UPDATE approval_requests SET status = ?, decided_by = ?, decision_note = ?, decided_at = NOW() WHERE id = ?', [
-        decision,
-        req.user!.id,
-        decision_note || null,
-        id,
-      ]);
-    });
+    await execute('UPDATE approval_requests SET status = ?, decided_by = ?, decision_note = ?, decided_at = ? WHERE id = ?', [
+      decision,
+      req.user!.id,
+      decision_note || null,
+      nowSql(),
+      id,
+    ]);
 
     if (decision === 'approved') {
-      const inv = await queryOne<{
-        id: number;
-        invoice_number: string;
-        patient_id: number;
-        payer_type: string;
-        subtotal: number;
-        discount_amount: number;
-        paid_amount: number;
-      }>(
-        'SELECT id, invoice_number, patient_id, payer_type, subtotal, discount_amount, paid_amount FROM invoices WHERE id = ?',
-        [reqRow.entity_id]
-      );
-      if (inv) {
-        if (reqRow.request_type === 'discount' && reqRow.requested_amount) {
-          const disc = Math.min(Number(inv.subtotal), Number(inv.discount_amount || 0) + Number(reqRow.requested_amount));
-          const newTotal = Number((Number(inv.subtotal) - disc).toFixed(2));
-          const unpaidStatus = inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? 'credit_billed' : 'unpaid';
-          const newStatus = Number(inv.paid_amount) >= newTotal ? 'paid' : Number(inv.paid_amount) > 0 ? 'partial' : unpaidStatus;
-          await execute('UPDATE invoices SET discount_amount = ?, total_amount = ?, status = ? WHERE id = ?', [
-            disc,
-            newTotal,
-            newStatus,
-            inv.id,
-          ]);
-          if (newStatus === 'paid') {
-            await unlockPaidInvoiceGates({
-              invoiceId: inv.id,
-              invoiceNumber: inv.invoice_number,
-              userId: req.user!.id,
+      if (reqRow.entity_type === 'invoice') {
+        const inv = await queryOne<{
+          id: number;
+          invoice_number: string;
+          patient_id: number;
+          payer_type: string;
+          subtotal: number;
+          discount_amount: number;
+          total_amount: number;
+          paid_amount: number;
+        }>(
+          'SELECT id, invoice_number, patient_id, payer_type, subtotal, discount_amount, total_amount, paid_amount FROM invoices WHERE id = ?',
+          [reqRow.entity_id]
+        );
+        if (inv) {
+          const hasAccrual = await hasInvoiceAccrualJE(inv.id);
+          const receivableAcct = inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? '1100' : '1150';
+
+          if (reqRow.request_type === 'discount' && reqRow.requested_amount) {
+            const reqDisc = Math.min(Number(inv.subtotal) - Number(inv.discount_amount || 0), Number(reqRow.requested_amount));
+            const disc = Number((Number(inv.discount_amount || 0) + reqDisc).toFixed(2));
+            const newTotal = Number((Number(inv.subtotal) - disc).toFixed(2));
+            const unpaidStatus = inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? 'credit_billed' : 'unpaid';
+            const newStatus = Number(inv.paid_amount) >= newTotal ? 'paid' : Number(inv.paid_amount) > 0 ? 'partial' : unpaidStatus;
+            await execute('UPDATE invoices SET discount_amount = ?, total_amount = ?, status = ? WHERE id = ?', [
+              disc,
+              newTotal,
+              newStatus,
+              inv.id,
+            ]);
+            if (reqDisc > 0 && hasAccrual) {
+              const revDebits = await buildPerLineRevenueLines(inv.id, reqDisc, 'debit', `Discount ${inv.invoice_number}`);
+              await postJournalEntry({
+                sourceType: 'discount',
+                sourceId: reqRow.id,
+                description: `Approved discount on ${inv.invoice_number}`,
+                postedBy: req.user!.id,
+                lines: [...revDebits, { accountCode: receivableAcct, credit: reqDisc, memo: inv.invoice_number }],
+              });
+            }
+            if (newStatus === 'paid') {
+              await unlockPaidInvoiceGates({
+                invoiceId: inv.id,
+                invoiceNumber: inv.invoice_number,
+                userId: req.user!.id,
+              });
+            }
+          } else if (reqRow.request_type === 'refund' && Number(inv.paid_amount) > 0) {
+            const refundAmt = Number(Math.min(Number(reqRow.requested_amount || inv.paid_amount), Number(inv.paid_amount)).toFixed(2));
+            const lastPay = await queryOne<{ id: number; payment_method: string }>(
+              "SELECT id, payment_method FROM payments WHERE invoice_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
+              [inv.id]
+            );
+            const refundMethod = lastPay?.payment_method || 'cash';
+            const linkedReceipt = lastPay
+              ? await queryOne<{ id: number }>('SELECT id FROM receipts WHERE payment_id = ? LIMIT 1', [lastPay.id])
+              : null;
+
+            let shiftId: number | null = null;
+            if (refundMethod === 'cash') {
+              const openShift = await queryOne<{ id: number }>("SELECT id FROM cashier_shifts WHERE status = 'open' ORDER BY id DESC LIMIT 1");
+              if (!openShift) {
+                return {
+                  ok: false as const,
+                  error: 'An open cashier shift is required to process cash refund reversals.',
+                  httpStatus: 409,
+                };
+              }
+              shiftId = openShift.id;
+              await execute('UPDATE cashier_shifts SET expected_cash = expected_cash - ? WHERE id = ?', [refundAmt, openShift.id]);
+            }
+
+            const cnNumber = await nextSequence('CN');
+            await execute(
+              "INSERT INTO payments (invoice_id, patient_id, shift_id, amount, payment_method, reference_number, status, created_by) VALUES (?, ?, ?, ?, ?, ?, 'refunded', ?)",
+              [inv.id, inv.patient_id, shiftId, -refundAmt, refundMethod, cnNumber, req.user!.id]
+            );
+            const revDebits = await buildPerLineRevenueLines(inv.id, refundAmt, 'debit', `Credit Note ${cnNumber}`);
+            const je = await postJournalEntry({
+              sourceType: 'refund',
+              sourceId: inv.id,
+              description: `Refund Credit Note ${cnNumber} (${inv.invoice_number})`,
+              postedBy: req.user!.id,
+              lines: [
+                ...revDebits,
+                { accountCode: refundMethod === 'cash' ? '1010' : '1020', credit: refundAmt, memo: cnNumber },
+              ],
             });
+            await execute(
+              `INSERT INTO credit_notes (credit_note_number, original_payment_id, receipt_id, invoice_id, patient_id, amount, payment_method, shift_id, journal_entry_id, reason, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [cnNumber, lastPay?.id ?? null, linkedReceipt?.id ?? null, inv.id, inv.patient_id, refundAmt, refundMethod, shiftId, je.entryId, reqRow.reason, req.user!.id]
+            );
+            const remPaid = Number((Number(inv.paid_amount) - refundAmt).toFixed(2));
+            await execute("UPDATE invoices SET paid_amount = ?, status = CASE WHEN ? <= 0 THEN 'refunded' ELSE 'partial' END WHERE id = ?", [
+              remPaid,
+              remPaid,
+              inv.id,
+            ]);
+          } else if (reqRow.request_type === 'void_invoice') {
+            if (Number(inv.paid_amount) > 0) {
+              return {
+                ok: false as const,
+                error: 'Paid invoices cannot be voided directly. Submit a Refund approval request instead.',
+                httpStatus: 409,
+              };
+            }
+            await execute("UPDATE invoices SET status = 'voided' WHERE id = ?", [inv.id]);
+            await execute("UPDATE lab_orders SET status = 'cancelled' WHERE invoice_id = ? AND status IN ('ordered','collected')", [inv.id]);
+            await execute("UPDATE imaging_orders SET status = 'cancelled' WHERE invoice_id = ? AND status IN ('ordered','scheduled')", [inv.id]);
+            await execute("UPDATE prescriptions SET status = 'cancelled' WHERE invoice_id = ? AND status IN ('draft','pending_payment','pending')", [inv.id]);
+            await execute("UPDATE nursing_procedures SET status = 'cancelled' WHERE invoice_id = ? AND status = 'ordered'", [inv.id]);
+
+            if (hasAccrual && Number(inv.total_amount) > 0) {
+              const amt = Number(inv.total_amount);
+              const revDebits = await buildPerLineRevenueLines(inv.id, amt, 'debit', `Void ${inv.invoice_number}`);
+              await postJournalEntry({
+                sourceType: 'void_invoice',
+                sourceId: inv.id,
+                description: `Void unpaid invoice ${inv.invoice_number}`,
+                postedBy: req.user!.id,
+                lines: [...revDebits, { accountCode: receivableAcct, credit: amt, memo: inv.invoice_number }],
+              });
+            }
           }
-        } else if (reqRow.request_type === 'refund' && Number(inv.paid_amount) > 0) {
-          const refundAmt = Math.min(Number(reqRow.requested_amount || inv.paid_amount), Number(inv.paid_amount));
-          const openShift = await queryOne<{ id: number }>("SELECT id FROM cashier_shifts WHERE status = 'open' ORDER BY id DESC LIMIT 1");
-          if (!openShift) {
-            return {
-              ok: false as const,
-              error: 'An open cashier shift is required to process cash refund reversals.',
-              httpStatus: 409,
-            };
-          }
+        }
+      } else if (reqRow.entity_type === 'admission' && reqRow.request_type === 'discharge_override') {
+        await createNotification({
+          targetRole: 'WRD',
+          title: 'Discharge Override Approved',
+          message: `Financial override approved for Admission #${reqRow.entity_id}. Cashier can now clear discharge.`,
+          severity: 'info',
+          entityType: 'admission',
+          entityId: reqRow.entity_id,
+        });
+      } else if (reqRow.entity_type === 'patient' && reqRow.request_type === 'payer_exempt') {
+        const pat = await queryOne<{ id: number; patient_type: string }>('SELECT id, patient_type FROM patients WHERE id = ?', [reqRow.entity_id]);
+        if (pat) {
+          await execute("UPDATE patients SET patient_type = 'exempt', payer_name = 'Exempt / Charity Care' WHERE id = ?", [pat.id]);
           await execute(
-            "INSERT INTO payments (invoice_id, patient_id, shift_id, amount, payment_method, reference_number, status, created_by) VALUES (?, ?, ?, ?, 'cash', 'REFUND-REV', 'refunded', ?)",
-            [inv.id, inv.patient_id, openShift.id, -refundAmt, req.user!.id]
+            "INSERT INTO patient_payer_history (patient_id, from_type, to_type, payer_name, reason, changed_by, approved_by) VALUES (?, ?, 'exempt', 'Exempt / Charity Care', ?, ?, ?)",
+            [pat.id, pat.patient_type, reqRow.reason, reqRow.requested_by, req.user!.id]
           );
-          await execute('UPDATE cashier_shifts SET expected_cash = expected_cash - ? WHERE id = ?', [refundAmt, openShift.id]);
-          const remPaid = Number((Number(inv.paid_amount) - refundAmt).toFixed(2));
-          await execute("UPDATE invoices SET paid_amount = ?, status = CASE WHEN ? <= 0 THEN 'voided' ELSE 'partial' END WHERE id = ?", [
-            remPaid,
-            remPaid,
-            inv.id,
-          ]);
-        } else if (reqRow.request_type === 'void_invoice') {
-          if (Number(inv.paid_amount) > 0) {
-            return {
-              ok: false as const,
-              error: 'Paid invoices cannot be voided directly. Submit a Refund approval request instead.',
-              httpStatus: 409,
-            };
-          }
-          await execute("UPDATE invoices SET status = 'voided' WHERE id = ?", [inv.id]);
         }
       }
     }
@@ -5120,7 +6559,7 @@ router.post('/billing/approvals/:id/decide', requireAuth, requirePermission('bil
     await createNotification({
       targetRole: 'CSH',
       title: `Request ${decision}`,
-      message: `${reqRow.request_type.replace('_', ' ')} request #${id} was ${decision}.`,
+      message: `${reqRow.request_type.replace(/_/g, ' ')} request #${id} was ${decision}.`,
       severity: decision === 'approved' ? 'info' : 'warning',
       entityType: 'approval_request',
       entityId: id,
@@ -5160,16 +6599,50 @@ router.get('/admin/roles', requireAuth, requirePermission('admin.role.manage', '
      FROM role_permissions rp
      INNER JOIN permissions p ON p.id = rp.permission_id`
   );
-  res.json({ roles, rolePerms });
+  const allPermissions = await query('SELECT id, code, module, description FROM permissions ORDER BY module ASC, code ASC');
+  res.json({ roles, rolePerms, allPermissions });
+});
+
+router.put('/admin/roles/:code/permissions', requireAuth, requirePermission('admin.role.manage'), async (req: AuthRequest, res: Response) => {
+  const roleCode = String(req.params.code || '').trim().toUpperCase();
+  const permissionCodes: string[] = Array.isArray(req.body?.permission_codes) ? req.body.permission_codes : [];
+  const role = await queryOne<{ id: number; code: string }>('SELECT id, code FROM roles WHERE code = ?', [roleCode]);
+  if (!role) return res.status(404).json({ error: 'Role not found' });
+
+  const cleanCodes = [...new Set(permissionCodes.map((c) => String(c).trim()).filter(Boolean))];
+  const permRows =
+    cleanCodes.length > 0
+      ? await query<{ id: number; code: string }>(
+          `SELECT id, code FROM permissions WHERE code IN (${cleanCodes.map(() => '?').join(',')})`,
+          cleanCodes
+        )
+      : [];
+
+  await withTransaction(async () => {
+    await execute('DELETE FROM role_permissions WHERE role_id = ?', [role.id]);
+    for (const p of permRows) {
+      await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [role.id, p.id, 'all']);
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'admin.role.permissions.update',
+      entityType: 'role',
+      entityId: role.id,
+      after: { roleCode, permissionCount: permRows.length, permissionCodes: permRows.map((p) => p.code) },
+      req,
+    });
+  });
+
+  res.json({ ok: true, roleCode, permissionCount: permRows.length });
 });
 
 router.get('/admin/users', requireAuth, requirePermission('admin.user.manage', 'audit.read', 'hr.manage'), async (_req, res) => {
   const users = await query(
-    `SELECT u.id, u.full_name, u.email, u.specialty, u.active, u.must_change_password, u.two_fa_enabled, u.last_login_at, u.created_at,
-            r.code AS role_code, r.name AS role_name
+    `SELECT u.id, u.full_name, u.email, u.specialty, u.active, u.must_change_password, u.two_fa_enabled,
+            u.failed_attempts, u.locked_until, u.last_login_at, u.created_at,
+            COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_code,
+            COALESCE((SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_name
      FROM users u
-     LEFT JOIN user_roles ur ON ur.user_id = u.id
-     LEFT JOIN roles r ON r.id = ur.role_id
      ORDER BY u.id ASC`
   );
   res.json({ users });
@@ -5195,35 +6668,119 @@ router.get('/admin/deployment-status', requireAuth, requirePermission('admin.use
 });
 
 router.post('/admin/users', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
-  const { full_name, email, password, role_code, specialty, two_fa_enabled } = req.body || {};
-  if (!full_name || !email || !password || !role_code) {
-    return res.status(400).json({ error: 'Full name, email, temporary password, and role are required.' });
+  const { full_name, email, password, role_code, role_codes, specialty, two_fa_enabled } = req.body || {};
+  const requestedRoles: string[] = Array.isArray(role_codes) && role_codes.length > 0
+    ? role_codes.map((c: unknown) => String(c).trim().toUpperCase()).filter(Boolean)
+    : role_code
+      ? [String(role_code).trim().toUpperCase()]
+      : [];
+
+  if (!full_name || !email || !password || requestedRoles.length === 0) {
+    return res.status(400).json({ error: 'Full name, email, temporary password, and at least one role are required.' });
   }
-  const role = await queryOne<{ id: number }>('SELECT id FROM roles WHERE code = ?', [role_code]);
-  if (!role) return res.status(400).json({ error: 'Invalid role code' });
+  const roleRows = await query<{ id: number; code: string }>(
+    `SELECT id, code FROM roles WHERE code IN (${requestedRoles.map(() => '?').join(',')})`,
+    requestedRoles
+  );
+  if (roleRows.length !== new Set(requestedRoles).size) {
+    return res.status(400).json({ error: 'One or more invalid role codes.' });
+  }
 
   const normalizedEmail = String(email).trim().toLowerCase();
   const existing = await queryOne<{ id: number }>('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
   if (existing) return res.status(409).json({ error: 'A user with this email already exists.' });
 
-  const enforce2fa = two_fa_enabled !== undefined ? (two_fa_enabled ? 1 : 0) : ['ADM', 'ACC', 'MGR'].includes(role_code) ? 1 : 0;
+  const hasPrivilegedRole = requestedRoles.some((c) => ['ADM', 'ACC', 'MGR'].includes(c));
+  const enforce2fa = two_fa_enabled !== undefined ? (two_fa_enabled ? 1 : 0) : hasPrivilegedRole ? 1 : 0;
   const hash = await bcrypt.hash(String(password), 10);
-  const inserted = await execute(
-    'INSERT INTO users (branch_id, full_name, email, password_hash, specialty, must_change_password, two_fa_enabled) VALUES (1, ?, ?, ?, ?, 1, ?)',
-    [full_name.trim(), normalizedEmail, hash, specialty || null, enforce2fa]
-  );
-  await execute('INSERT INTO user_roles (user_id, role_id, branch_id) VALUES (?, ?, 1)', [inserted.insertId, role.id]);
 
-  await writeAuditLog({
-    user: req.user,
-    action: 'admin.user.create',
-    entityType: 'user',
-    entityId: inserted.insertId,
-    after: { email: normalizedEmail, role_code, must_change_password: true, two_fa_enabled: Boolean(enforce2fa) },
-    req,
+  const insertedId = await withTransaction(async () => {
+    const inserted = await execute(
+      'INSERT INTO users (branch_id, full_name, email, password_hash, specialty, must_change_password, two_fa_enabled) VALUES (1, ?, ?, ?, ?, 1, ?)',
+      [full_name.trim(), normalizedEmail, hash, specialty || null, enforce2fa]
+    );
+    for (const r of roleRows) {
+      await execute('INSERT INTO user_roles (user_id, role_id, branch_id) VALUES (?, ?, 1)', [inserted.insertId, r.id]);
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'admin.user.create',
+      entityType: 'user',
+      entityId: inserted.insertId,
+      after: { email: normalizedEmail, roles: requestedRoles, must_change_password: true, two_fa_enabled: Boolean(enforce2fa) },
+      req,
+    });
+    return inserted.insertId;
   });
 
-  res.status(201).json({ id: inserted.insertId });
+  res.status(201).json({ id: insertedId });
+});
+
+router.put('/admin/users/:id/roles', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const roleCodes: string[] = Array.isArray(req.body?.role_codes)
+    ? [...new Set<string>((req.body.role_codes as unknown[]).map((c) => String(c).trim().toUpperCase()).filter(Boolean))]
+    : [];
+  if (roleCodes.length === 0) {
+    return res.status(400).json({ error: 'At least one role_code must be assigned.' });
+  }
+  if (targetId === req.user!.id && !roleCodes.includes('ADM')) {
+    return res.status(409).json({ error: 'Administrators cannot remove their own ADM role.' });
+  }
+
+  const target = await queryOne<{ id: number; email: string }>('SELECT id, email FROM users WHERE id = ?', [targetId]);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+
+  const roleRows = await query<{ id: number; code: string }>(
+    `SELECT id, code FROM roles WHERE code IN (${roleCodes.map(() => '?').join(',')})`,
+    roleCodes
+  );
+  if (roleRows.length !== roleCodes.length) {
+    return res.status(400).json({ error: 'One or more role codes do not exist.' });
+  }
+
+  await withTransaction(async () => {
+    const prevRoles = await query<{ code: string }>(
+      'SELECT r.code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ?',
+      [targetId]
+    );
+    await execute('DELETE FROM user_roles WHERE user_id = ?', [targetId]);
+    for (const r of roleRows) {
+      await execute('INSERT INTO user_roles (user_id, role_id, branch_id) VALUES (?, ?, 1)', [targetId, r.id]);
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'admin.user.roles.update',
+      entityType: 'user',
+      entityId: targetId,
+      before: { roles: prevRoles.map((r) => r.code) },
+      after: { roles: roleCodes },
+      req,
+    });
+  });
+
+  res.json({ ok: true, roles: roleCodes });
+});
+
+router.post('/admin/users/:id/unlock', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const target = await queryOne<{ id: number; email: string; failed_attempts: number; locked_until: string | null }>(
+    'SELECT id, email, failed_attempts, locked_until FROM users WHERE id = ?',
+    [targetId]
+  );
+  if (!target) return res.status(404).json({ error: 'User not found' });
+
+  await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?', [targetId]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.user.unlock',
+    entityType: 'user',
+    entityId: targetId,
+    before: { failed_attempts: target.failed_attempts, locked_until: target.locked_until },
+    after: { failed_attempts: 0, locked_until: null },
+    req,
+  });
+  res.json({ ok: true });
 });
 
 router.patch('/admin/users/:id/toggle', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
@@ -5254,6 +6811,13 @@ router.patch('/admin/users/:id/toggle', requireAuth, requirePermission('admin.us
 
 router.get('/audit-logs', requireAuth, requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
   const actionFilter = req.query.action ? String(req.query.action).trim() : '';
+  const entityType = req.query.entity_type ? String(req.query.entity_type).trim() : '';
+  const userId = req.query.user_id ? Number(req.query.user_id) : null;
+  const fromDate = req.query.from ? String(req.query.from).slice(0, 10) : '';
+  const toDate = req.query.to ? String(req.query.to).slice(0, 10) : '';
+  const limit = Math.min(250, Math.max(10, Number(req.query.limit || 120)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
   let sql = 'SELECT * FROM audit_logs WHERE 1=1';
   const params: unknown[] = [];
   if (actionFilter) {
@@ -5261,7 +6825,23 @@ router.get('/audit-logs', requireAuth, requirePermission('audit.read'), async (r
     const like = `%${actionFilter}%`;
     params.push(like, like, like);
   }
-  sql += ' ORDER BY id DESC LIMIT 120';
+  if (entityType) {
+    sql += ' AND entity_type = ?';
+    params.push(entityType);
+  }
+  if (userId) {
+    sql += ' AND user_id = ?';
+    params.push(userId);
+  }
+  if (fromDate) {
+    sql += ' AND occurred_at >= ?';
+    params.push(`${fromDate} 00:00:00`);
+  }
+  if (toDate) {
+    sql += ' AND occurred_at <= ?';
+    params.push(`${toDate} 23:59:59`);
+  }
+  sql += ` ORDER BY id DESC LIMIT ${limit} OFFSET ${offset}`;
   const logs = await query(sql, params);
 
   const lastViewed = lastAuditViewByUser.get(req.user!.id) || 0;
@@ -5277,6 +6857,53 @@ router.get('/audit-logs', requireAuth, requirePermission('audit.read'), async (r
   }
 
   res.json({ logs });
+});
+
+router.get('/audit-logs/export', requireAuth, requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
+  const fromDate = req.query.from ? String(req.query.from).slice(0, 10) : '2020-01-01';
+  const toDate = req.query.to ? String(req.query.to).slice(0, 10) : '2099-12-31';
+  const rows = await query<{
+    id: number;
+    occurred_at: string;
+    user_name: string;
+    role_at_time: string;
+    action: string;
+    entity_type: string;
+    entity_id: string | null;
+    patient_id: number | null;
+    reason: string | null;
+    ip_address: string | null;
+    row_hash: string;
+  }>(
+    `SELECT id, occurred_at, user_name, role_at_time, action, entity_type, entity_id, patient_id, reason, ip_address, row_hash
+     FROM audit_logs
+     WHERE occurred_at BETWEEN ? AND ?
+     ORDER BY id ASC LIMIT 5000`,
+    [`${fromDate} 00:00:00`, `${toDate} 23:59:59`]
+  );
+
+  const csvCell = (val: unknown) => {
+    const str = String(val ?? '');
+    return `"${str.replace(/"/g, '""')}"`;
+  };
+  const header = ['id', 'occurred_at', 'user_name', 'role_at_time', 'action', 'entity_type', 'entity_id', 'patient_id', 'reason', 'ip_address', 'row_hash'].join(',');
+  const lines = rows.map((r) =>
+    [r.id, r.occurred_at, r.user_name, r.role_at_time, r.action, r.entity_type, r.entity_id, r.patient_id, r.reason, r.ip_address, r.row_hash]
+      .map(csvCell)
+      .join(',')
+  );
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'audit.log.exported',
+    entityType: 'audit_log',
+    after: { fromDate, toDate, rowCount: rows.length },
+    req,
+  });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="clinic360-audit-${fromDate}-to-${toDate}.csv"`);
+  res.send([header, ...lines].join('\n'));
 });
 
 router.get('/audit-logs/exceptions', requireAuth, requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
@@ -5341,10 +6968,10 @@ router.get('/audit-logs/verify', requireAuth, requirePermission('audit.read'), a
 });
 
 // ---------------------------------------------------------------------------
-// FULL ACCOUNTING LEDGER (CoA, Journals, Trial Balance, P&L, AR/AP, Expenses)
+// FULL ACCOUNTING LEDGER (CoA, Journals, Reversals, Periods, AR/AP, Expenses)
 // ---------------------------------------------------------------------------
-router.get('/accounting/overview', requireAuth, requirePermission('finance.report.view', 'accounting.ledger.manage', 'accounting.expense.create'), async (_req, res) => {
-  const [accounts, journals, journalLines, supplierBills, expenseVouchers, insuranceClaims, creditInvoices] = await Promise.all([
+router.get('/accounting/overview', requireAuth, requirePermission('finance.report.view', 'accounting.ledger.manage', 'accounting.expense.create', 'accounting.expense.approve'), async (_req, res) => {
+  const [accounts, journals, journalLines, supplierBills, expenseVouchers, insuranceClaims, creditInvoices, periods, settings] = await Promise.all([
     query<{ id: number; code: string; name: string; account_type: string; normal_balance: string; active: number }>(
       'SELECT * FROM chart_of_accounts ORDER BY code ASC'
     ),
@@ -5352,7 +6979,7 @@ router.get('/accounting/overview', requireAuth, requirePermission('finance.repor
       `SELECT je.*, u.full_name AS posted_by_name
        FROM journal_entries je
        LEFT JOIN users u ON u.id = je.posted_by
-       ORDER BY je.id DESC LIMIT 60`
+       ORDER BY je.id DESC LIMIT 80`
     ),
     query<{ entry_id: number; account_id: number; code: string; name: string; debit: number; credit: number; memo: string | null }>(
       `SELECT jl.entry_id, jl.account_id, coa.code, coa.name, jl.debit, jl.credit, jl.memo
@@ -5392,6 +7019,13 @@ router.get('/accounting/overview', requireAuth, requirePermission('finance.repor
          AND i.id NOT IN (SELECT invoice_id FROM insurance_claims)
        ORDER BY i.id DESC LIMIT 30`
     ),
+    query(
+      `SELECT ap.*, u.full_name AS closed_by_name
+       FROM accounting_periods ap
+       LEFT JOIN users u ON u.id = ap.closed_by
+       ORDER BY ap.period_code DESC LIMIT 24`
+    ),
+    getClinicSettings(),
   ]);
 
   const linesByEntry = new Map<number, typeof journalLines>();
@@ -5448,7 +7082,48 @@ router.get('/accounting/overview', requireAuth, requirePermission('finance.repor
     expenseVouchers,
     insuranceClaims,
     unclaimedCreditInvoices: creditInvoices,
+    periods,
+    expenseAutoPostLimit: settings.expenseAutoPostLimit,
   });
+});
+
+router.post('/accounting/periods/close', requireAuth, requirePermission('accounting.period.manage'), async (req: AuthRequest, res: Response) => {
+  const periodCode = String(req.body?.period_code || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(periodCode)) {
+    return res.status(400).json({ error: 'period_code must be formatted as YYYY-MM.' });
+  }
+  const [yr, mo] = periodCode.split('-').map(Number);
+  const startDate = `${periodCode}-01`;
+  const endDate = new Date(Date.UTC(yr, mo, 0)).toISOString().slice(0, 10);
+
+  const existing = await queryOne<{ id: number; status: string }>('SELECT id, status FROM accounting_periods WHERE period_code = ?', [periodCode]);
+  if (existing?.status === 'closed') {
+    return res.status(409).json({ error: `Accounting period ${periodCode} is already closed.` });
+  }
+
+  if (existing) {
+    await execute("UPDATE accounting_periods SET status = 'closed', closed_by = ?, closed_at = ? WHERE id = ?", [
+      req.user!.id,
+      nowSql(),
+      existing.id,
+    ]);
+  } else {
+    await execute(
+      "INSERT INTO accounting_periods (period_code, start_date, end_date, status, closed_by, closed_at) VALUES (?, ?, ?, 'closed', ?, ?)",
+      [periodCode, startDate, endDate, req.user!.id, nowSql()]
+    );
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'accounting.period.close',
+    entityType: 'accounting_period',
+    entityId: periodCode,
+    after: { periodCode, startDate, endDate },
+    req,
+  });
+
+  res.json({ ok: true, periodCode, status: 'closed' });
 });
 
 router.post('/accounting/journal', requireAuth, requirePermission('accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
@@ -5479,6 +7154,71 @@ router.post('/accounting/journal', requireAuth, requirePermission('accounting.le
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
   }
+});
+
+router.post('/accounting/journals/:id/reverse', requireAuth, requirePermission('accounting.journal.reverse', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const origId = Number(req.params.id);
+  const reason = String(req.body?.reason || '').trim();
+  if (reason.length < 5) {
+    return res.status(400).json({ error: 'A formal reversal reason (minimum 5 characters) is required.' });
+  }
+
+  const result = await withTransaction(async () => {
+    const orig = await queryOne<{
+      id: number;
+      entry_number: string;
+      entry_date: string;
+      description: string;
+      reversal_of_id: number | null;
+    }>('SELECT * FROM journal_entries WHERE id = ?', [origId]);
+    if (!orig) return { ok: false as const, error: 'Journal entry not found.', httpStatus: 404 };
+    if (orig.reversal_of_id) {
+      return { ok: false as const, error: 'Cannot reverse an entry that is already a reversal.', httpStatus: 409 };
+    }
+    const alreadyReversed = await queryOne<{ entry_number: string }>(
+      'SELECT entry_number FROM journal_entries WHERE reversal_of_id = ?',
+      [origId]
+    );
+    if (alreadyReversed) {
+      return { ok: false as const, error: `Journal entry already reversed by ${alreadyReversed.entry_number}.`, httpStatus: 409 };
+    }
+
+    const origLines = await query<{ code: string; debit: number; credit: number; memo: string | null }>(
+      `SELECT coa.code, jl.debit, jl.credit, jl.memo
+       FROM journal_lines jl
+       INNER JOIN chart_of_accounts coa ON coa.id = jl.account_id
+       WHERE jl.entry_id = ?`,
+      [origId]
+    );
+
+    const revJe = await postJournalEntry({
+      sourceType: 'reversal',
+      sourceId: origId,
+      reversalOfId: origId,
+      description: `Reversal of ${orig.entry_number}: ${reason}`,
+      postedBy: req.user!.id,
+      lines: origLines.map((ln) => ({
+        accountCode: ln.code,
+        debit: Number(ln.credit || 0),
+        credit: Number(ln.debit || 0),
+        memo: `Reverse ${orig.entry_number}${ln.memo ? ` · ${ln.memo}` : ''}`,
+      })),
+    });
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'accounting.journal.reverse',
+      entityType: 'journal_entry',
+      entityId: revJe.entryId,
+      reason,
+      after: { reversedEntryId: origId, reversedEntryNumber: orig.entry_number, reversalEntryNumber: revJe.entryNumber },
+      req,
+    });
+    return { ok: true as const, ...revJe };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.status(201).json(result);
 });
 
 router.post('/accounting/ap/:id/pay', requireAuth, requirePermission('accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
@@ -5540,21 +7280,23 @@ router.post('/accounting/ar-claims', requireAuth, requirePermission('accounting.
 
     const claimNumber = await nextSequence('CLM');
     const clmRes = await execute(
-      `INSERT INTO insurance_claims (claim_number, payer_name, invoice_id, patient_id, billed_amount, settled_amount, status, notes)
-       VALUES (?, ?, ?, ?, ?, 0, 'submitted', ?)`,
-      [claimNumber, inv.payer_name || 'Insurance Payer', inv.id, inv.patient_id, Number(inv.total_amount), notes || null]
+      `INSERT INTO insurance_claims (claim_number, payer_name, invoice_id, patient_id, billed_amount, settled_amount, status, submitted_at, notes)
+       VALUES (?, ?, ?, ?, ?, 0, 'submitted', ?, ?)`,
+      [claimNumber, inv.payer_name || 'Insurance Payer', inv.id, inv.patient_id, Number(inv.total_amount), nowSql(), notes || null]
     );
-    const topItem = await queryOne<{ category: string }>('SELECT category FROM invoice_items WHERE invoice_id = ? ORDER BY line_total DESC LIMIT 1', [inv.id]);
-    await postJournalEntry({
-      sourceType: 'ar_claim',
-      sourceId: clmRes.insertId,
-      description: `Insurance claim ${claimNumber} (${inv.invoice_number})`,
-      postedBy: req.user!.id,
-      lines: [
-        { accountCode: '1100', debit: Number(inv.total_amount), memo: claimNumber },
-        { accountCode: revenueAccountForCategory(topItem?.category || 'consultation'), credit: Number(inv.total_amount), memo: inv.invoice_number },
-      ],
-    });
+
+    const alreadyRecognized = await hasInvoiceAccrualJE(inv.id);
+    if (!alreadyRecognized && Number(inv.total_amount) > 0) {
+      const revLines = await buildPerLineRevenueLines(inv.id, Number(inv.total_amount), 'credit', inv.invoice_number);
+      await postJournalEntry({
+        sourceType: 'ar_claim',
+        sourceId: clmRes.insertId,
+        description: `Insurance claim ${claimNumber} (${inv.invoice_number})`,
+        postedBy: req.user!.id,
+        lines: [{ accountCode: '1100', debit: Number(inv.total_amount), memo: claimNumber }, ...revLines],
+      });
+    }
+
     await writeAuditLog({
       user: req.user,
       action: 'accounting.ar.submit',
@@ -5596,25 +7338,18 @@ router.post('/accounting/ar-claims/:id/settle', requireAuth, requirePermission('
     const nextSettled = Number((Number(clm.settled_amount) + apply).toFixed(2));
     const nextStatus = nextSettled >= Number(clm.billed_amount) - 0.01 ? 'settled' : 'partial';
 
-    await execute("UPDATE insurance_claims SET settled_amount = ?, status = ?, settled_at = datetime('now'), notes = COALESCE(?, notes) WHERE id = ?", [
+    await execute('UPDATE insurance_claims SET settled_amount = ?, status = ?, settled_at = ?, notes = COALESCE(?, notes) WHERE id = ?', [
       nextSettled,
       nextStatus,
+      nowSql(),
       notes || null,
       claimId,
-    ]).catch(async () => {
-      await execute('UPDATE insurance_claims SET settled_amount = ?, status = ?, settled_at = NOW(), notes = COALESCE(?, notes) WHERE id = ?', [
-        nextSettled,
-        nextStatus,
-        notes || null,
-        claimId,
-      ]);
-    });
-
-    await execute('UPDATE invoices SET paid_amount = paid_amount + ?, status = CASE WHEN paid_amount + ? >= total_amount - 0.01 THEN \'paid\' ELSE \'partial\' END WHERE id = ?', [
-      apply,
-      apply,
-      clm.invoice_id,
     ]);
+
+    await execute(
+      "UPDATE invoices SET paid_amount = paid_amount + ?, status = CASE WHEN paid_amount + ? >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END WHERE id = ?",
+      [apply, apply, clm.invoice_id]
+    );
 
     const je = await postJournalEntry({
       sourceType: 'ar_settle',
@@ -5668,15 +7403,18 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
     return res.status(400).json({ error: 'Select a valid active Expense GL account.' });
   }
 
-  const voucherDate = expense_date ? String(expense_date).slice(0, 10) : new Date().toISOString().slice(0, 10);
-  const shouldAutoPost = auto_post !== false;
+  const settings = await getClinicSettings();
+  const voucherDate = expense_date ? String(expense_date).slice(0, 10) : await getClinicToday();
+  const canApproveOwnUnderLimit = amt <= settings.expenseAutoPostLimit && hasPermission(req.user!, 'accounting.ledger.manage');
+  const hasExplicitApprove = hasPermission(req.user!, 'accounting.expense.approve');
+  const shouldAutoPost = auto_post !== false && (canApproveOwnUnderLimit || (hasExplicitApprove && amt <= settings.expenseAutoPostLimit));
 
   const created = await withTransaction(async () => {
     const voucherNumber = await nextSequence('EXP');
     const status = shouldAutoPost ? 'paid' : 'pending';
     const inserted = await execute(
       `INSERT INTO expense_vouchers (voucher_number, expense_date, category, account_id, payee_name, amount, payment_method, description, status, requested_by, approved_by, paid_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${shouldAutoPost ? "datetime('now')" : 'NULL'})`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         voucherNumber,
         voucherDate,
@@ -5689,26 +7427,9 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
         status,
         req.user!.id,
         shouldAutoPost ? req.user!.id : null,
+        shouldAutoPost ? nowSql() : null,
       ]
-    ).catch(async () => {
-      return execute(
-        `INSERT INTO expense_vouchers (voucher_number, expense_date, category, account_id, payee_name, amount, payment_method, description, status, requested_by, approved_by, paid_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${shouldAutoPost ? 'NOW()' : 'NULL'})`,
-        [
-          voucherNumber,
-          voucherDate,
-          category.trim(),
-          acct.id,
-          payee_name.trim(),
-          amt,
-          payment_method,
-          description.trim(),
-          status,
-          req.user!.id,
-          shouldAutoPost ? req.user!.id : null,
-        ]
-      );
-    });
+    );
 
     let entryNumber: string | null = null;
     let journalEntryId: number | null = null;
@@ -5730,6 +7451,15 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
       });
       entryNumber = je.entryNumber;
       journalEntryId = je.entryId;
+    } else {
+      await createNotification({
+        targetRole: 'MGR',
+        title: 'Expense Voucher Pending Approval',
+        message: `${voucherNumber} for ${settings.currencySymbol}${amt.toFixed(2)} (${payee_name.trim()}) requires approval.`,
+        severity: 'warning',
+        entityType: 'expense_voucher',
+        entityId: inserted.insertId,
+      });
     }
 
     await writeAuditLog({
@@ -5756,7 +7486,7 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
   res.status(201).json(created);
 });
 
-router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('accounting.expense.approve', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const { decision } = req.body || {};
   if (!['paid', 'rejected'].includes(decision)) {
@@ -5772,6 +7502,7 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
       payment_method: string;
       description: string;
       status: string;
+      requested_by: number;
       account_code: string;
     }>(
       `SELECT ev.*, coa.code AS account_code
@@ -5782,18 +7513,14 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
     );
     if (!ev) return { ok: false as const, error: 'Expense voucher not found', httpStatus: 404 };
     if (ev.status !== 'pending') return { ok: false as const, error: 'Expense voucher already processed.', httpStatus: 409 };
+    assertDifferentUser(req.user!.id, ev.requested_by, 'approve or reject an expense voucher you created');
 
-    await execute("UPDATE expense_vouchers SET status = ?, approved_by = ?, paid_at = datetime('now') WHERE id = ?", [
+    await execute('UPDATE expense_vouchers SET status = ?, approved_by = ?, paid_at = ? WHERE id = ?', [
       decision,
       req.user!.id,
+      nowSql(),
       id,
-    ]).catch(async () => {
-      await execute('UPDATE expense_vouchers SET status = ?, approved_by = ?, paid_at = NOW() WHERE id = ?', [
-        decision,
-        req.user!.id,
-        id,
-      ]);
-    });
+    ]);
 
     let entryNumber: string | null = null;
     if (decision === 'paid') {
@@ -5828,18 +7555,32 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
 // ---------------------------------------------------------------------------
 // FILTERABLE REPORTS LIBRARY
 // ---------------------------------------------------------------------------
-router.get('/reports/:type', requireAuth, requirePermission('finance.report.view', 'audit.read', 'store.item.read'), async (req: AuthRequest, res: Response) => {
+router.get('/reports/:type', requireAuth, async (req: AuthRequest, res: Response) => {
   const type = req.params.type;
   const fromDate = req.query.from ? String(req.query.from).slice(0, 10) : '2020-01-01';
   const toDate = req.query.to ? String(req.query.to).slice(0, 10) : '2099-12-31';
 
+  const allowedByType: Record<string, string[]> = {
+    'daily-cash': ['finance.report.view', 'audit.read'],
+    'ar-ageing': ['finance.report.view', 'audit.read', 'accounting.ledger.manage'],
+    'opd-diagnoses': ['finance.report.view', 'audit.read', 'visit.read'],
+    'lab-turnaround': ['finance.report.view', 'audit.read', 'lab.order.read'],
+    'stock-valuation': ['finance.report.view', 'audit.read', 'store.item.read'],
+  };
+  const needed = allowedByType[type];
+  if (!needed) return res.status(400).json({ error: 'Unknown report type.' });
+  if (!needed.some((p) => hasPermission(req.user!, p))) {
+    return res.status(403).json({ error: `Forbidden: requires one of [${needed.join(', ')}]` });
+  }
+
   if (type === 'daily-cash') {
     const rows = await query(
       `SELECT substr(pay.created_at, 1, 10) AS payment_date, u.full_name AS cashier_name,
-              pay.payment_method, COUNT(*) AS tx_count, ROUND(SUM(pay.amount), 2) AS total_amount
+              pay.payment_method, COUNT(*) AS tx_count,
+              ROUND(SUM(CASE WHEN pay.status = 'refunded' THEN -pay.amount ELSE pay.amount END), 2) AS total_amount
        FROM payments pay
        LEFT JOIN users u ON u.id = pay.created_by
-       WHERE pay.status = 'completed' AND substr(pay.created_at, 1, 10) BETWEEN ? AND ?
+       WHERE pay.status IN ('completed', 'refunded') AND substr(pay.created_at, 1, 10) BETWEEN ? AND ?
        GROUP BY substr(pay.created_at, 1, 10), u.full_name, pay.payment_method
        ORDER BY payment_date DESC, cashier_name ASC`,
       [fromDate, toDate]
@@ -5889,88 +7630,120 @@ router.get('/reports/:type', requireAuth, requirePermission('finance.report.view
     return res.json({ reportType: type, fromDate, toDate, rows });
   }
 
-  if (type === 'ar-ageing') {
-    const claims = await query<Record<string, unknown>>(
-      `SELECT ic.claim_number, ic.payer_name, i.invoice_number, p.mrn, p.first_name, p.last_name,
-              ic.billed_amount, ic.settled_amount, ROUND(ic.billed_amount - ic.settled_amount, 2) AS balance_due,
-              ic.status, ic.submitted_at
-       FROM insurance_claims ic
-       INNER JOIN invoices i ON i.id = ic.invoice_id
-       INNER JOIN patients p ON p.id = ic.patient_id
-       ORDER BY ic.id DESC`
-    );
-    const nowMs = Date.now();
-    const rows = claims.map((c) => {
-      const ageDays = Math.max(0, Math.floor((nowMs - new Date(String(c.submitted_at)).getTime()) / 86400000));
-      return {
-        ...c,
-        age_days: ageDays,
-        age_bucket: ageDays <= 30 ? '0-30 days' : ageDays <= 60 ? '31-60 days' : ageDays <= 90 ? '61-90 days' : '90+ days',
-      };
-    });
-    return res.json({ reportType: type, fromDate, toDate, rows });
-  }
-
-  res.status(400).json({ error: 'Unknown report type.' });
+  const claims = await query<Record<string, unknown>>(
+    `SELECT ic.claim_number, ic.payer_name, i.invoice_number, p.mrn, p.first_name, p.last_name,
+            ic.billed_amount, ic.settled_amount, ROUND(ic.billed_amount - ic.settled_amount, 2) AS balance_due,
+            ic.status, ic.submitted_at
+     FROM insurance_claims ic
+     INNER JOIN invoices i ON i.id = ic.invoice_id
+     INNER JOIN patients p ON p.id = ic.patient_id
+     ORDER BY ic.id DESC`
+  );
+  const nowMs = Date.now();
+  const rows = claims.map((c) => {
+    const ageDays = Math.max(0, Math.floor((nowMs - new Date(String(c.submitted_at)).getTime()) / 86400000));
+    return {
+      ...c,
+      age_days: ageDays,
+      age_bucket: ageDays <= 30 ? '0-30 days' : ageDays <= 60 ? '31-60 days' : ageDays <= 90 ? '61-90 days' : '90+ days',
+    };
+  });
+  return res.json({ reportType: type, fromDate, toDate, rows });
 });
 
 // ---------------------------------------------------------------------------
-// HR & PAYROLL (HRO)
+// HR & PAYROLL (HRO) — Progressive PAYE, Verification & Multi-Stage Workflow
 // ---------------------------------------------------------------------------
-router.get('/hr/overview', requireAuth, requirePermission('hr.manage', 'hr.leave.request'), async (req: AuthRequest, res: Response) => {
+async function computeProgressivePaye(taxableIncome: number): Promise<number> {
+  if (taxableIncome <= 0) return 0;
+  const brackets = await query<{ lower_bound: number; upper_bound: number | null; rate: number; deduction: number }>(
+    'SELECT lower_bound, upper_bound, rate, deduction FROM tax_brackets WHERE active = 1 ORDER BY lower_bound ASC'
+  );
+  if (brackets.length === 0) {
+    return Number((taxableIncome * 0.15).toFixed(2));
+  }
+  let matched = brackets[0];
+  for (const b of brackets) {
+    if (taxableIncome >= Number(b.lower_bound) && (b.upper_bound === null || taxableIncome <= Number(b.upper_bound))) {
+      matched = b;
+      break;
+    }
+    if (taxableIncome >= Number(b.lower_bound)) {
+      matched = b;
+    }
+  }
+  const tax = Math.max(0, taxableIncome * Number(matched.rate) - Number(matched.deduction));
+  return Number(tax.toFixed(2));
+}
+
+router.get('/hr/overview', requireAuth, requirePermission('hr.manage', 'hr.leave.request', 'hr.payroll.verify', 'hr.payroll.approve', 'hr.payroll.post', 'hr.payroll.pay'), async (req: AuthRequest, res: Response) => {
   const isHrManager = hasPermission(req.user!, 'hr.manage');
+  const canViewPayroll =
+    isHrManager ||
+    hasPermission(req.user!, 'hr.payroll.verify', 'hr.payroll.approve', 'hr.payroll.post', 'hr.payroll.pay');
 
   const leaveRequests = isHrManager
     ? await query(
-        `SELECT lr.*, u1.full_name AS staff_name, r.code AS role_code, u2.full_name AS decided_by_name
+        `SELECT lr.*, u1.full_name AS staff_name,
+                (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u1.id) AS role_code,
+                u2.full_name AS decided_by_name
          FROM leave_requests lr
          INNER JOIN users u1 ON u1.id = lr.user_id
-         LEFT JOIN user_roles ur ON ur.user_id = u1.id
-         LEFT JOIN roles r ON r.id = ur.role_id
          LEFT JOIN users u2 ON u2.id = lr.decided_by
          ORDER BY lr.id DESC LIMIT 60`
       )
     : await query(
-        `SELECT lr.*, u1.full_name AS staff_name, r.code AS role_code, u2.full_name AS decided_by_name
+        `SELECT lr.*, u1.full_name AS staff_name,
+                (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u1.id) AS role_code,
+                u2.full_name AS decided_by_name
          FROM leave_requests lr
          INNER JOIN users u1 ON u1.id = lr.user_id
-         LEFT JOIN user_roles ur ON ur.user_id = u1.id
-         LEFT JOIN roles r ON r.id = ur.role_id
          LEFT JOIN users u2 ON u2.id = lr.decided_by
          WHERE lr.user_id = ?
          ORDER BY lr.id DESC LIMIT 30`,
         [req.user!.id]
       );
 
-  if (!isHrManager) {
-    return res.json({ isHrManager: false, contracts: [], leaveRequests, payrollRuns: [], staffUsers: [] });
+  if (!isHrManager && !canViewPayroll) {
+    return res.json({ isHrManager: false, canViewPayroll: false, contracts: [], leaveRequests, payrollRuns: [], staffUsers: [], taxBrackets: [] });
   }
 
-  const [contractsRaw, payrollRuns, payrollItems, staffUsers] = await Promise.all([
+  const [contractsRaw, payrollRuns, payrollItems, staffUsers, taxBrackets] = await Promise.all([
+    isHrManager
+      ? query<Record<string, unknown>>(
+          `SELECT sc.*, u.full_name, u.email, u.specialty, u.active,
+                  (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
+                  (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
+           FROM staff_contracts sc
+           INNER JOIN users u ON u.id = sc.user_id
+           ORDER BY sc.employee_code ASC`
+        )
+      : Promise.resolve([]),
     query<Record<string, unknown>>(
-      `SELECT sc.*, u.full_name, u.email, u.specialty, u.active, r.code AS role_code, r.name AS role_name
-       FROM staff_contracts sc
-       INNER JOIN users u ON u.id = sc.user_id
-       LEFT JOIN user_roles ur ON ur.user_id = u.id
-       LEFT JOIN roles r ON r.id = ur.role_id
-       ORDER BY sc.employee_code ASC`
-    ),
-    query<Record<string, unknown>>(
-      `SELECT pr.*, je.entry_number AS journal_entry_number, u.full_name AS created_by_name
+      `SELECT pr.*, je.entry_number AS journal_entry_number, pje.entry_number AS payment_journal_entry_number,
+              u.full_name AS created_by_name, uv.full_name AS verified_by_name,
+              ua.full_name AS approved_by_name, up.full_name AS paid_by_name
        FROM payroll_runs pr
        LEFT JOIN journal_entries je ON je.id = pr.journal_entry_id
+       LEFT JOIN journal_entries pje ON pje.id = pr.payment_journal_entry_id
        LEFT JOIN users u ON u.id = pr.created_by
+       LEFT JOIN users uv ON uv.id = pr.verified_by
+       LEFT JOIN users ua ON ua.id = pr.approved_by
+       LEFT JOIN users up ON up.id = pr.paid_by
        ORDER BY pr.id DESC LIMIT 20`
     ),
     query<Record<string, unknown>>('SELECT * FROM payroll_items ORDER BY id ASC'),
-    query(
-      `SELECT u.id, u.full_name, u.email, r.code AS role_code, r.name AS role_name
-       FROM users u
-       LEFT JOIN user_roles ur ON ur.user_id = u.id
-       LEFT JOIN roles r ON r.id = ur.role_id
-       WHERE u.active = 1
-       ORDER BY u.full_name`
-    ),
+    isHrManager
+      ? query(
+          `SELECT u.id, u.full_name, u.email,
+                  (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
+                  (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
+           FROM users u
+           WHERE u.active = 1
+           ORDER BY u.full_name`
+        )
+      : Promise.resolve([]),
+    query('SELECT * FROM tax_brackets WHERE active = 1 ORDER BY lower_bound ASC'),
   ]);
 
   const nowMs = Date.now();
@@ -6003,11 +7776,25 @@ router.get('/hr/overview', requireAuth, requirePermission('hr.manage', 'hr.leave
     run.items = itemsByRun.get(Number(run.id)) || [];
   }
 
-  res.json({ isHrManager: true, contracts, leaveRequests, payrollRuns, staffUsers });
+  res.json({ isHrManager, canViewPayroll, contracts, leaveRequests, payrollRuns, staffUsers, taxBrackets });
+});
+
+router.get('/hr/my-payslips', requireAuth, requirePermission('hr.payslip.own', 'hr.leave.request'), async (req: AuthRequest, res: Response) => {
+  const payslips = await query(
+    `SELECT pi.*, pr.run_number, pr.pay_month, pr.status AS run_status, pr.posted_at, pr.paid_at,
+            sc.employee_code, sc.department_name
+     FROM payroll_items pi
+     INNER JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
+     LEFT JOIN staff_contracts sc ON sc.user_id = pi.user_id
+     WHERE pi.user_id = ? AND pr.status IN ('approved','posted','paid')
+     ORDER BY pr.pay_month DESC, pr.id DESC LIMIT 24`,
+    [req.user!.id]
+  );
+  res.json({ payslips });
 });
 
 router.post('/hr/contracts', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
-  const { user_id, employee_code, department_name, contract_type = 'full_time', base_salary, housing_allowance = 0, licence_number, licence_expiry, contract_start } = req.body || {};
+  const { user_id, employee_code, department_name, contract_type = 'full_time', base_salary, housing_allowance = 0, licence_number, licence_expiry, contract_start, contract_end } = req.body || {};
   if (!user_id || !employee_code?.trim() || !department_name?.trim() || Number(base_salary) <= 0 || !contract_start) {
     return res.status(400).json({ error: 'Staff member, employee code, department, positive base salary, and start date are required.' });
   }
@@ -6015,29 +7802,24 @@ router.post('/hr/contracts', requireAuth, requirePermission('hr.manage'), async 
   const existing = await queryOne<{ id: number }>('SELECT id FROM staff_contracts WHERE user_id = ?', [Number(user_id)]);
   if (existing) {
     await execute(
-      `UPDATE staff_contracts SET employee_code = ?, department_name = ?, contract_type = ?, base_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, updated_at = datetime('now') WHERE id = ?`,
-      [employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, existing.id]
-    ).catch(async () => {
-      await execute(
-        'UPDATE staff_contracts SET employee_code = ?, department_name = ?, contract_type = ?, base_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, updated_at = NOW() WHERE id = ?',
-        [employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, existing.id]
-      );
-    });
+      `UPDATE staff_contracts SET employee_code = ?, department_name = ?, contract_type = ?, base_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, contract_end = ?, updated_at = ? WHERE id = ?`,
+      [employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, contract_end || null, nowSql(), existing.id]
+    );
     await writeAuditLog({
       user: req.user,
       action: 'hr.contract.update',
       entityType: 'staff_contract',
       entityId: existing.id,
-      after: { employee_code, base_salary, licence_expiry },
+      after: { employee_code, base_salary, licence_expiry, contract_end },
       req,
     });
     return res.json({ id: existing.id, updated: true });
   }
 
   const inserted = await execute(
-    `INSERT INTO staff_contracts (user_id, employee_code, department_name, contract_type, base_salary, housing_allowance, licence_number, licence_expiry, contract_start, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
-    [Number(user_id), employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start]
+    `INSERT INTO staff_contracts (user_id, employee_code, department_name, contract_type, base_salary, housing_allowance, licence_number, licence_expiry, contract_start, contract_end, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+    [Number(user_id), employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, contract_end || null]
   );
   await writeAuditLog({
     user: req.user,
@@ -6062,6 +7844,9 @@ router.post('/hr/leave', requireAuth, requirePermission('hr.leave.request', 'hr.
     return res.status(400).json({ error: 'End date must be on or after start date.' });
   }
   const daysCount = Math.max(1, Math.round((eMs - sMs) / 86400000) + 1);
+  if (daysCount > 90) {
+    return res.status(400).json({ error: 'Single leave request cannot exceed 90 days.' });
+  }
   const inserted = await execute(
     "INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, days_count, reason, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
     [targetUserId, leave_type, start_date, end_date, daysCount, reason.trim()]
@@ -6087,31 +7872,50 @@ router.post('/hr/leave', requireAuth, requirePermission('hr.leave.request', 'hr.
 
 router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const { decision } = req.body || {};
-  if (!['approved', 'rejected'].includes(decision)) {
-    return res.status(400).json({ error: 'Decision must be approved or rejected.' });
+  const { decision, decision_note } = req.body || {};
+  if (!['approved', 'rejected', 'cancelled'].includes(decision)) {
+    return res.status(400).json({ error: 'Decision must be approved, rejected, or cancelled.' });
   }
+  if (decision === 'rejected' && !decision_note?.trim()) {
+    return res.status(400).json({ error: 'A formal rejection reason is required.' });
+  }
+
   const result = await withTransaction(async () => {
     const lr = await queryOne<{ id: number; user_id: number; start_date: string; end_date: string; leave_type: string; status: string }>(
       'SELECT * FROM leave_requests WHERE id = ?',
       [id]
     );
     if (!lr) return { ok: false as const, error: 'Leave request not found', httpStatus: 404 };
-    if (lr.status !== 'pending') return { ok: false as const, error: 'Leave request already decided.', httpStatus: 409 };
 
-    await execute("UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = datetime('now') WHERE id = ?", [
+    if (decision === 'cancelled') {
+      if (!['pending', 'approved'].includes(lr.status)) {
+        return { ok: false as const, error: 'Only pending or approved leave can be cancelled.', httpStatus: 409 };
+      }
+      await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?', ['cancelled', req.user!.id, nowSql(), id]);
+      await execute('DELETE FROM doctor_blocks WHERE source_leave_id = ?', [id]);
+      await writeAuditLog({
+        user: req.user,
+        action: 'hr.leave.cancelled',
+        entityType: 'leave_request',
+        entityId: id,
+        reason: decision_note?.trim() || null,
+        req,
+      });
+      return { ok: true as const, decision: 'cancelled', blocksCreated: 0, conflictingAppointments: [] };
+    }
+
+    if (lr.status !== 'pending') return { ok: false as const, error: 'Leave request already decided.', httpStatus: 409 };
+    assertDifferentUser(req.user!.id, lr.user_id, 'approve or reject your own leave request');
+
+    await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?', [
       decision,
       req.user!.id,
+      nowSql(),
       id,
-    ]).catch(async () => {
-      await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = NOW() WHERE id = ?', [
-        decision,
-        req.user!.id,
-        id,
-      ]);
-    });
+    ]);
 
     let blocksCreated = 0;
+    let conflictingAppointments: Array<{ id: number; appointment_date: string; start_time: string }> = [];
     if (decision === 'approved') {
       const isDoc = await queryOne<{ cnt: number }>(
         `SELECT COUNT(*) AS cnt FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND r.code = 'DOC'`,
@@ -6120,13 +7924,28 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
       if (Number(isDoc?.cnt || 0) > 0) {
         const start = new Date(`${lr.start_date}T00:00:00Z`);
         const end = new Date(`${lr.end_date}T00:00:00Z`);
-        for (let d = new Date(start); d <= end && blocksCreated < 14; d.setUTCDate(d.getUTCDate() + 1)) {
+        for (let d = new Date(start); d <= end && blocksCreated < 90; d.setUTCDate(d.getUTCDate() + 1)) {
           const dateStr = d.toISOString().slice(0, 10);
           await execute(
-            "INSERT INTO doctor_blocks (doctor_id, block_date, start_time, end_time, block_type, reason, created_by) VALUES (?, ?, '08:00', '17:00', 'leave', ?, ?)",
-            [lr.user_id, dateStr, `Approved ${lr.leave_type} leave`, req.user!.id]
+            "INSERT INTO doctor_blocks (doctor_id, block_date, start_time, end_time, block_type, reason, source_leave_id, created_by) VALUES (?, ?, '08:00', '17:00', 'leave', ?, ?, ?)",
+            [lr.user_id, dateStr, `Approved ${lr.leave_type} leave`, id, req.user!.id]
           );
           blocksCreated++;
+        }
+        conflictingAppointments = await query<{ id: number; appointment_date: string; start_time: string }>(
+          `SELECT id, appointment_date, start_time FROM appointments
+           WHERE doctor_id = ? AND appointment_date BETWEEN ? AND ? AND status IN ('scheduled','checked_in')`,
+          [lr.user_id, lr.start_date, lr.end_date]
+        );
+        if (conflictingAppointments.length > 0) {
+          await createNotification({
+            targetRole: 'REC',
+            title: 'Reschedule Needed: Clinician Leave Approved',
+            message: `${conflictingAppointments.length} appointment(s) overlap approved leave (${lr.start_date} – ${lr.end_date}).`,
+            severity: 'warning',
+            entityType: 'leave_request',
+            entityId: id,
+          });
         }
       }
     }
@@ -6136,10 +7955,11 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
       action: `hr.leave.${decision}`,
       entityType: 'leave_request',
       entityId: id,
-      after: { decision, blocksCreated },
+      after: { decision, blocksCreated, conflictingCount: conflictingAppointments.length },
+      reason: decision_note?.trim() || null,
       req,
     });
-    return { ok: true as const, decision, blocksCreated };
+    return { ok: true as const, decision, blocksCreated, conflictingAppointments };
   });
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
@@ -6148,6 +7968,12 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
 
 router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
   const payMonth = String(req.body?.pay_month || new Date().toISOString().slice(0, 7));
+  if (!/^\d{4}-\d{2}$/.test(payMonth)) {
+    return res.status(400).json({ error: 'pay_month must be YYYY-MM.' });
+  }
+  const monthStart = `${payMonth}-01`;
+  const [yr, mo] = payMonth.split('-').map(Number);
+  const monthEnd = new Date(Date.UTC(yr, mo, 0)).toISOString().slice(0, 10);
 
   const result = await withTransaction(async () => {
     const existing = await queryOne<{ id: number; run_number: string }>('SELECT id, run_number FROM payroll_runs WHERE pay_month = ?', [payMonth]);
@@ -6162,15 +7988,18 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
       base_salary: number;
       housing_allowance: number;
     }>(
-      `SELECT sc.user_id, u.full_name, COALESCE(r.code, 'STF') AS role_code, sc.base_salary, sc.housing_allowance
+      `SELECT sc.user_id, u.full_name,
+              COALESCE((SELECT r.code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id ORDER BY ur.role_id ASC LIMIT 1), 'STF') AS role_code,
+              sc.base_salary, sc.housing_allowance
        FROM staff_contracts sc
        INNER JOIN users u ON u.id = sc.user_id
-       LEFT JOIN user_roles ur ON ur.user_id = u.id
-       LEFT JOIN roles r ON r.id = ur.role_id
-       WHERE sc.status = 'active' AND u.active = 1`
+       WHERE sc.status = 'active' AND u.active = 1
+         AND sc.contract_start <= ?
+         AND (sc.contract_end IS NULL OR sc.contract_end >= ?)`,
+      [monthEnd, monthStart]
     );
     if (contracts.length === 0) {
-      return { ok: false as const, error: 'No active staff contracts found to run payroll.', httpStatus: 400 };
+      return { ok: false as const, error: 'No active staff contracts eligible for this pay period.', httpStatus: 400 };
     }
 
     const runNumber = await nextSequence('PAY');
@@ -6178,23 +8007,34 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
     let totalDed = 0;
     let totalNet = 0;
 
-    const computedLines = contracts.map((c) => {
-      const gross = Number((Number(c.base_salary) + Number(c.housing_allowance || 0)).toFixed(2));
-      const tax = Number((gross * 0.15).toFixed(2));
-      const net = Number((gross - tax).toFixed(2));
+    const computedLines = [];
+    for (const c of contracts) {
+      const base = Number(c.base_salary);
+      const allow = Number(c.housing_allowance || 0);
+      const gross = Number((base + allow).toFixed(2));
+      const pensionEe = Number((base * 0.07).toFixed(2));
+      const pensionEr = Number((base * 0.11).toFixed(2));
+      const taxableIncome = Math.max(0, gross - pensionEe);
+      const paye = await computeProgressivePaye(taxableIncome);
+      const totalEmpDed = Number((paye + pensionEe).toFixed(2));
+      const net = Number((gross - totalEmpDed).toFixed(2));
       totalGross += gross;
-      totalDed += tax;
+      totalDed += totalEmpDed;
       totalNet += net;
-      return {
+      computedLines.push({
         user_id: c.user_id,
         staff_name: c.full_name,
         role_code: c.role_code,
-        base_salary: Number(c.base_salary),
-        allowances: Number(c.housing_allowance || 0),
-        tax_deduction: tax,
+        base_salary: base,
+        allowances: allow,
+        taxable_allowances: allow,
+        pension_employee: pensionEe,
+        pension_employer: pensionEr,
+        paye_tax: paye,
+        tax_deduction: totalEmpDed,
         net_pay: net,
-      };
-    });
+      });
+    }
 
     const runRes = await execute(
       "INSERT INTO payroll_runs (run_number, pay_month, total_gross, total_deductions, total_net, status, created_by) VALUES (?, ?, ?, ?, ?, 'draft', ?)",
@@ -6203,8 +8043,22 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
 
     for (const ln of computedLines) {
       await execute(
-        'INSERT INTO payroll_items (payroll_run_id, user_id, staff_name, role_code, base_salary, allowances, tax_deduction, net_pay) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [runRes.insertId, ln.user_id, ln.staff_name, ln.role_code, ln.base_salary, ln.allowances, ln.tax_deduction, ln.net_pay]
+        `INSERT INTO payroll_items (payroll_run_id, user_id, staff_name, role_code, base_salary, allowances, taxable_allowances, pension_employee, pension_employer, paye_tax, tax_deduction, net_pay)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          runRes.insertId,
+          ln.user_id,
+          ln.staff_name,
+          ln.role_code,
+          ln.base_salary,
+          ln.allowances,
+          ln.taxable_allowances,
+          ln.pension_employee,
+          ln.pension_employer,
+          ln.paye_tax,
+          ln.tax_deduction,
+          ln.net_pay,
+        ]
       );
     }
 
@@ -6213,7 +8067,7 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
       action: 'hr.payroll.generate',
       entityType: 'payroll_run',
       entityId: runRes.insertId,
-      after: { runNumber, payMonth, headcount: computedLines.length, totalGross: Number(totalGross.toFixed(2)) },
+      after: { runNumber, payMonth, headcount: computedLines.length, totalGross: Number(totalGross.toFixed(2)), totalNet: Number(totalNet.toFixed(2)) },
       req,
     });
 
@@ -6224,7 +8078,48 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
   res.status(201).json(result);
 });
 
-router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/payroll/:id/verify', requireAuth, requirePermission('hr.payroll.verify'), async (req: AuthRequest, res: Response) => {
+  const runId = Number(req.params.id);
+  const run = await queryOne<{ id: number; run_number: string; status: string; created_by: number }>('SELECT * FROM payroll_runs WHERE id = ?', [runId]);
+  if (!run) return res.status(404).json({ error: 'Payroll run not found' });
+  if (run.status !== 'draft') return res.status(409).json({ error: `Cannot verify payroll in '${run.status}' status.` });
+  assertDifferentUser(req.user!.id, run.created_by, 'verify a payroll run you drafted');
+
+  await execute("UPDATE payroll_runs SET status = 'verified', verified_by = ?, verified_at = ? WHERE id = ?", [req.user!.id, nowSql(), runId]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.payroll.verify',
+    entityType: 'payroll_run',
+    entityId: runId,
+    after: { runNumber: run.run_number },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.post('/hr/payroll/:id/approve', requireAuth, requirePermission('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
+  const runId = Number(req.params.id);
+  const run = await queryOne<{ id: number; run_number: string; status: string; created_by: number; verified_by: number | null }>(
+    'SELECT * FROM payroll_runs WHERE id = ?',
+    [runId]
+  );
+  if (!run) return res.status(404).json({ error: 'Payroll run not found' });
+  if (run.status !== 'verified') return res.status(409).json({ error: 'Payroll run must be verified by Finance before approval.' });
+  assertDifferentUser(req.user!.id, run.created_by, 'approve a payroll run you drafted');
+
+  await execute("UPDATE payroll_runs SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ?", [req.user!.id, nowSql(), runId]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.payroll.approve',
+    entityType: 'payroll_run',
+    entityId: runId,
+    after: { runNumber: run.run_number },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.payroll.post', 'hr.manage'), async (req: AuthRequest, res: Response) => {
   const runId = Number(req.params.id);
   const result = await withTransaction(async () => {
     const run = await queryOne<{ id: number; run_number: string; pay_month: string; total_gross: number; total_deductions: number; total_net: number; status: string }>(
@@ -6232,32 +8127,48 @@ router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.manage'),
       [runId]
     );
     if (!run) return { ok: false as const, error: 'Payroll run not found', httpStatus: 404 };
-    if (run.status === 'posted') return { ok: false as const, error: 'Payroll run is already posted to Accounting.', httpStatus: 409 };
+    if (run.status !== 'approved') {
+      return { ok: false as const, error: `Payroll must be verified & manager-approved before GL posting (current: '${run.status}').`, httpStatus: 409 };
+    }
+
+    const items = await query<{ paye_tax: number; pension_employee: number; pension_employer: number; net_pay: number }>(
+      'SELECT paye_tax, pension_employee, pension_employer, net_pay FROM payroll_items WHERE payroll_run_id = ?',
+      [runId]
+    );
+    const totalPaye = Number(items.reduce((s, i) => s + Number(i.paye_tax || 0), 0).toFixed(2));
+    const totalPensionEe = Number(items.reduce((s, i) => s + Number(i.pension_employee || 0), 0).toFixed(2));
+    const totalPensionEr = Number(items.reduce((s, i) => s + Number(i.pension_employer || 0), 0).toFixed(2));
+    const totalNet = Number(items.reduce((s, i) => s + Number(i.net_pay || 0), 0).toFixed(2));
+    const totalExpense = Number((Number(run.total_gross) + totalPensionEr).toFixed(2));
+    const totalPension = Number((totalPensionEe + totalPensionEr).toFixed(2));
+
+    const lines: Array<{ accountCode: string; debit?: number; credit?: number; memo?: string }> = [
+      { accountCode: '5100', debit: totalExpense, memo: `Gross $${run.total_gross} + Employer Pension $${totalPensionEr}` },
+      { accountCode: '2200', credit: totalNet, memo: `Net salaries payable ${run.pay_month}` },
+    ];
+    if (totalPaye > 0) lines.push({ accountCode: '2210', credit: totalPaye, memo: `PAYE income tax ${run.pay_month}` });
+    if (totalPension > 0) lines.push({ accountCode: '2220', credit: totalPension, memo: `Employee & Employer pension ${run.pay_month}` });
 
     const je = await postJournalEntry({
       sourceType: 'payroll',
       sourceId: runId,
-      description: `Monthly Payroll ${run.pay_month} (${run.run_number})`,
+      description: `Monthly Payroll Accrual ${run.pay_month} (${run.run_number})`,
       postedBy: req.user!.id,
-      lines: [
-        { accountCode: '5100', debit: Number(run.total_gross), memo: `Gross salaries ${run.pay_month}` },
-        { accountCode: '2200', credit: Number(run.total_gross), memo: `Net $${run.total_net} + Statutory Tax $${run.total_deductions}` },
-      ],
+      lines,
     });
 
-    await execute("UPDATE payroll_runs SET status = 'posted', journal_entry_id = ?, posted_at = datetime('now') WHERE id = ?", [
+    await execute("UPDATE payroll_runs SET status = 'posted', journal_entry_id = ?, posted_at = ? WHERE id = ?", [
       je.entryId,
+      nowSql(),
       runId,
-    ]).catch(async () => {
-      await execute("UPDATE payroll_runs SET status = 'posted', journal_entry_id = ?, posted_at = NOW() WHERE id = ?", [je.entryId, runId]);
-    });
+    ]);
 
     await writeAuditLog({
       user: req.user,
       action: 'hr.payroll.post',
       entityType: 'payroll_run',
       entityId: runId,
-      after: { runNumber: run.run_number, entryNumber: je.entryNumber, totalGross: run.total_gross },
+      after: { runNumber: run.run_number, entryNumber: je.entryNumber, totalExpense, totalNet, totalPaye, totalPension },
       req,
     });
 
@@ -6266,6 +8177,163 @@ router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.manage'),
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
   res.json(result);
+});
+
+router.post('/hr/payroll/:id/pay', requireAuth, requirePermission('hr.payroll.pay'), async (req: AuthRequest, res: Response) => {
+  const runId = Number(req.params.id);
+  const result = await withTransaction(async () => {
+    const run = await queryOne<{ id: number; run_number: string; pay_month: string; total_net: number; status: string }>(
+      'SELECT * FROM payroll_runs WHERE id = ?',
+      [runId]
+    );
+    if (!run) return { ok: false as const, error: 'Payroll run not found', httpStatus: 404 };
+    if (run.status !== 'posted') {
+      return { ok: false as const, error: 'Payroll run must be posted to General Ledger before bank disbursement.', httpStatus: 409 };
+    }
+    const netAmt = Number(run.total_net);
+    const je = await postJournalEntry({
+      sourceType: 'payroll_payment',
+      sourceId: runId,
+      description: `Payroll Bank Disbursement ${run.pay_month} (${run.run_number})`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: '2200', debit: netAmt, memo: `Clear net salaries payable ${run.run_number}` },
+        { accountCode: '1020', credit: netAmt, memo: `Bank payroll transfer ${run.pay_month}` },
+      ],
+    });
+    await execute("UPDATE payroll_runs SET status = 'paid', payment_journal_entry_id = ?, paid_by = ?, paid_at = ? WHERE id = ?", [
+      je.entryId,
+      req.user!.id,
+      nowSql(),
+      runId,
+    ]);
+    await writeAuditLog({
+      user: req.user,
+      action: 'hr.payroll.pay',
+      entityType: 'payroll_run',
+      entityId: runId,
+      after: { runNumber: run.run_number, entryNumber: je.entryNumber, netPaid: netAmt },
+      req,
+    });
+    return { ok: true as const, entryNumber: je.entryNumber };
+  });
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// MASTER CATALOG MANAGEMENT (ADM / MGR)
+// ---------------------------------------------------------------------------
+router.get('/catalog/manage/:entity', requireAuth, requirePermission('catalog.manage', 'admin.user.manage'), async (req, res) => {
+  const entity = req.params.entity;
+  if (entity === 'services') return res.json({ rows: await query('SELECT * FROM services ORDER BY category, code') });
+  if (entity === 'lab_tests') return res.json({ rows: await query('SELECT * FROM lab_tests ORDER BY code') });
+  if (entity === 'imaging_catalog') return res.json({ rows: await query('SELECT * FROM imaging_catalog ORDER BY code') });
+  if (entity === 'medicines') return res.json({ rows: await query('SELECT * FROM medicines ORDER BY generic_name') });
+  if (entity === 'wards') return res.json({ rows: await query('SELECT * FROM wards ORDER BY id') });
+  return res.status(400).json({ error: 'Invalid catalog entity.' });
+});
+
+router.post('/catalog/manage/:entity', requireAuth, requirePermission('catalog.manage'), async (req: AuthRequest, res: Response) => {
+  const entity = req.params.entity;
+  const b = req.body || {};
+  let insertedId = 0;
+
+  if (entity === 'services') {
+    if (!b.code?.trim() || !b.name?.trim() || Number(b.unit_price) < 0) return res.status(400).json({ error: 'Code, name, and valid unit_price are required.' });
+    const r = await execute('INSERT INTO services (code, name, category, unit_price, active) VALUES (?, ?, ?, ?, 1)', [
+      b.code.trim().toUpperCase(), b.name.trim(), b.category || 'consultation', Number(b.unit_price),
+    ]);
+    insertedId = r.insertId;
+  } else if (entity === 'lab_tests') {
+    if (!b.code?.trim() || !b.name?.trim() || Number(b.price) < 0) return res.status(400).json({ error: 'Code, name, and valid price are required.' });
+    const r = await execute(
+      'INSERT INTO lab_tests (code, name, sample_type, unit, reference_range, price, turnaround_mins) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [b.code.trim().toUpperCase(), b.name.trim(), b.sample_type || 'Serum', b.unit || '', b.reference_range || '', Number(b.price), Number(b.turnaround_mins || 60)]
+    );
+    insertedId = r.insertId;
+  } else if (entity === 'imaging_catalog') {
+    if (!b.code?.trim() || !b.name?.trim() || Number(b.price) < 0) return res.status(400).json({ error: 'Code, name, and valid price are required.' });
+    const r = await execute(
+      'INSERT INTO imaging_catalog (code, name, modality, body_region, price) VALUES (?, ?, ?, ?, ?)',
+      [b.code.trim().toUpperCase(), b.name.trim(), b.modality || 'X-Ray', b.body_region || 'General', Number(b.price)]
+    );
+    insertedId = r.insertId;
+  } else if (entity === 'medicines') {
+    if (!b.code?.trim() || !b.generic_name?.trim() || Number(b.unit_price) < 0) return res.status(400).json({ error: 'Code, generic_name, and valid unit_price are required.' });
+    const r = await execute(
+      'INSERT INTO medicines (code, generic_name, strength, form, unit_price, stock_qty, reorder_level, batch_number, expiry_date) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)',
+      [
+        b.code.trim().toUpperCase(),
+        b.generic_name.trim(),
+        b.strength || '',
+        b.form || 'Tablet',
+        Number(b.unit_price),
+        Number(b.reorder_level || 20),
+        b.batch_number || 'INIT-01',
+        b.expiry_date || '2028-12-31',
+      ]
+    );
+    insertedId = r.insertId;
+  } else if (entity === 'wards') {
+    if (!b.code?.trim() || !b.name?.trim() || Number(b.daily_tariff) < 0) return res.status(400).json({ error: 'Code, name, and daily_tariff are required.' });
+    const r = await execute('INSERT INTO wards (code, name, department, daily_tariff) VALUES (?, ?, ?, ?)', [
+      b.code.trim().toUpperCase(), b.name.trim(), b.department || 'Inpatient', Number(b.daily_tariff),
+    ]);
+    insertedId = r.insertId;
+  } else {
+    return res.status(400).json({ error: 'Invalid catalog entity.' });
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: `catalog.${entity}.create`,
+    entityType: entity,
+    entityId: insertedId,
+    after: b,
+    req,
+  });
+  res.status(201).json({ id: insertedId });
+});
+
+router.put('/catalog/manage/:entity/:id', requireAuth, requirePermission('catalog.manage'), async (req: AuthRequest, res: Response) => {
+  const entity = req.params.entity;
+  const id = Number(req.params.id);
+  const b = req.body || {};
+
+  if (entity === 'services') {
+    await execute('UPDATE services SET name = COALESCE(?, name), category = COALESCE(?, category), unit_price = COALESCE(?, unit_price), active = COALESCE(?, active) WHERE id = ?', [
+      b.name ?? null, b.category ?? null, b.unit_price !== undefined ? Number(b.unit_price) : null, b.active !== undefined ? (b.active ? 1 : 0) : null, id,
+    ]);
+  } else if (entity === 'lab_tests') {
+    await execute('UPDATE lab_tests SET name = COALESCE(?, name), sample_type = COALESCE(?, sample_type), reference_range = COALESCE(?, reference_range), price = COALESCE(?, price) WHERE id = ?', [
+      b.name ?? null, b.sample_type ?? null, b.reference_range ?? null, b.price !== undefined ? Number(b.price) : null, id,
+    ]);
+  } else if (entity === 'imaging_catalog') {
+    await execute('UPDATE imaging_catalog SET name = COALESCE(?, name), modality = COALESCE(?, modality), body_region = COALESCE(?, body_region), price = COALESCE(?, price) WHERE id = ?', [
+      b.name ?? null, b.modality ?? null, b.body_region ?? null, b.price !== undefined ? Number(b.price) : null, id,
+    ]);
+  } else if (entity === 'medicines') {
+    await execute('UPDATE medicines SET generic_name = COALESCE(?, generic_name), strength = COALESCE(?, strength), unit_price = COALESCE(?, unit_price), reorder_level = COALESCE(?, reorder_level) WHERE id = ?', [
+      b.generic_name ?? null, b.strength ?? null, b.unit_price !== undefined ? Number(b.unit_price) : null, b.reorder_level !== undefined ? Number(b.reorder_level) : null, id,
+    ]);
+  } else if (entity === 'wards') {
+    await execute('UPDATE wards SET name = COALESCE(?, name), department = COALESCE(?, department), daily_tariff = COALESCE(?, daily_tariff) WHERE id = ?', [
+      b.name ?? null, b.department ?? null, b.daily_tariff !== undefined ? Number(b.daily_tariff) : null, id,
+    ]);
+  } else {
+    return res.status(400).json({ error: 'Invalid catalog entity.' });
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: `catalog.${entity}.update`,
+    entityType: entity,
+    entityId: id,
+    after: b,
+    req,
+  });
+  res.json({ ok: true });
 });
 
 export default router;

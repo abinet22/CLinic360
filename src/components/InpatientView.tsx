@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BedDouble, CheckCircle2, ClipboardCheck, DollarSign, Plus, Printer, Sparkles, X } from 'lucide-react';
+import { Activity, BedDouble, CheckCircle2, ClipboardCheck, DollarSign, FileText, Pill, Plus, Printer, Sparkles, Stethoscope, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type {
   Admission,
   Bed,
+  IpdStatement,
   MedicationAdministration,
   Patient,
   UserContext,
@@ -48,12 +49,43 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
   const [forceClearTarget, setForceClearTarget] = useState<{ adm: Admission; reasonNeededMsg: string } | null>(null);
   const [forceReason, setForceReason] = useState('');
 
+  // IPD Clinical Chart Modal
+  const [chartAdmission, setChartAdmission] = useState<Admission | null>(null);
+  const [chartDetail, setChartDetail] = useState<IpdStatement | null>(null);
+  const [chartTab, setChartTab] = useState<'rounds' | 'meds' | 'notes' | 'vitals'>('rounds');
+  const [medCatalog, setMedCatalog] = useState<Array<{ id: number; generic_name: string; strength: string }>>([]);
+  const [roundForm, setRoundForm] = useState({ subjective: '', objective: '', assessment: '', plan: '' });
+  const [medOrderForm, setMedOrderForm] = useState({
+    medicine_id: '',
+    medicine_name: '',
+    dose: '',
+    route: 'Oral',
+    frequency: 'BID',
+    prn: false,
+  });
+  const [noteForm, setNoteForm] = useState({ note_type: 'Shift Note', note: '' });
+  const [ipdVitalForm, setIpdVitalForm] = useState({
+    bp_systolic: '120',
+    bp_diastolic: '80',
+    heart_rate: '76',
+    respiratory_rate: '16',
+    temperature_c: '36.8',
+    spo2: '98',
+    weight_kg: '',
+    height_cm: '',
+    notes: '',
+  });
+
   const canCreateAdmission = user.permissions.includes('ipd.admission.create');
   const canAssignBed = user.permissions.includes('ipd.bed.assign');
   const canGiveMar = user.permissions.includes('ipd.mar.give');
   const canOrderDischarge = user.permissions.includes('ipd.discharge.create');
   const canClearDischarge = user.permissions.includes('ipd.discharge.clear');
   const canBillBed = user.permissions.includes('ipd.bed.bill');
+  const canWriteRounds = canCreateAdmission || user.permissions.includes('visit.update');
+  const canOrderIpdMeds = canCreateAdmission || user.permissions.includes('prescription.create');
+  const canWriteNotes = canGiveMar || canAssignBed || user.permissions.includes('nursing.procedure.perform');
+  const canRecordIpdVitals = canGiveMar || user.permissions.includes('vitals.create');
 
   const loadIpd = useCallback(async () => {
     setLoading(true);
@@ -90,7 +122,113 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
         })
         .catch(() => {});
     }
-  }, [loadIpd, canCreateAdmission, user.permissions]);
+    if (canOrderIpdMeds) {
+      apiFetch<{ medicines: Array<{ id: number; generic_name: string; strength: string }> }>('/api/catalog/medicines')
+        .then((mRes) => setMedCatalog(mRes.medicines || []))
+        .catch(() => {});
+    }
+  }, [loadIpd, canCreateAdmission, canOrderIpdMeds, user.permissions]);
+
+  async function loadChartStatement(admId: number) {
+    try {
+      const res = await apiFetch<IpdStatement>(`/api/ipd/admissions/${admId}/statement`);
+      setChartDetail(res);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  function openChartModal(adm: Admission) {
+    setChartAdmission(adm);
+    setChartTab('rounds');
+    setChartDetail(null);
+    loadChartStatement(adm.id);
+  }
+
+  async function handleSaveRound(e: React.FormEvent) {
+    e.preventDefault();
+    if (!chartAdmission) return;
+    try {
+      await apiFetch(`/api/ipd/admissions/${chartAdmission.id}/rounds`, {
+        method: 'POST',
+        body: JSON.stringify(roundForm),
+      });
+      onNotify('Ward round SOAP note recorded', 'success');
+      setRoundForm({ subjective: '', objective: '', assessment: '', plan: '' });
+      loadChartStatement(chartAdmission.id);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleSaveMedOrder(e: React.FormEvent) {
+    e.preventDefault();
+    if (!chartAdmission) return;
+    try {
+      const res = await apiFetch<{ scheduledSlots: string[] }>(
+        `/api/ipd/admissions/${chartAdmission.id}/medication-orders`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            medicine_id: medOrderForm.medicine_id ? Number(medOrderForm.medicine_id) : undefined,
+            medicine_name: medOrderForm.medicine_name,
+            dose: medOrderForm.dose,
+            route: medOrderForm.route,
+            frequency: medOrderForm.frequency,
+            prn: medOrderForm.prn,
+          }),
+        }
+      );
+      onNotify(`Medication order added (${res.scheduledSlots.join(', ')} MAR slots generated)`, 'success');
+      setMedOrderForm({ medicine_id: '', medicine_name: '', dose: '', route: 'Oral', frequency: 'BID', prn: false });
+      loadChartStatement(chartAdmission.id);
+      loadIpd();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleSaveNursingNote(e: React.FormEvent) {
+    e.preventDefault();
+    if (!chartAdmission) return;
+    try {
+      await apiFetch(`/api/ipd/admissions/${chartAdmission.id}/nursing-notes`, {
+        method: 'POST',
+        body: JSON.stringify(noteForm),
+      });
+      onNotify('Nursing note logged to chart', 'success');
+      setNoteForm({ note_type: 'Shift Note', note: '' });
+      loadChartStatement(chartAdmission.id);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
+
+  async function handleSaveIpdVitals(e: React.FormEvent) {
+    e.preventDefault();
+    if (!chartAdmission) return;
+    try {
+      await apiFetch(`/api/ipd/admissions/${chartAdmission.id}/vitals`, {
+        method: 'POST',
+        body: JSON.stringify({
+          bp_systolic: ipdVitalForm.bp_systolic ? Number(ipdVitalForm.bp_systolic) : undefined,
+          bp_diastolic: ipdVitalForm.bp_diastolic ? Number(ipdVitalForm.bp_diastolic) : undefined,
+          heart_rate: ipdVitalForm.heart_rate ? Number(ipdVitalForm.heart_rate) : undefined,
+          respiratory_rate: ipdVitalForm.respiratory_rate ? Number(ipdVitalForm.respiratory_rate) : undefined,
+          temperature_c: ipdVitalForm.temperature_c ? Number(ipdVitalForm.temperature_c) : undefined,
+          spo2: ipdVitalForm.spo2 ? Number(ipdVitalForm.spo2) : undefined,
+          weight_kg: ipdVitalForm.weight_kg ? Number(ipdVitalForm.weight_kg) : undefined,
+          height_cm: ipdVitalForm.height_cm ? Number(ipdVitalForm.height_cm) : undefined,
+          notes: ipdVitalForm.notes || undefined,
+        }),
+      });
+      onNotify('Inpatient vitals recorded', 'success');
+      setIpdVitalForm((prev) => ({ ...prev, notes: '' }));
+      loadChartStatement(chartAdmission.id);
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    }
+  }
 
   async function handleCreateAdmission(e: React.FormEvent) {
     e.preventDefault();
@@ -278,7 +416,7 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                       {ward.name} <span className="font-mono text-xs text-slate-500">({ward.code})</span>
                     </h3>
                     <div className="text-xs text-slate-500 capitalize">
-                      {ward.ward_type} ward · Daily tariff ${Number(ward.daily_tariff).toFixed(2)}
+                      {(ward as Ward & { department?: string }).department || ward.ward_type || 'Inpatient'} ward · Daily tariff ${Number(ward.daily_tariff).toFixed(2)}
                     </div>
                   </div>
                   <div className="text-xs font-mono text-slate-700 tabular-nums">
@@ -441,6 +579,13 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right whitespace-nowrap space-x-1.5">
+                        <button
+                          onClick={() => openChartModal(adm)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+                        >
+                          <Stethoscope className="w-3 h-3" />
+                          <span>Chart</span>
+                        </button>
                         <button
                           onClick={() => setPrintRequest({ type: 'ipd_statement', admissionId: adm.id })}
                           className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
@@ -839,6 +984,384 @@ export const InpatientView: React.FC<InpatientViewProps> = ({ user, onNotify }) 
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Inpatient Clinical Chart Modal */}
+      {chartAdmission && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-lg max-w-4xl w-full max-h-[90vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+              <div>
+                <h3 className="font-display text-base font-semibold text-slate-900">
+                  Inpatient Clinical Chart · {chartAdmission.admission_number}
+                </h3>
+                <div className="text-xs text-slate-500 mt-0.5">
+                  {chartAdmission.first_name} {chartAdmission.last_name} ({chartAdmission.mrn}) ·{' '}
+                  {chartAdmission.ward_name} {chartAdmission.bed_number || 'Unassigned'} · Dx: {chartAdmission.admission_diagnosis}
+                </div>
+              </div>
+              <button onClick={() => setChartAdmission(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="px-6 pt-3 border-b border-slate-200 flex flex-wrap gap-1 bg-slate-50/70">
+              {(
+                [
+                  { id: 'rounds', label: `Ward Rounds (${chartDetail?.wardRounds?.length ?? 0})`, Icon: Stethoscope },
+                  { id: 'meds', label: `Medication Orders (${chartDetail?.medicationOrders?.length ?? 0})`, Icon: Pill },
+                  { id: 'notes', label: `Nursing Notes (${chartDetail?.nursingNotes?.length ?? 0})`, Icon: FileText },
+                  { id: 'vitals', label: `IPD Vitals (${chartDetail?.vitals?.length ?? 0})`, Icon: Activity },
+                ] as const
+              ).map(({ id, label, Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setChartTab(id)}
+                  className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium border-b-2 transition-colors ${
+                    chartTab === id
+                      ? 'border-teal-700 text-teal-800 bg-white'
+                      : 'border-transparent text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-5 text-xs flex-1">
+              {!chartDetail ? (
+                <div className="py-10 text-center text-slate-500">Loading inpatient clinical chart...</div>
+              ) : (
+                <>
+                  {chartTab === 'rounds' && (
+                    <div className="space-y-4">
+                      {canWriteRounds && chartAdmission.status !== 'discharged' && (
+                        <form onSubmit={handleSaveRound} className="p-4 bg-slate-50 border border-slate-200 rounded-md space-y-3">
+                          <div className="font-semibold text-slate-900">Record Doctor Ward Round (SOAP)</div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-slate-600 mb-1">Subjective</label>
+                              <textarea
+                                rows={2}
+                                value={roundForm.subjective}
+                                onChange={(e) => setRoundForm({ ...roundForm, subjective: e.target.value })}
+                                placeholder="Patient symptoms, overnight events..."
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">Objective</label>
+                              <textarea
+                                rows={2}
+                                value={roundForm.objective}
+                                onChange={(e) => setRoundForm({ ...roundForm, objective: e.target.value })}
+                                placeholder="Physical exam findings, lab trends..."
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                            <div>
+                              <label className="block font-medium text-slate-700 mb-1">Assessment *</label>
+                              <input
+                                required
+                                value={roundForm.assessment}
+                                onChange={(e) => setRoundForm({ ...roundForm, assessment: e.target.value })}
+                                placeholder="Clinical progress & working assessment"
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                            <div>
+                              <label className="block font-medium text-slate-700 mb-1">Plan *</label>
+                              <input
+                                required
+                                value={roundForm.plan}
+                                onChange={(e) => setRoundForm({ ...roundForm, plan: e.target.value })}
+                                placeholder="Medication adjustments, discharge criteria..."
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                          </div>
+                          <div className="flex justify-end">
+                            <button type="submit" className="px-4 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded">
+                              Save Ward Round
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                      <div className="divide-y divide-slate-200 border border-slate-200 rounded-md">
+                        {(!chartDetail.wardRounds || chartDetail.wardRounds.length === 0) ? (
+                          <div className="p-6 text-center text-slate-500">No ward rounds documented yet.</div>
+                        ) : (
+                          chartDetail.wardRounds.map((wr) => (
+                            <div key={wr.id} className="p-4 space-y-1.5">
+                              <div className="flex justify-between text-slate-500 font-mono">
+                                <span className="font-semibold text-slate-800">{wr.doctor_name || 'Attending'}</span>
+                                <span>{wr.recorded_at}</span>
+                              </div>
+                              {wr.subjective && <div><strong className="text-slate-600">S:</strong> {wr.subjective}</div>}
+                              {wr.objective && <div><strong className="text-slate-600">O:</strong> {wr.objective}</div>}
+                              <div><strong className="text-slate-700">A:</strong> {wr.assessment}</div>
+                              <div><strong className="text-slate-700">P:</strong> {wr.plan}</div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {chartTab === 'meds' && (
+                    <div className="space-y-4">
+                      {canOrderIpdMeds && chartAdmission.status !== 'discharged' && (
+                        <form onSubmit={handleSaveMedOrder} className="p-4 bg-slate-50 border border-slate-200 rounded-md space-y-3">
+                          <div className="font-semibold text-slate-900">Order Inpatient Medication (Auto-Schedules MAR)</div>
+                          <div className="grid grid-cols-1 sm:grid-cols-6 gap-2.5">
+                            {medCatalog.length > 0 && (
+                              <div className="sm:col-span-2">
+                                <label className="block text-slate-600 mb-1">Formulary Pick (Opt)</label>
+                                <select
+                                  value={medOrderForm.medicine_id}
+                                  onChange={(e) => {
+                                    const picked = medCatalog.find((m) => String(m.id) === e.target.value);
+                                    setMedOrderForm((prev) => ({
+                                      ...prev,
+                                      medicine_id: e.target.value,
+                                      medicine_name: picked ? `${picked.generic_name} ${picked.strength}`.trim() : prev.medicine_name,
+                                    }));
+                                  }}
+                                  className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white"
+                                >
+                                  <option value="">Custom / Free text</option>
+                                  {medCatalog.map((m) => (
+                                    <option key={m.id} value={m.id}>
+                                      {m.generic_name} {m.strength}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            )}
+                            <div className={medCatalog.length > 0 ? 'sm:col-span-2' : 'sm:col-span-3'}>
+                              <label className="block font-medium text-slate-700 mb-1">Medication Name *</label>
+                              <input
+                                required
+                                value={medOrderForm.medicine_name}
+                                onChange={(e) => setMedOrderForm({ ...medOrderForm, medicine_name: e.target.value })}
+                                placeholder="e.g. Ceftriaxone 1g"
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                            <div className={medCatalog.length > 0 ? 'sm:col-span-2' : 'sm:col-span-3'}>
+                              <label className="block font-medium text-slate-700 mb-1">Dose *</label>
+                              <input
+                                required
+                                value={medOrderForm.dose}
+                                onChange={(e) => setMedOrderForm({ ...medOrderForm, dose: e.target.value })}
+                                placeholder="e.g. 1g"
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                            <div className="sm:col-span-2">
+                              <label className="block text-slate-600 mb-1">Route</label>
+                              <select
+                                value={medOrderForm.route}
+                                onChange={(e) => setMedOrderForm({ ...medOrderForm, route: e.target.value })}
+                                className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white"
+                              >
+                                <option value="Oral">Oral</option>
+                                <option value="IV">IV</option>
+                                <option value="IM">IM</option>
+                                <option value="SC">SC</option>
+                                <option value="Topical">Topical</option>
+                                <option value="Inhaled">Inhaled</option>
+                              </select>
+                            </div>
+                            <div className="sm:col-span-2">
+                              <label className="block text-slate-600 mb-1">Frequency</label>
+                              <select
+                                value={medOrderForm.frequency}
+                                onChange={(e) => setMedOrderForm({ ...medOrderForm, frequency: e.target.value })}
+                                className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white"
+                              >
+                                <option value="OD">OD (08:00)</option>
+                                <option value="BID">BID (08:00, 20:00)</option>
+                                <option value="TID">TID (08:00, 14:00, 20:00)</option>
+                                <option value="QID">QID (06, 12, 18, 23)</option>
+                                <option value="STAT">STAT (Immediate)</option>
+                                <option value="PRN">PRN (As needed)</option>
+                              </select>
+                            </div>
+                            <div className="sm:col-span-2 flex items-end justify-between gap-2">
+                              <label className="inline-flex items-center gap-1.5 py-1.5 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={medOrderForm.prn}
+                                  onChange={(e) => setMedOrderForm({ ...medOrderForm, prn: e.target.checked })}
+                                />
+                                <span>PRN only</span>
+                              </label>
+                              <button type="submit" className="px-3.5 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded whitespace-nowrap">
+                                Add to MAR
+                              </button>
+                            </div>
+                          </div>
+                        </form>
+                      )}
+                      <div className="divide-y divide-slate-200 border border-slate-200 rounded-md">
+                        {(!chartDetail.medicationOrders || chartDetail.medicationOrders.length === 0) ? (
+                          <div className="p-6 text-center text-slate-500">No inpatient medication orders yet.</div>
+                        ) : (
+                          chartDetail.medicationOrders.map((mo) => (
+                            <div key={mo.id} className="p-3.5 flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <div className="font-semibold text-slate-900">
+                                  {mo.medicine_name} · {mo.dose}
+                                </div>
+                                <div className="text-slate-500 font-mono">
+                                  {mo.route} · {mo.frequency}{mo.prn === 1 ? ' (PRN)' : ''} · Ordered by {mo.ordered_by_name || 'Clinician'}
+                                </div>
+                              </div>
+                              <div className="font-mono text-slate-600">{mo.status} · {mo.created_at}</div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {chartTab === 'notes' && (
+                    <div className="space-y-4">
+                      {canWriteNotes && (
+                        <form onSubmit={handleSaveNursingNote} className="p-4 bg-slate-50 border border-slate-200 rounded-md space-y-3">
+                          <div className="font-semibold text-slate-900">Log Inpatient Nursing Note</div>
+                          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                            <div>
+                              <label className="block text-slate-600 mb-1">Note Type</label>
+                              <select
+                                value={noteForm.note_type}
+                                onChange={(e) => setNoteForm({ ...noteForm, note_type: e.target.value })}
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              >
+                                <option value="Shift Note">Shift Note</option>
+                                <option value="Handover">Handover</option>
+                                <option value="Intake/Output">Intake / Output</option>
+                                <option value="Wound Care">Wound / IV Site Care</option>
+                              </select>
+                            </div>
+                            <div className="sm:col-span-3">
+                              <label className="block font-medium text-slate-700 mb-1">Nursing Observation *</label>
+                              <input
+                                required
+                                value={noteForm.note}
+                                onChange={(e) => setNoteForm({ ...noteForm, note: e.target.value })}
+                                placeholder="Patient comfortable, IV site patent, output recorded..."
+                                className="w-full px-2.5 py-1.5 border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                          </div>
+                          <div className="flex justify-end">
+                            <button type="submit" className="px-4 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded">
+                              Log Nursing Note
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                      <div className="divide-y divide-slate-200 border border-slate-200 rounded-md">
+                        {(!chartDetail.nursingNotes || chartDetail.nursingNotes.length === 0) ? (
+                          <div className="p-6 text-center text-slate-500">No nursing notes recorded yet.</div>
+                        ) : (
+                          chartDetail.nursingNotes.map((nn) => (
+                            <div key={nn.id} className="p-3.5 space-y-1">
+                              <div className="flex justify-between font-mono text-slate-500">
+                                <span className="font-semibold text-teal-800">{nn.note_type} · {nn.nurse_name || 'Ward Nurse'}</span>
+                                <span>{nn.recorded_at}</span>
+                              </div>
+                              <div className="text-slate-800">{nn.note}</div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {chartTab === 'vitals' && (
+                    <div className="space-y-4">
+                      {canRecordIpdVitals && chartAdmission.status !== 'discharged' && (
+                        <form onSubmit={handleSaveIpdVitals} className="p-4 bg-slate-50 border border-slate-200 rounded-md space-y-3">
+                          <div className="font-semibold text-slate-900">Record Ward Vitals Chart</div>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                            <div>
+                              <label className="block text-slate-600 mb-1">BP Systolic</label>
+                              <input type="number" value={ipdVitalForm.bp_systolic} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, bp_systolic: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">BP Diastolic</label>
+                              <input type="number" value={ipdVitalForm.bp_diastolic} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, bp_diastolic: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">Temp (°C)</label>
+                              <input type="number" step="0.1" value={ipdVitalForm.temperature_c} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, temperature_c: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">SpO2 (%)</label>
+                              <input type="number" value={ipdVitalForm.spo2} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, spo2: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">Pulse (bpm)</label>
+                              <input type="number" value={ipdVitalForm.heart_rate} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, heart_rate: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div>
+                              <label className="block text-slate-600 mb-1">Resp Rate</label>
+                              <input type="number" value={ipdVitalForm.respiratory_rate} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, respiratory_rate: e.target.value })} className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white font-mono" />
+                            </div>
+                            <div className="sm:col-span-2">
+                              <label className="block text-slate-600 mb-1">Ward Observation Notes</label>
+                              <input value={ipdVitalForm.notes} onChange={(e) => setIpdVitalForm({ ...ipdVitalForm, notes: e.target.value })} placeholder="Pain score, posture, O2 flow..." className="w-full px-2 py-1.5 border border-slate-300 rounded bg-white" />
+                            </div>
+                          </div>
+                          <div className="flex justify-end">
+                            <button type="submit" className="px-4 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded">
+                              Record Ward Vitals
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                      <div className="divide-y divide-slate-200 border border-slate-200 rounded-md">
+                        {(!chartDetail.vitals || chartDetail.vitals.length === 0) ? (
+                          <div className="p-6 text-center text-slate-500">No vitals recorded for this admission yet.</div>
+                        ) : (
+                          chartDetail.vitals.map((vt) => {
+                            const tempVal = vt.temperature ?? vt.temperature_c;
+                            const hrVal = vt.pulse ?? vt.heart_rate;
+                            return (
+                              <div key={vt.id} className="p-3 flex flex-wrap items-center justify-between gap-2">
+                                <div className="font-mono tabular-nums text-slate-800">
+                                  BP <strong>{vt.bp_systolic ?? '-'}/{vt.bp_diastolic ?? '-'}</strong> · Temp{' '}
+                                  <strong className={Number(tempVal) >= 38.5 ? 'text-red-700' : 'text-slate-900'}>
+                                    {tempVal ?? '-'}°C
+                                  </strong>{' '}
+                                  · Pulse <strong>{hrVal ?? '-'}</strong> · SpO2{' '}
+                                  <strong className={Number(vt.spo2) < 92 ? 'text-red-700' : 'text-slate-900'}>
+                                    {vt.spo2 ?? '-'}%
+                                  </strong>{' '}
+                                  · RR <strong>{vt.respiratory_rate ?? '-'}</strong>
+                                  {vt.notes && <span className="font-sans text-slate-600"> — {vt.notes}</span>}
+                                </div>
+                                <div className="font-mono text-slate-400">
+                                  {vt.recorded_by_name ? `${vt.recorded_by_name} · ` : ''}
+                                  {vt.recorded_at}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </div>
       )}
