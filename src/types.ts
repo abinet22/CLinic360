@@ -1,10 +1,49 @@
+export type DashboardType =
+  | 'admin'
+  | 'doctor'
+  | 'nurse'
+  | 'cashier'
+  | 'lab'
+  | 'radiology'
+  | 'pharmacy'
+  | 'hr'
+  | 'accounting'
+  | 'general';
+
+export interface DepartmentInfo {
+  id: number;
+  code: string;
+  name: string;
+  category: string | null;
+  isPrimary: boolean;
+}
+
+export interface ClinicUnitInfo {
+  id: number;
+  roomCode: string;
+  name: string;
+  departmentId: number | null;
+  roomType: string | null;
+}
+
 export interface UserContext {
   id: number;
+  employeeId?: number | null;
+  username?: string | null;
   fullName: string;
   email: string;
   branchId: number;
+  status?: string;
   roles: string[];
   permissions: string[];
+  departmentIds?: number[];
+  departmentCodes?: string[];
+  departmentNames?: string[];
+  departments?: DepartmentInfo[];
+  clinicUnitIds?: number[];
+  clinicUnits?: ClinicUnitInfo[];
+  defaultDashboard?: DashboardType;
+  authorizedDashboards?: DashboardType[];
   mustChangePassword?: boolean;
   twoFaEnabled?: boolean;
 }
@@ -724,6 +763,11 @@ export interface ChartAccount {
   account_type: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
   normal_balance: 'debit' | 'credit';
   active: number;
+  parent_id?: number | null;
+  parent_code?: string | null;
+  parent_name?: string | null;
+  description?: string | null;
+  tx_count?: number;
   debit_total?: number;
   credit_total?: number;
   net_balance?: number;
@@ -788,9 +832,14 @@ export interface ExpenseVoucher {
   account_name: string;
   payee_name: string;
   amount: number;
+  paid_amount?: number;
   payment_method: string;
+  cash_bank_account_id?: number | null;
+  cash_bank_account_name?: string | null;
+  reference_number?: string | null;
+  attachment_ref?: string | null;
   description: string;
-  status: 'pending' | 'paid' | 'rejected';
+  status: 'pending' | 'approved' | 'partial' | 'paid' | 'rejected';
   requested_by_name: string | null;
   approved_by_name: string | null;
   paid_at: string | null;
@@ -838,35 +887,205 @@ export interface StaffContract {
   status: string;
 }
 
+export interface HrEmployee {
+  id: number;
+  employee_number: string;
+  user_id: number | null;
+  user_email?: string | null;
+  user_active?: number | null;
+  role_code?: string | null;
+  full_name: string;
+  gender: 'male' | 'female' | 'other' | 'unspecified' | string;
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+  emergency_contact_name: string | null;
+  emergency_contact_phone: string | null;
+  department_name: string;
+  job_position: string;
+  employment_type: 'full_time' | 'part_time' | 'contract' | 'locum' | string;
+  hire_date: string;
+  contract_start: string;
+  contract_end: string | null;
+  basic_salary: number;
+  housing_allowance: number;
+  licence_number: string | null;
+  licence_expiry: string | null;
+  licence_days_remaining?: number | null;
+  licence_alert?: 'none' | 'expired' | 'expiring_soon' | 'valid';
+  status: 'active' | 'inactive' | 'resigned' | 'terminated';
+  terminated_at: string | null;
+  termination_reason: string | null;
+  document_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface HrEmployeeDocument {
+  id: number;
+  employee_id: number;
+  employee_number?: string;
+  employee_name?: string;
+  doc_type: 'contract' | 'certificate' | 'id_document' | 'licence' | 'other' | string;
+  title: string;
+  file_ref: string | null;
+  expiry_date: string | null;
+  notes: string | null;
+  uploaded_by_name?: string | null;
+  created_at: string;
+}
+
+export interface HrAttendanceRecord {
+  id: number;
+  employee_id: number;
+  user_id: number | null;
+  employee_number: string;
+  full_name: string;
+  department_name: string;
+  attendance_date: string;
+  check_in: string | null;
+  check_out: string | null;
+  hours_worked: number;
+  status: 'present' | 'late' | 'early_departure' | 'absent' | 'on_leave';
+  late_minutes: number;
+  early_leave_minutes: number;
+  notes: string | null;
+}
+
+export interface HrLeaveType {
+  id: number;
+  code: string;
+  name: string;
+  annual_allowance_days: number;
+  paid: number;
+  description: string | null;
+  active: number;
+}
+
+export interface HrLeaveBalance {
+  employee_id: number;
+  employee_number: string;
+  full_name: string;
+  department_name: string;
+  leave_type_code: string;
+  leave_type_name: string;
+  annual_allowance_days: number;
+  used_days: number;
+  pending_days: number;
+  remaining_days: number;
+}
+
+export interface HrOvertimeRecord {
+  id: number;
+  employee_id: number;
+  user_id: number | null;
+  employee_number: string;
+  full_name: string;
+  department_name: string;
+  overtime_date: string;
+  hours: number;
+  day_type: 'regular' | 'weekend' | 'holiday';
+  rate_multiplier: number;
+  hourly_rate_snapshot: number;
+  computed_amount: number;
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  payroll_run_id: number | null;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  created_at: string;
+}
+
+export interface HrAdjustment {
+  id: number;
+  employee_id: number;
+  user_id: number | null;
+  employee_number: string;
+  full_name: string;
+  department_name: string;
+  adjustment_type: 'earning' | 'deduction';
+  category: string;
+  description: string;
+  amount: number;
+  effective_month: string;
+  effective_date: string | null;
+  recurring: number;
+  status: 'active' | 'cancelled';
+  created_by_name?: string | null;
+  created_at: string;
+}
+
+export interface HrMonthlySubmission {
+  id: number;
+  pay_month: string;
+  status: 'draft' | 'submitted' | 'processed';
+  total_employees: number;
+  total_attendance_hours: number;
+  total_overtime_amount: number;
+  total_extra_earnings: number;
+  total_extra_deductions: number;
+  notes: string | null;
+  submitted_by_name: string | null;
+  submitted_at: string;
+}
+
 export interface LeaveRequest {
   id: number;
-  user_id: number;
+  user_id: number | null;
+  employee_id?: number | null;
+  employee_number?: string | null;
+  department_name?: string | null;
   staff_name: string;
   role_code: string;
-  leave_type: 'annual' | 'sick' | 'study' | 'emergency';
+  leave_type: string;
   start_date: string;
   end_date: string;
   days_count: number;
   reason: string;
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   decided_by_name: string | null;
+  decision_note?: string | null;
   created_at: string;
+}
+
+export interface PayrollComponent {
+  id: number;
+  code: string;
+  name: string;
+  component_type: 'earning' | 'deduction';
+  calc_method: 'fixed' | 'percentage' | 'manual';
+  default_value: number;
+  account_code: string;
+  is_recurring: number;
+  is_taxable: number;
+  is_pensionable: number;
+  active: number;
 }
 
 export interface PayrollItem {
   id: number;
   payroll_run_id: number;
-  user_id: number;
+  user_id: number | null;
+  employee_id?: number | null;
   staff_name: string;
   role_code: string;
   base_salary: number;
   allowances: number;
   taxable_allowances?: number;
+  overtime_pay?: number;
+  bonus_earnings?: number;
   pension_employee?: number;
   pension_employer?: number;
   paye_tax?: number;
+  other_deductions?: number;
   tax_deduction: number;
   net_pay: number;
+  paid_amount?: number;
+  payment_status?: 'unpaid' | 'partial' | 'paid';
+  payment_method?: string | null;
+  payment_ref?: string | null;
+  paid_at?: string | null;
 }
 
 export interface PayrollRun {
@@ -876,7 +1095,7 @@ export interface PayrollRun {
   total_gross: number;
   total_deductions: number;
   total_net: number;
-  status: 'draft' | 'verified' | 'approved' | 'posted' | 'paid';
+  status: 'draft' | 'verified' | 'approved' | 'posted' | 'partially_paid' | 'paid' | 'rejected';
   journal_entry_id: number | null;
   journal_entry_number: string | null;
   payment_journal_entry_number?: string | null;
@@ -895,6 +1114,107 @@ export interface StaffPayslip extends PayrollItem {
   run_status: string;
   posted_at: string | null;
   paid_at: string | null;
+  employee_code?: string | null;
+  department_name?: string | null;
+}
+
+export interface CashBankAccount {
+  id: number;
+  account_name: string;
+  account_type: 'cash' | 'bank';
+  account_number: string | null;
+  bank_name: string | null;
+  coa_code: string;
+  opening_balance: number;
+  current_balance: number;
+  active: number;
+}
+
+export interface CashBankTransfer {
+  id: number;
+  transfer_number: string;
+  transfer_date: string;
+  from_account_id: number;
+  to_account_id: number;
+  from_account_name: string;
+  to_account_name: string;
+  amount: number;
+  reference_no: string | null;
+  notes: string | null;
+  journal_entry_number?: string | null;
+  created_by_name?: string | null;
+}
+
+export interface FinancePayment {
+  id: number;
+  payment_number: string;
+  payment_date: string;
+  payment_category: string;
+  payee_name: string;
+  cash_bank_account_id: number;
+  cash_bank_account_name: string;
+  payment_method: string;
+  amount: number;
+  reference_no: string | null;
+  attachment_ref: string | null;
+  linked_type: string | null;
+  linked_id: number | null;
+  notes: string | null;
+  journal_entry_number?: string | null;
+  created_by_name?: string | null;
+  created_at: string;
+}
+
+export interface FinanceReceipt {
+  id: number;
+  receipt_number: string;
+  receipt_date: string;
+  income_category: string;
+  payer_name: string;
+  cash_bank_account_id: number;
+  cash_bank_account_name: string;
+  payment_method: string;
+  amount: number;
+  reference_no: string | null;
+  attachment_ref: string | null;
+  notes: string | null;
+  journal_entry_number?: string | null;
+  created_by_name?: string | null;
+  created_at: string;
+}
+
+export interface GrvRecord {
+  id: number;
+  grn_number: string;
+  supplier_name: string;
+  invoice_ref: string | null;
+  delivery_date: string | null;
+  received_date: string | null;
+  department_name: string | null;
+  attachment_ref: string | null;
+  approval_status: 'pending' | 'approved' | 'rejected';
+  rejected_reason?: string | null;
+  total_cost: number;
+  notes: string | null;
+  received_by_name: string | null;
+  approved_by_name: string | null;
+  bill_number: string | null;
+  bill_status: string | null;
+  bill_paid_amount: number | null;
+  items_summary?: string;
+  received_at: string;
+}
+
+export interface BalanceSheetData {
+  assets: Array<ChartAccount & { debit_total: number; credit_total: number; net_balance: number }>;
+  liabilities: Array<ChartAccount & { debit_total: number; credit_total: number; net_balance: number }>;
+  equity: Array<ChartAccount & { debit_total: number; credit_total: number; net_balance: number }>;
+  currentNetIncome: number;
+  totalAssets: number;
+  totalLiabilities: number;
+  totalEquity: number;
+  totalLiabilitiesAndEquity: number;
+  balanced: boolean;
 }
 
 export interface ClinicSettings {
@@ -903,7 +1223,209 @@ export interface ClinicSettings {
   currencySymbol: string;
   timezone: string;
   expenseAutoPostLimit?: number;
+  profile?: {
+    legalName: string;
+    facilityCode: string;
+    address: string;
+    phone: string;
+    email: string;
+    operatingHours: string;
+    taxId: string;
+  };
+  clinical?: {
+    mrnPrefix: string;
+    visitPrefix: string;
+    defaultSlotMinutes: number;
+    maxDailyPatientsPerDoctor: number;
+    allowWalkInRegistration: boolean;
+    requireVitalsBeforeConsultation: boolean;
+    requirePaymentBeforeConsultation: boolean;
+    vitalReferenceRanges: {
+      bpSystolicMin: number;
+      bpSystolicMax: number;
+      bpDiastolicMin: number;
+      bpDiastolicMax: number;
+      tempMinC: number;
+      tempMaxC: number;
+      pulseMin: number;
+      pulseMax: number;
+      spo2Min: number;
+    };
+    autoAssignRoomBySpecialty: boolean;
+  };
+  billing?: {
+    defaultTaxRatePct: number;
+    cashierMaxDiscountPct: number;
+    requireShiftForCollection: boolean;
+    allowPartialPayments: boolean;
+    allowInsuranceCreditBilling: boolean;
+    receiptFooterNote: string;
+  };
+  notifications?: {
+    enableInAppAlerts: boolean;
+    enableSmsAlerts: boolean;
+    enableEmailAlerts: boolean;
+    notifyDoctorOnAssignment: boolean;
+    notifyNurseOnPaymentClearance: boolean;
+    notifyAdminOnAccessReview: boolean;
+    criticalLabAlertImmediate: boolean;
+  };
+  documents?: {
+    prescriptionHeader: string;
+    labReportHeader: string;
+    radiologyHeader: string;
+    invoiceHeader: string;
+    showClinicStampOnPrint: boolean;
+  };
+  security?: {
+    sessionTimeoutMinutes: number;
+    passwordMinLength: number;
+    requireMixedCasePassword: boolean;
+    maxFailedLoginAttempts: number;
+    lockoutDurationMinutes: number;
+    enforce2faForPrivilegedRoles: boolean;
+    allowMultipleActiveSessions: boolean;
+  };
+  lastBackupVerifiedAt?: string | null;
+  lastBackupVerifiedBy?: string | null;
 }
+
+export interface StaffUserRow {
+  id: number;
+  employee_id?: number | null;
+  employee_number?: string | null;
+  hr_department_name?: string | null;
+  hr_job_position?: string | null;
+  hr_status?: string | null;
+  access_review_required?: number;
+  username?: string | null;
+  full_name: string;
+  email: string;
+  specialty: string | null;
+  active: number;
+  status: 'active' | 'inactive' | 'locked' | string;
+  exception_approved?: number;
+  must_change_password?: number;
+  two_fa_enabled?: number;
+  failed_attempts?: number;
+  locked_until?: string | null;
+  last_login_at: string | null;
+  created_at?: string;
+  role_code: string;
+  role_name: string;
+  department_names?: string;
+  department_ids?: number[];
+  clinic_unit_ids?: number[];
+  active_session_count?: number;
+}
+
+export interface HrEmployeeAdminOption {
+  id: number;
+  employee_number: string;
+  user_id: number | null;
+  full_name: string;
+  gender: string;
+  phone: string | null;
+  email: string | null;
+  department_name: string;
+  job_position: string;
+  employment_type: string;
+  status: 'active' | 'inactive' | 'terminated' | string;
+  terminated_at: string | null;
+  termination_reason: string | null;
+  access_review_required: number;
+  access_reviewed_at: string | null;
+  has_system_account: boolean;
+  account_count: number;
+  linked_user_id: number | null;
+  linked_username: string | null;
+  linked_email: string | null;
+  linked_status: string | null;
+  linked_roles: string;
+}
+
+export interface DepartmentConfig {
+  id: number;
+  code: string;
+  name: string;
+  category: string;
+  head_name: string | null;
+  description: string | null;
+  active: number;
+  assigned_staff_count?: number;
+  active_room_count?: number;
+}
+
+export interface SpecialtyConfig {
+  id: number;
+  code: string;
+  name: string;
+  department_id: number | null;
+  department_name?: string | null;
+  description: string | null;
+  consultation_fee: number;
+  active: number;
+}
+
+export interface ClinicRoomConfig {
+  id: number;
+  room_code: string;
+  name: string;
+  department_id: number | null;
+  department_name?: string | null;
+  specialty_id: number | null;
+  specialty_name?: string | null;
+  room_type: string;
+  capacity: number;
+  active: number;
+}
+
+export interface DoctorProfileConfig {
+  id: number;
+  username: string | null;
+  full_name: string;
+  email: string;
+  specialty: string | null;
+  active: number;
+  status: string;
+  employee_number: string | null;
+  hr_department_name: string | null;
+  licence_number: string | null;
+  licence_expiry: string | null;
+  assigned_rooms: string;
+  active_visits_count: number;
+}
+
+export interface UserSessionRow {
+  jti: string;
+  user_id: number;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revoked_by: number | null;
+}
+
+export interface BackupStatusResponse {
+  dialect: 'sqlite' | 'mysql';
+  mysqlConfigured: boolean;
+  sqliteFileBytes: number | null;
+  sqliteIntegrity: string;
+  lastBackupVerifiedAt: string | null;
+  lastBackupVerifiedBy: string | null;
+  tableCounts: {
+    patients: number;
+    visits: number;
+    invoices: number;
+    auditLogs: number;
+    hrEmployees: number;
+    users: number;
+    activeSessions: number;
+  };
+}
+
 
 
 

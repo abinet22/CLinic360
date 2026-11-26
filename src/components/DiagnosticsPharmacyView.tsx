@@ -16,9 +16,10 @@ import { PrintDocumentModal, type PrintDocRequest } from './PrintDocumentModal';
 interface DiagnosticsPharmacyViewProps {
   user: UserContext;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
+  initialTab?: 'lab' | 'imaging' | 'pharmacy';
 }
 
-export const DiagnosticsPharmacyView: React.FC<DiagnosticsPharmacyViewProps> = ({ user, onNotify }) => {
+export const DiagnosticsPharmacyView: React.FC<DiagnosticsPharmacyViewProps> = ({ user, onNotify, initialTab }) => {
   const canLab = user.permissions.includes('lab.order.read');
   const canImaging = user.permissions.includes('imaging.order.read');
   const canPharmacy = user.permissions.includes('pharmacy.prescription.read');
@@ -26,8 +27,14 @@ export const DiagnosticsPharmacyView: React.FC<DiagnosticsPharmacyViewProps> = (
 
   const canBypassGate = user.permissions.includes('payment.gate.bypass');
 
-  const defaultTab = canLab ? 'lab' : canImaging ? 'imaging' : 'pharmacy';
+  const defaultTab = initialTab || (canLab ? 'lab' : canImaging ? 'imaging' : 'pharmacy');
   const [tab, setTab] = useState<'lab' | 'imaging' | 'pharmacy'>(defaultTab);
+
+  useEffect(() => {
+    if (initialTab) {
+      setTab(initialTab);
+    }
+  }, [initialTab]);
   const [labOrders, setLabOrders] = useState<LabOrder[]>([]);
   const [imagingOrders, setImagingOrders] = useState<ImagingOrder[]>([]);
   const [prescriptions, setPrescriptions] = useState<Prescription[]>([]);

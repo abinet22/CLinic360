@@ -4,58 +4,69 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
+import { Bell, KeyRound, Menu, X } from 'lucide-react';
+import { apiFetch, setAuthToken } from './lib/api';
+import { AuthProvider } from './lib/authContext';
+import { resetRealtimeStream, setRealtimeAuthenticated, useRealtimeSync } from './lib/useRealtimeSync';
+import type { AppNotification, ClinicUnitInfo, DashboardType, DepartmentInfo, UserContext } from './types';
 import {
-  Activity,
-  BedDouble,
-  Bell,
-  BookOpen,
-  Briefcase,
-  Calendar,
-  CreditCard,
-  FlaskConical,
-  KeyRound,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  Package,
-  ShieldCheck,
-  Users,
-  X,
-} from 'lucide-react';
-import { apiFetch, getAuthToken, setAuthToken } from './lib/api';
-import { resetRealtimeStream, useRealtimeSync } from './lib/useRealtimeSync';
-import type { AppNotification, UserContext } from './types';
+  buildPathForRoute,
+  DASHBOARD_METADATA,
+  filterNavigationForUser,
+  getRequiredPermissionsForRoute,
+  resolvePathToState,
+  type FilteredNavItem,
+  type TabKey,
+} from './config/navigationConfig';
 import { LoginView } from './components/LoginView';
-import { DashboardView } from './components/DashboardView';
+import { Sidebar } from './components/Sidebar';
+import { DashboardRouter } from './components/DashboardRouter';
+import { ProtectedRoute } from './components/ProtectedRoute';
+import { UnauthorizedView } from './components/UnauthorizedView';
 import { PatientsQueueView } from './components/PatientsQueueView';
 import { AppointmentsView } from './components/AppointmentsView';
 import { ClinicalOpdView } from './components/ClinicalOpdView';
 import { DiagnosticsPharmacyView } from './components/DiagnosticsPharmacyView';
 import { InpatientView } from './components/InpatientView';
 import { BillingCashierView } from './components/BillingCashierView';
-import { AdminAuditView } from './components/AdminAuditView';
+import { AdminAuditView, type AdminTab } from './components/AdminAuditView';
 import { StoreInventoryView } from './components/StoreInventoryView';
 import { AccountingReportsView } from './components/AccountingReportsView';
 import { HrPayrollView } from './components/HrPayrollView';
 
-type TabKey =
-  | 'dashboard'
-  | 'patients'
-  | 'appointments'
-  | 'clinical'
-  | 'diagnostics'
-  | 'store'
-  | 'ipd'
-  | 'billing'
-  | 'accounting'
-  | 'hr'
-  | 'governance';
+interface AuthPayload {
+  user?: UserContext;
+  roles?: string[];
+  permissions?: string[];
+  departments?: DepartmentInfo[];
+  clinic_units?: ClinicUnitInfo[];
+  dashboard_type?: DashboardType;
+  defaultDashboard?: DashboardType;
+  authorizedDashboards?: DashboardType[];
+  dialect?: string;
+}
+
+function normalizeUserContext(res: AuthPayload): UserContext | null {
+  if (!res.user || !Array.isArray(res.user.permissions)) return null;
+  return {
+    ...res.user,
+    roles: res.roles ?? res.user.roles,
+    permissions: res.permissions ?? res.user.permissions,
+    departments: res.departments ?? res.user.departments,
+    clinicUnits: res.clinic_units ?? res.user.clinicUnits,
+    defaultDashboard: res.defaultDashboard ?? res.dashboard_type ?? res.user.defaultDashboard,
+    authorizedDashboards: res.authorizedDashboards ?? res.user.authorizedDashboards,
+  };
+}
 
 export default function App() {
   const [user, setUser] = useState<UserContext | null>(null);
   const [dialect, setDialect] = useState<string>('sqlite');
   const [checkingSession, setCheckingSession] = useState(true);
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [activeSubView, setActiveSubView] = useState<string | undefined>(undefined);
+  const [activeDashboard, setActiveDashboard] = useState<DashboardType | undefined>(undefined);
+  const [activeNavKey, setActiveNavKey] = useState<string>('dashboard');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
@@ -79,26 +90,51 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    const token = getAuthToken();
-    if (!token) {
-      setCheckingSession(false);
-      return;
+  const syncRouteFromLocation = useCallback((ctx: UserContext) => {
+    const defDash: DashboardType = ctx.defaultDashboard || 'general';
+    const currentPath = typeof window !== 'undefined' ? window.location.pathname : '/';
+    const resolved = resolvePathToState(currentPath, defDash);
+    setActiveTab(resolved.tab);
+    setActiveSubView(resolved.subView);
+    setActiveDashboard(resolved.dashboardType);
+    if (resolved.navKey) {
+      setActiveNavKey(resolved.navKey);
     }
-    apiFetch<{ user?: UserContext; dialect?: string }>('/api/auth/me')
+    if (typeof window !== 'undefined' && (currentPath === '/' || currentPath === '/dashboard')) {
+      const targetPath = DASHBOARD_METADATA[defDash]?.path || '/dashboard';
+      window.history.replaceState(null, '', targetPath);
+    }
+  }, []);
+
+  useEffect(() => {
+    apiFetch<AuthPayload>('/api/auth/me')
       .then((res) => {
-        if (res?.user && Array.isArray(res.user.permissions)) {
-          setUser(res.user);
+        const normalized = normalizeUserContext(res);
+        if (normalized) {
+          setUser(normalized);
           setDialect(res.dialect || 'sqlite');
+          setRealtimeAuthenticated(true);
+          syncRouteFromLocation(normalized);
         } else {
           setAuthToken(null);
+          setRealtimeAuthenticated(false);
         }
       })
       .catch(() => {
         setAuthToken(null);
+        setRealtimeAuthenticated(false);
       })
       .finally(() => setCheckingSession(false));
-  }, []);
+  }, [syncRouteFromLocation]);
+
+  useEffect(() => {
+    if (!user) return;
+    const handlePopState = () => {
+      syncRouteFromLocation(user);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [user, syncRouteFromLocation]);
 
   useEffect(() => {
     if (user) {
@@ -127,12 +163,18 @@ export default function App() {
   async function handleLogout() {
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setAuthToken(null);
-    resetRealtimeStream();
+    resetRealtimeStream(false);
     setUser(null);
     setNotifications([]);
     setUnreadCount(0);
     setNotifOpen(false);
     setActiveTab('dashboard');
+    setActiveSubView(undefined);
+    setActiveDashboard(undefined);
+    setActiveNavKey('dashboard');
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/');
+    }
   }
 
   if (checkingSession) {
@@ -149,90 +191,69 @@ export default function App() {
         onSuccess={(u, d) => {
           setUser(u);
           setDialect(d);
-          resetRealtimeStream();
+          resetRealtimeStream(true);
+          const defDash: DashboardType = u.defaultDashboard || 'general';
           setActiveTab('dashboard');
+          setActiveSubView(undefined);
+          setActiveDashboard(defDash);
+          setActiveNavKey('dashboard');
+          if (typeof window !== 'undefined') {
+            window.history.pushState(null, '', DASHBOARD_METADATA[defDash]?.path || '/dashboard');
+          }
         }}
       />
     );
   }
 
-  const perms = user.permissions;
-  const allNavItems: Array<{ key: TabKey; label: string; icon: React.ComponentType<{ className?: string }>; visible: boolean }> = [
-    { key: 'dashboard', label: 'Overview', icon: LayoutDashboard, visible: true },
-    { key: 'patients', label: 'Patients & Queue', icon: Users, visible: perms.includes('patient.read') },
-    { key: 'appointments', label: 'Appointments', icon: Calendar, visible: perms.includes('appointment.read') },
-    {
-      key: 'clinical',
-      label: 'Triage & OPD',
-      icon: Activity,
-      visible: perms.includes('visit.read') || perms.includes('vitals.read'),
-    },
-    {
-      key: 'diagnostics',
-      label: 'Diagnostics & Rx',
-      icon: FlaskConical,
-      visible:
-        perms.includes('lab.order.read') ||
-        perms.includes('imaging.order.read') ||
-        perms.includes('pharmacy.prescription.read'),
-    },
-    {
-      key: 'store',
-      label: 'Store & FEFO',
-      icon: Package,
-      visible: perms.includes('store.item.read'),
-    },
-    {
-      key: 'ipd',
-      label: 'Inpatient & Beds',
-      icon: BedDouble,
-      visible: perms.includes('ipd.admission.read'),
-    },
-    {
-      key: 'billing',
-      label: 'Cashier & Billing',
-      icon: CreditCard,
-      visible: perms.includes('billing.invoice.read') || perms.includes('billing.shift.manage'),
-    },
-    {
-      key: 'accounting',
-      label: 'Finance & Reports',
-      icon: BookOpen,
-      visible:
-        perms.includes('finance.report.view') ||
-        perms.includes('accounting.ledger.manage') ||
-        perms.includes('accounting.expense.create') ||
-        perms.includes('accounting.period.manage') ||
-        perms.includes('accounting.journal.reverse'),
-    },
-    {
-      key: 'hr',
-      label: 'HR & Payroll',
-      icon: Briefcase,
-      visible:
-        perms.includes('hr.manage') ||
-        perms.includes('hr.leave.request') ||
-        perms.includes('hr.payroll.verify') ||
-        perms.includes('hr.payroll.approve') ||
-        perms.includes('hr.payroll.post') ||
-        perms.includes('hr.payroll.pay') ||
-        perms.includes('hr.payslip.own'),
-    },
-    {
-      key: 'governance',
-      label: 'Users & Audit Log',
-      icon: ShieldCheck,
-      visible:
-        perms.includes('audit.read') ||
-        perms.includes('admin.user.manage') ||
-        perms.includes('admin.role.manage') ||
-        perms.includes('admin.settings.manage') ||
-        perms.includes('catalog.manage'),
-    },
-  ];
-  const navItems = allNavItems.filter((item) => item.visible);
+  const defaultDashboard: DashboardType = user.defaultDashboard || 'general';
+  const navGroups = filterNavigationForUser(user.permissions, user.roles, defaultDashboard);
+  const flatNavItems = navGroups.flatMap((g) => g.items);
+  const currentNav =
+    flatNavItems.find((i) => i.key === activeNavKey) ||
+    flatNavItems.find((i) => i.tab === activeTab) ||
+    flatNavItems[0];
 
-  const currentNav = navItems.find((i) => i.key === activeTab) || navItems[0];
+  function pushRoutePath(path: string) {
+    if (typeof window !== 'undefined' && window.location.pathname !== path) {
+      window.history.pushState(null, '', path);
+    }
+  }
+
+  function handleSelectNavItem(item: FilteredNavItem) {
+    setActiveTab(item.tab);
+    setActiveSubView(item.subView);
+    setActiveDashboard(item.tab === 'dashboard' ? item.dashboardType || defaultDashboard : undefined);
+    setActiveNavKey(item.key);
+    pushRoutePath(item.path);
+  }
+
+  function handleSelectDashboard(dashboard: DashboardType) {
+    setActiveTab('dashboard');
+    setActiveSubView(undefined);
+    setActiveDashboard(dashboard);
+    setActiveNavKey('dashboard');
+    pushRoutePath(DASHBOARD_METADATA[dashboard]?.path || '/dashboard');
+  }
+
+  function handleNavigate(tab: string, subView?: string) {
+    const targetTab = tab as TabKey;
+    if (targetTab === 'dashboard') {
+      handleSelectDashboard(defaultDashboard);
+      setMobileNavOpen(false);
+      return;
+    }
+    const match =
+      flatNavItems.find((i) => i.tab === targetTab && (!subView || i.subView === subView)) ||
+      flatNavItems.find((i) => i.tab === targetTab);
+    setActiveTab(targetTab);
+    setActiveSubView(subView ?? match?.subView);
+    setActiveDashboard(undefined);
+    if (match) {
+      setActiveNavKey(match.key);
+    }
+    pushRoutePath(buildPathForRoute(targetTab, subView ?? match?.subView));
+    setMobileNavOpen(false);
+  }
 
   if (user.mustChangePassword) {
     return (
@@ -247,98 +268,49 @@ export default function App() {
     );
   }
 
+  const activeRequiredPerms = getRequiredPermissionsForRoute(activeTab, activeSubView);
+  const breadcrumbTitle =
+    activeTab === 'unauthorized'
+      ? 'Access Denied'
+      : activeTab === 'dashboard'
+        ? DASHBOARD_METADATA[activeDashboard || defaultDashboard]?.label || 'Dashboard'
+        : currentNav?.displayLabel || 'Workspace';
+
   return (
-    <div className="min-h-screen bg-slate-50 flex print-hide-when-modal">
-      {/* Mobile Sidebar Backdrop */}
-      {mobileNavOpen && (
-        <div
-          className="fixed inset-0 z-30 bg-slate-900/40 lg:hidden"
-          onClick={() => setMobileNavOpen(false)}
+    <AuthProvider user={user} dialect={dialect}>
+      <div className="min-h-screen bg-slate-50 flex print-hide-when-modal">
+        {mobileNavOpen && (
+          <div
+            className="fixed inset-0 z-30 bg-slate-900/40 lg:hidden"
+            onClick={() => setMobileNavOpen(false)}
+          />
+        )}
+
+        <Sidebar
+          activeNavKey={activeNavKey}
+          activeTab={activeTab}
+          mobileNavOpen={mobileNavOpen}
+          onCloseMobile={() => setMobileNavOpen(false)}
+          onSelectItem={handleSelectNavItem}
+          onLogout={handleLogout}
         />
-      )}
 
-      {/* Left Sidebar (248px) */}
-      <aside
-        className={`no-print fixed lg:static inset-y-0 left-0 z-40 w-[248px] bg-white border-r border-slate-200 flex flex-col justify-between transition-transform duration-150 ${
-          mobileNavOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
-        }`}
-      >
-        <div>
-          <div className="h-14 px-5 border-b border-slate-200 flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded bg-teal-700 text-white flex items-center justify-center font-display font-bold text-xs">
-                C3
+        <div className="flex-1 flex flex-col min-w-0">
+          <header className="no-print h-14 bg-white border-b border-slate-200 px-5 lg:px-8 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3 min-w-0">
+              <button
+                onClick={() => setMobileNavOpen(true)}
+                className="lg:hidden p-1.5 text-slate-600 hover:text-slate-900"
+                aria-label="Open menu"
+              >
+                <Menu className="w-5 h-5" />
+              </button>
+              <div className="text-xs text-slate-500 flex items-center gap-2 truncate">
+                <span className="font-medium text-slate-900">Clinic360 Central</span>
+                <span aria-hidden="true">/</span>
+                <span className="font-semibold text-teal-800 truncate">{breadcrumbTitle}</span>
               </div>
-              <span className="font-display font-bold text-base tracking-tight text-slate-900 whitespace-nowrap">
-                Clinic360
-              </span>
             </div>
-            <button onClick={() => setMobileNavOpen(false)} className="lg:hidden text-slate-400">
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-
-          <nav className="p-3 space-y-1">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const isActive = activeTab === item.key;
-              return (
-                <button
-                  key={item.key}
-                  onClick={() => {
-                    setActiveTab(item.key);
-                    setMobileNavOpen(false);
-                  }}
-                  className={`w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                    isActive
-                      ? 'bg-teal-50 text-teal-800'
-                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                  }`}
-                >
-                  <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-teal-700' : 'text-slate-400'}`} />
-                  <span>{item.label}</span>
-                </button>
-              );
-            })}
-          </nav>
-        </div>
-
-        {/* Active Staff Footer */}
-        <div className="p-4 border-t border-slate-200 space-y-3">
-          <div className="text-xs">
-            <div className="font-semibold text-slate-900 truncate">{user.fullName}</div>
-            <div className="text-slate-500 mt-0.5 font-mono">
-              Role: {user.roles.join(', ')} · {dialect.toUpperCase()}
-            </div>
-          </div>
-          <button
-            onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-md"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            <span>Switch User / Sign Out</span>
-          </button>
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Bar Contract: Breadcrumb Left, Single Action / Context Right */}
-        <header className="no-print h-14 bg-white border-b border-slate-200 px-5 lg:px-8 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
-            <button
-              onClick={() => setMobileNavOpen(true)}
-              className="lg:hidden p-1.5 text-slate-600 hover:text-slate-900"
-              aria-label="Open menu"
-            >
-              <Menu className="w-5 h-5" />
-            </button>
-            <div className="text-xs text-slate-500 flex items-center gap-2 truncate">
-              <span className="font-medium text-slate-900">Clinic360 Central</span>
-              <span aria-hidden="true">/</span>
-              <span className="font-semibold text-teal-800 truncate">{currentNav?.label}</span>
-            </div>
-          </div>
 
           <div className="flex items-center gap-3 shrink-0 relative">
             <span className="hidden sm:inline text-xs text-slate-500 font-mono">
@@ -432,20 +404,105 @@ export default function App() {
         )}
 
         <main className="flex-1 p-5 lg:p-8 max-w-[1440px] w-full mx-auto">
-          {activeTab === 'dashboard' && <DashboardView user={user} onNavigate={(t) => setActiveTab(t as TabKey)} />}
-          {activeTab === 'patients' && <PatientsQueueView user={user} onNotify={notify} />}
-          {activeTab === 'appointments' && <AppointmentsView user={user} onNotify={notify} />}
-          {activeTab === 'clinical' && <ClinicalOpdView user={user} onNotify={notify} />}
-          {activeTab === 'diagnostics' && <DiagnosticsPharmacyView user={user} onNotify={notify} />}
-          {activeTab === 'store' && <StoreInventoryView user={user} onNotify={notify} />}
-          {activeTab === 'ipd' && <InpatientView user={user} onNotify={notify} />}
-          {activeTab === 'billing' && <BillingCashierView user={user} onNotify={notify} />}
-          {activeTab === 'accounting' && <AccountingReportsView user={user} onNotify={notify} />}
-          {activeTab === 'hr' && <HrPayrollView user={user} onNotify={notify} />}
-          {activeTab === 'governance' && <AdminAuditView user={user} onNotify={notify} />}
+          {activeTab === 'dashboard' && (
+            <DashboardRouter
+              activeDashboard={activeDashboard}
+              onSelectDashboard={handleSelectDashboard}
+              onNavigate={handleNavigate}
+            />
+          )}
+          {activeTab === 'unauthorized' && (
+            <UnauthorizedView
+              attemptedPath={typeof window !== 'undefined' ? window.location.pathname : '/unauthorized'}
+              onReturnToDashboard={handleSelectDashboard}
+            />
+          )}
+          {activeTab !== 'dashboard' && activeTab !== 'unauthorized' && (
+            <ProtectedRoute
+              requiredAnyPermissions={activeRequiredPerms}
+              attemptedPath={typeof window !== 'undefined' ? window.location.pathname : undefined}
+              onReturnToDashboard={handleSelectDashboard}
+            >
+              {activeTab === 'patients' && (
+                <PatientsQueueView
+                  user={user}
+                  onNotify={notify}
+                  initialSubTab={
+                    activeSubView === 'register' ||
+                    activeSubView === 'visits' ||
+                    activeSubView === 'assign_doctor' ||
+                    activeSubView === 'queue'
+                      ? activeSubView
+                      : 'patients'
+                  }
+                />
+              )}
+              {activeTab === 'appointments' && <AppointmentsView user={user} onNotify={notify} />}
+              {activeTab === 'clinical' && (
+                <ClinicalOpdView
+                  user={user}
+                  onNotify={notify}
+                  initialSection={
+                    activeSubView === 'vitals_only' ||
+                    activeSubView === 'consultations' ||
+                    activeSubView === 'prescriptions' ||
+                    activeSubView === 'lab_requests' ||
+                    activeSubView === 'reports'
+                      ? activeSubView
+                      : 'all'
+                  }
+                />
+              )}
+              {activeTab === 'diagnostics' && (
+                <DiagnosticsPharmacyView
+                  user={user}
+                  onNotify={notify}
+                  initialTab={
+                    activeSubView === 'lab' || activeSubView === 'imaging' || activeSubView === 'pharmacy'
+                      ? activeSubView
+                      : undefined
+                  }
+                />
+              )}
+              {activeTab === 'store' && <StoreInventoryView user={user} onNotify={notify} />}
+              {activeTab === 'ipd' && <InpatientView user={user} onNotify={notify} />}
+              {activeTab === 'billing' && (
+                <BillingCashierView
+                  user={user}
+                  onNotify={notify}
+                  initialSubTab={
+                    activeSubView === 'payments' ||
+                    activeSubView === 'deposits' ||
+                    activeSubView === 'approvals' ||
+                    activeSubView === 'bypasses' ||
+                    activeSubView === 'shifts' ||
+                    activeSubView === 'reports'
+                      ? activeSubView
+                      : 'invoices'
+                  }
+                />
+              )}
+              {activeTab === 'accounting' && <AccountingReportsView user={user} onNotify={notify} />}
+              {activeTab === 'hr' && (
+                <HrPayrollView
+                  user={user}
+                  onNotify={notify}
+                  initialSubTab={activeSubView === 'payroll' ? 'payroll' : undefined}
+                />
+              )}
+              {activeTab === 'governance' && (
+                <AdminAuditView
+                  user={user}
+                  initialTab={activeSubView as AdminTab | undefined}
+                  onNotify={notify}
+                />
+              )}
+            </ProtectedRoute>
+          )}
         </main>
+        </div>
       </div>
-    </div>
+    </AuthProvider>
   );
 }
 

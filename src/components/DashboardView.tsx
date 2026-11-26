@@ -1,8 +1,41 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ArrowRight, BedDouble, BookOpen, Briefcase, Calendar, ClipboardList, CreditCard, FlaskConical, Package, Pill, Scan, Users } from 'lucide-react';
+import {
+  ArrowRight,
+  BedDouble,
+  BookOpen,
+  Briefcase,
+  Calendar,
+  ClipboardList,
+  CreditCard,
+  DollarSign,
+  FlaskConical,
+  Package,
+  Pill,
+  Receipt,
+  RefreshCw,
+  Scan,
+  TrendingUp,
+  Users,
+  Wallet,
+} from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
 import type { UserContext } from '../types';
+
+interface FinancialSnapshot {
+  totalInvoicedRevenue: number;
+  collectedInvoiceRevenue: number;
+  unpaidInvoiceBalance: number;
+  invoiceCount: number;
+  totalExpenses: number;
+  paidExpenses: number;
+  pendingExpenseCount: number;
+  expenseCount: number;
+  cashOnHand: number;
+  cashVaultBalance: number;
+  cashDrawerNet: number;
+  bankBalance: number;
+}
 
 interface DashboardData {
   metrics: {
@@ -18,7 +51,9 @@ interface DashboardData {
     totalBeds: number;
     revenueTotal: number | null;
     unpaidBalance: number | null;
+    isDoctorScoped?: boolean;
   };
+  financialSnapshot?: FinancialSnapshot | null;
   recentQueue: Array<{
     id: number;
     ticket_number: string;
@@ -43,21 +78,53 @@ interface DashboardData {
   }>;
 }
 
+interface DoctorActivityRow {
+  id: number;
+  full_name: string;
+  specialty: string | null;
+  active_visits: number;
+  completed_visits: number;
+  queue_count: number;
+  today_appointments: number;
+}
+
 interface DashboardViewProps {
   user: UserContext;
-  onNavigate: (tab: string) => void;
+  onNavigate: (tab: string, subView?: string) => void;
+}
+
+function fmtMoney(val: number): string {
+  const n = Number(val || 0);
+  const abs = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n < 0 ? `-$${abs}` : `$${abs}`;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }) => {
   const [data, setData] = useState<DashboardData | null>(null);
+  const [doctorActivity, setDoctorActivity] = useState<DoctorActivityRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const loadDashboard = useCallback(() => {
+  const canViewDoctorActivity =
+    user.roles.includes('MGR') ||
+    user.roles.includes('ADM') ||
+    user.permissions.includes('audit.read');
+
+  const loadDashboard = useCallback((isManual = false) => {
+    if (isManual) setRefreshing(true);
     apiFetch<DashboardData>('/api/dashboard')
       .then(setData)
       .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+      .finally(() => {
+        setLoading(false);
+        setRefreshing(false);
+      });
+    if (canViewDoctorActivity) {
+      apiFetch<{ doctors: DoctorActivityRow[] }>('/api/doctors/activity')
+        .then((res) => setDoctorActivity(res.doctors || []))
+        .catch(() => {});
+    }
+  }, [canViewDoctorActivity]);
 
   useEffect(() => {
     setLoading(true);
@@ -65,7 +132,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
   }, [loadDashboard]);
 
   useRealtimeSync(
-    ['visit:updated', 'queue:updated', 'payment:confirmed', 'lab:updated', 'imaging:updated', 'pharmacy:updated'],
+    [
+      'visit:updated',
+      'queue:updated',
+      'payment:confirmed',
+      'finance:updated',
+      'lab:updated',
+      'imaging:updated',
+      'pharmacy:updated',
+    ],
     () => {
       loadDashboard();
     }
@@ -87,32 +162,53 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
   }
 
   const m = data?.metrics;
+  const fs = data?.financialSnapshot;
+  const isDocScoped = Boolean(m?.isDoctorScoped);
+  const canOpenFinance =
+    user.permissions.includes('finance.report.view') || user.permissions.includes('accounting.ledger.manage');
+  const netOperating = fs ? Number((fs.totalInvoicedRevenue - fs.totalExpenses).toFixed(2)) : 0;
+  const collectionPct =
+    fs && fs.totalInvoicedRevenue > 0
+      ? Math.round((fs.collectedInvoiceRevenue / fs.totalInvoicedRevenue) * 100)
+      : 0;
 
   return (
     <div className="space-y-6">
       {/* Primary KPI Grid - Single Flat Elevation */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 bg-white border border-slate-200 rounded-lg divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
         <div className="p-5">
-          <div className="text-xs font-medium text-slate-500">Registered Patients</div>
+          <div className="text-xs font-medium text-slate-500">
+            {isDocScoped ? 'My Assigned Patients' : 'Registered Patients'}
+          </div>
           <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
             {m?.totalPatients ?? 0}
           </div>
-          <div className="mt-1 text-xs text-slate-500">Active clinic registry</div>
+          <div className="mt-1 text-xs text-slate-500">
+            {isDocScoped ? 'Assigned to your care' : 'Active clinic registry'}
+          </div>
         </div>
 
         <div className="p-5">
-          <div className="text-xs font-medium text-slate-500">Today Appointments &amp; Queue</div>
+          <div className="text-xs font-medium text-slate-500">
+            {isDocScoped ? 'My Appointments & Queue' : 'Today Appointments & Queue'}
+          </div>
           <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
             {m?.todayAppointments ?? 0} <span className="text-sm font-normal text-slate-400">/ {m?.activeQueue ?? 0} waiting</span>
           </div>
-          <div className="mt-1 text-xs text-slate-500">OPD &amp; diagnostics flow</div>
+          <div className="mt-1 text-xs text-slate-500">
+            {isDocScoped ? 'Your scheduled & waiting patients' : 'OPD & diagnostics flow'}
+          </div>
         </div>
 
         <div className="p-5">
-          <div className="text-xs font-medium text-slate-500">Clinical Orders &amp; Ward Beds</div>
+          <div className="text-xs font-medium text-slate-500">
+            {isDocScoped ? 'My Pending Orders' : 'Clinical Orders & Ward Beds'}
+          </div>
           <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
             {(m?.pendingLabs ?? 0) + (m?.pendingImaging ?? 0) + (m?.pendingPrescriptions ?? 0)}
-            <span className="text-sm font-normal text-slate-400"> · {m?.occupiedBeds ?? 0}/{m?.totalBeds ?? 0} beds</span>
+            {!isDocScoped && (
+              <span className="text-sm font-normal text-slate-400"> · {m?.occupiedBeds ?? 0}/{m?.totalBeds ?? 0} beds</span>
+            )}
           </div>
           <div className="mt-1 text-xs text-slate-500">
             {m?.pendingLabs ?? 0} Lab · {m?.pendingImaging ?? 0} Imaging · {m?.pendingPrescriptions ?? 0} Rx
@@ -124,23 +220,137 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
             <>
               <div className="text-xs font-medium text-slate-500">Collected / Unpaid Balance</div>
               <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
-                ${m.revenueTotal.toFixed(2)}
+                {fmtMoney(m.revenueTotal)}
               </div>
               <div className="mt-1 text-xs text-amber-700 font-mono tabular-nums">
-                ${(m.unpaidBalance ?? 0).toFixed(2)} outstanding · {m.pendingApprovals} approvals
+                {fmtMoney(m.unpaidBalance ?? 0)} outstanding · {m.pendingApprovals} approvals
               </div>
             </>
           ) : (
             <>
-              <div className="text-xs font-medium text-slate-500">Open Clinical Visits</div>
+              <div className="text-xs font-medium text-slate-500">
+                {isDocScoped ? 'My Open Consultations' : 'Open Clinical Visits'}
+              </div>
               <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
                 {m?.openVisits ?? 0}
               </div>
-              <div className="mt-1 text-xs text-slate-500">Financial figures restricted</div>
+              <div className="mt-1 text-xs text-slate-500">
+                {isDocScoped ? 'Active assigned OPD visits' : 'Financial figures restricted'}
+              </div>
             </>
           )}
         </div>
       </div>
+
+      {/* Real-Time Financial Snapshot */}
+      {fs && (
+        <section aria-label="Financial Snapshot" className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-slate-50/50">
+            <div>
+              <h2 className="font-display text-sm font-semibold text-slate-900">Financial Snapshot</h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Real-time clinic revenue from invoices, registered expenses, and cash-on-hand
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => loadDashboard(true)}
+                disabled={refreshing}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 hover:border-slate-300 rounded-md whitespace-nowrap transition-colors"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                <span>Refresh</span>
+              </button>
+              {canOpenFinance ? (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('accounting')}
+                  className="text-xs font-medium text-teal-700 hover:text-teal-800 inline-flex items-center gap-1 whitespace-nowrap"
+                >
+                  <span>Open Finance Ledger</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              ) : user.permissions.includes('billing.invoice.read') ? (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('billing')}
+                  className="text-xs font-medium text-teal-700 hover:text-teal-800 inline-flex items-center gap-1 whitespace-nowrap"
+                >
+                  <span>Open Cashier</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200">
+            {/* Total Revenue (from invoices) */}
+            <div className="p-5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-500">Total Revenue (Invoices)</span>
+                <DollarSign className="w-4 h-4 text-teal-700 shrink-0" />
+              </div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+                {fmtMoney(fs.totalInvoicedRevenue)}
+              </div>
+              <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums">
+                {fmtMoney(fs.collectedInvoiceRevenue)} collected · {fs.invoiceCount} active invoices
+              </div>
+            </div>
+
+            {/* Total Expenses (from expense registrations) */}
+            <div className="p-5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-500">Total Expenses (Registered)</span>
+                <Receipt className="w-4 h-4 text-amber-600 shrink-0" />
+              </div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 tabular-nums">
+                {fmtMoney(fs.totalExpenses)}
+              </div>
+              <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums">
+                {fmtMoney(fs.paidExpenses)} disbursed ·{' '}
+                <span className={fs.pendingExpenseCount > 0 ? 'text-amber-700 font-medium' : ''}>
+                  {fs.pendingExpenseCount} pending approval
+                </span>
+              </div>
+            </div>
+
+            {/* Current Cash-on-Hand */}
+            <div className="p-5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-500">Current Cash-on-Hand</span>
+                <Wallet className="w-4 h-4 text-emerald-700 shrink-0" />
+              </div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-emerald-700 tabular-nums">
+                {fmtMoney(fs.cashOnHand)}
+              </div>
+              <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums">
+                Safe {fmtMoney(fs.cashVaultBalance)} · Till {fs.cashDrawerNet >= 0 ? '+' : ''}
+                {fmtMoney(fs.cashDrawerNet)}
+              </div>
+            </div>
+
+            {/* Operating Net & Liquidity */}
+            <div className="p-5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-500">Net Invoiced vs Expenses</span>
+                <TrendingUp className="w-4 h-4 text-slate-600 shrink-0" />
+              </div>
+              <div
+                className={`mt-2 font-mono text-2xl font-semibold tabular-nums ${
+                  netOperating >= 0 ? 'text-slate-900' : 'text-red-700'
+                }`}
+              >
+                {fmtMoney(netOperating)}
+              </div>
+              <div className="mt-1.5 text-xs text-slate-500 font-mono tabular-nums">
+                {collectionPct}% collected · Bank {fmtMoney(fs.bankBalance)}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* Quick Workflow Access */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -176,17 +386,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
         )}
         {user.permissions.includes('lab.order.read') && (
           <button
-            onClick={() => onNavigate('diagnostics')}
+            onClick={() => onNavigate(isDocScoped ? 'clinical' : 'diagnostics', isDocScoped ? 'lab_requests' : 'lab')}
             className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
           >
             <FlaskConical className="w-4 h-4 text-teal-700 mb-2" />
-            <div className="text-sm font-medium text-slate-900">Laboratory</div>
-            <div className="text-xs text-slate-500 mt-0.5">Samples &amp; 2-person verify</div>
+            <div className="text-sm font-medium text-slate-900">{isDocScoped ? 'Lab Requests' : 'Laboratory'}</div>
+            <div className="text-xs text-slate-500 mt-0.5">{isDocScoped ? 'My ordered tests' : 'Samples & 2-person verify'}</div>
           </button>
         )}
-        {user.permissions.includes('imaging.order.read') && (
+        {!isDocScoped && user.permissions.includes('imaging.order.read') && (
           <button
-            onClick={() => onNavigate('diagnostics')}
+            onClick={() => onNavigate('diagnostics', 'imaging')}
             className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
           >
             <Scan className="w-4 h-4 text-teal-700 mb-2" />
@@ -196,12 +406,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
         )}
         {user.permissions.includes('pharmacy.prescription.read') && (
           <button
-            onClick={() => onNavigate('diagnostics')}
+            onClick={() => onNavigate(isDocScoped ? 'clinical' : 'diagnostics', isDocScoped ? 'prescriptions' : 'pharmacy')}
             className="text-left p-4 bg-white border border-slate-200 hover:border-teal-600 rounded-lg transition-colors"
           >
             <Pill className="w-4 h-4 text-teal-700 mb-2" />
-            <div className="text-sm font-medium text-slate-900">Pharmacy</div>
-            <div className="text-xs text-slate-500 mt-0.5">Dispense &amp; FEFO</div>
+            <div className="text-sm font-medium text-slate-900">{isDocScoped ? 'Prescriptions' : 'Pharmacy'}</div>
+            <div className="text-xs text-slate-500 mt-0.5">{isDocScoped ? 'My e-Rx orders' : 'Dispense & FEFO'}</div>
           </button>
         )}
         {user.permissions.includes('store.item.read') && (
@@ -366,6 +576,45 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, onNavigate }
           )}
         </div>
       </div>
+
+      {/* Medical Director & Admin Doctors' Activity Overview */}
+      {canViewDoctorActivity && doctorActivity.length > 0 && (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-slate-50/50">
+            <div>
+              <h2 className="font-display text-sm font-semibold text-slate-900">Doctors&apos; Clinical Activity</h2>
+              <p className="text-xs text-slate-500 mt-0.5">Active OPD workload, queue assignments, and completed consultations per clinician</p>
+            </div>
+            <span className="text-xs font-mono text-slate-500">{doctorActivity.length} clinicians</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                  <th className="py-2.5 px-4">Clinician</th>
+                  <th className="py-2.5 px-4">Specialty</th>
+                  <th className="py-2.5 px-4 text-right">Today Appts</th>
+                  <th className="py-2.5 px-4 text-right">Waiting Queue</th>
+                  <th className="py-2.5 px-4 text-right">Active Visits</th>
+                  <th className="py-2.5 px-4 text-right">Completed Consults</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {doctorActivity.map((doc) => (
+                  <tr key={doc.id} className="hover:bg-slate-50/70">
+                    <td className="py-2.5 px-4 font-medium text-slate-900">{doc.full_name}</td>
+                    <td className="py-2.5 px-4 text-slate-600">{doc.specialty || 'General Medicine'}</td>
+                    <td className="py-2.5 px-4 text-right font-mono tabular-nums">{doc.today_appointments}</td>
+                    <td className="py-2.5 px-4 text-right font-mono tabular-nums text-amber-700 font-medium">{doc.queue_count}</td>
+                    <td className="py-2.5 px-4 text-right font-mono tabular-nums text-teal-800 font-semibold">{doc.active_visits}</td>
+                    <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">{doc.completed_visits}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -10,6 +10,7 @@ export type ClinicEventType =
   | 'lab:updated'
   | 'imaging:updated'
   | 'pharmacy:updated'
+  | 'finance:updated'
   | 'notification:created';
 
 interface SseClient {

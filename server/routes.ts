@@ -1,19 +1,30 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { execute, getDbConfigSummary, getDialect, nextSequence, nowSql, query, queryOne, withTransaction } from './db.ts';
 import {
   type AuthRequest,
   type AuthUser,
   assertDifferentUser,
   assertPatientAccess,
+  auditAction,
+  authorize,
+  clearSessionCookie,
   formatClinicDate,
+  formatUtcSqlDatetime,
+  getLinkedHrEmployeeStatus,
   hasPermission,
+  isDoctorOnly,
+  issueSessionToken,
   loadUserContext,
   requireAuth,
   requirePermission,
+  revokeAllUserSessions,
   revokeToken,
-  signAccessToken,
+  setSessionCookie,
+  validatePasswordPolicy,
   verifyAuditChain,
   writeAuditLog,
 } from './auth.ts';
@@ -151,7 +162,40 @@ for (const method of ['get', 'post', 'put', 'patch', 'delete'] as const) {
 }
 
 const loginAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
+const twoFaAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
+const passwordResetAttemptsByIp = new Map<string, { count: number; resetAt: number }>();
 const lastAuditViewByUser = new Map<number, number>();
+
+function isRateLimited(
+  bucket: Map<string, { count: number; resetAt: number }>,
+  key: string,
+  maxRequests: number,
+  windowMs: number
+): boolean {
+  const now = Date.now();
+  if (bucket.size > 2000) {
+    for (const [k, v] of bucket.entries()) {
+      if (v.resetAt <= now) bucket.delete(k);
+    }
+  }
+  const entry = bucket.get(key);
+  if (entry && entry.resetAt > now) {
+    if (entry.count >= maxRequests) return true;
+    entry.count += 1;
+    return false;
+  }
+  bucket.set(key, { count: 1, resetAt: now + windowMs });
+  return false;
+}
+
+function parseJsonSetting<T>(raw: string | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return { ...fallback, ...(JSON.parse(raw) as Partial<T>) };
+  } catch {
+    return fallback;
+  }
+}
 
 async function getClinicSettings() {
   const rows = await query<{ setting_key: string; setting_value: string }>('SELECT setting_key, setting_value FROM system_settings');
@@ -163,12 +207,91 @@ async function getClinicSettings() {
     currencySymbol: map.get('currency_symbol') || '$',
     timezone: map.get('timezone') || 'Africa/Addis_Ababa',
     expenseAutoPostLimit: Number.isFinite(parsedLimit) && parsedLimit >= 0 ? parsedLimit : 100,
+    profile: parseJsonSetting(map.get('clinic_profile_json'), {
+      legalName: 'Clinic360 Central Medical Center Ltd.',
+      facilityCode: 'C360-MAIN',
+      address: '420 Bole Medhanialem Ave, Suite 100',
+      phone: '+1 (555) 234-8900',
+      email: 'info@clinic360.local',
+      operatingHours: 'Mon-Sat 07:30 - 20:00, Emergency 24/7',
+      taxId: 'TIN-004921882',
+    }),
+    clinical: parseJsonSetting(map.get('clinical_config_json'), {
+      mrnPrefix: 'C360-',
+      visitPrefix: 'VIS-26-',
+      defaultSlotMinutes: 20,
+      maxDailyPatientsPerDoctor: 35,
+      allowWalkInRegistration: true,
+      requireVitalsBeforeConsultation: true,
+      requirePaymentBeforeConsultation: true,
+      vitalReferenceRanges: {
+        bpSystolicMin: 90,
+        bpSystolicMax: 140,
+        bpDiastolicMin: 60,
+        bpDiastolicMax: 90,
+        tempMinC: 36.1,
+        tempMaxC: 37.8,
+        pulseMin: 60,
+        pulseMax: 100,
+        spo2Min: 95,
+      },
+      autoAssignRoomBySpecialty: true,
+    }),
+    billing: parseJsonSetting(map.get('billing_config_json'), {
+      defaultTaxRatePct: 0,
+      cashierMaxDiscountPct: 10,
+      requireShiftForCollection: true,
+      allowPartialPayments: true,
+      allowInsuranceCreditBilling: true,
+      receiptFooterNote: 'Thank you for choosing Clinic360 Central Medical Center.',
+    }),
+    notifications: parseJsonSetting(map.get('notifications_config_json'), {
+      enableInAppAlerts: true,
+      enableSmsAlerts: false,
+      enableEmailAlerts: true,
+      notifyDoctorOnAssignment: true,
+      notifyNurseOnPaymentClearance: true,
+      notifyAdminOnAccessReview: true,
+      criticalLabAlertImmediate: true,
+    }),
+    documents: parseJsonSetting(map.get('documents_config_json'), {
+      prescriptionHeader: 'Clinic360 Outpatient Pharmacy & Medical Prescription',
+      labReportHeader: 'Clinic360 Accredited Clinical Laboratory Report',
+      radiologyHeader: 'Clinic360 Diagnostic Imaging & Radiology Report',
+      invoiceHeader: 'Official Clinic360 Tax Invoice & Statement',
+      showClinicStampOnPrint: true,
+    }),
+    security: parseJsonSetting(map.get('security_config_json'), {
+      sessionTimeoutMinutes: 720,
+      passwordMinLength: 8,
+      requireMixedCasePassword: true,
+      maxFailedLoginAttempts: 5,
+      lockoutDurationMinutes: 15,
+      enforce2faForPrivilegedRoles: true,
+      allowMultipleActiveSessions: true,
+    }),
+    lastBackupVerifiedAt: map.get('last_backup_verified_at') || null,
+    lastBackupVerifiedBy: map.get('last_backup_verified_by') || null,
   };
 }
 
 async function getClinicToday(): Promise<string> {
   const settings = await getClinicSettings();
   return formatClinicDate(settings.timezone);
+}
+
+async function assertOpenAccountingPeriod(dateStr: string) {
+  const periodCode = String(dateStr || '').slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(periodCode)) return;
+  const closedPeriod = await queryOne<{ period_code: string }>(
+    "SELECT period_code FROM accounting_periods WHERE period_code = ? AND status = 'closed' LIMIT 1",
+    [periodCode]
+  );
+  if (closedPeriod) {
+    const err = new Error(`Accounting period ${periodCode} is closed. Post to an open period instead.`) as Error & { status?: number };
+    err.status = 409;
+    throw err;
+  }
 }
 
 async function postJournalEntry(opts: {
@@ -200,16 +323,7 @@ async function postJournalEntry(opts: {
   }
 
   const entryDate = opts.entryDate || (await getClinicToday());
-  const periodCode = entryDate.slice(0, 7);
-  const closedPeriod = await queryOne<{ period_code: string }>(
-    "SELECT period_code FROM accounting_periods WHERE period_code = ? AND status = 'closed' LIMIT 1",
-    [periodCode]
-  );
-  if (closedPeriod) {
-    const err = new Error(`Accounting period ${periodCode} is closed. Post to an open period instead.`) as Error & { status?: number };
-    err.status = 409;
-    throw err;
-  }
+  await assertOpenAccountingPeriod(entryDate);
 
   const codes = [...new Set(normalizedLines.map((l) => l.accountCode))];
   const ph = codes.map(() => '?').join(',');
@@ -554,6 +668,7 @@ async function unlockPaidInvoiceGates(opts: {
 
 async function createNotification(opts: {
   targetRole: string;
+  targetUserId?: number | null;
   title: string;
   message: string;
   severity?: 'info' | 'warning' | 'critical';
@@ -561,9 +676,10 @@ async function createNotification(opts: {
   entityId?: number;
 }) {
   await execute(
-    'INSERT INTO notifications (target_role, title, message, severity, entity_type, entity_id) VALUES (?, ?, ?, ?, ?, ?)',
+    'INSERT INTO notifications (target_role, target_user_id, title, message, severity, entity_type, entity_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [
       opts.targetRole,
+      opts.targetUserId ?? null,
       opts.title,
       opts.message,
       opts.severity || 'info',
@@ -573,6 +689,7 @@ async function createNotification(opts: {
   );
   broadcastClinicEvent('notification:created', {
     targetRole: opts.targetRole,
+    targetUserId: opts.targetUserId ?? null,
     title: opts.title,
     severity: opts.severity || 'info',
   });
@@ -606,13 +723,25 @@ router.get('/settings/public', async (_req, res) => {
   });
 });
 
-router.get('/admin/settings', requireAuth, requirePermission('admin.user.manage', 'catalog.manage'), async (_req, res) => {
+router.get('/admin/settings', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage', 'catalog.manage'), async (_req, res) => {
   const settings = await getClinicSettings();
   res.json({ settings });
 });
 
-router.put('/admin/settings', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
-  const { clinicName, currencyCode, currencySymbol, timezone, expenseAutoPostLimit } = req.body || {};
+router.put('/admin/settings', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const {
+    clinicName,
+    currencyCode,
+    currencySymbol,
+    timezone,
+    expenseAutoPostLimit,
+    profile,
+    clinical,
+    billing,
+    notifications,
+    documents,
+    security,
+  } = req.body || {};
   const updates: Array<[string, string]> = [];
   if (typeof clinicName === 'string' && clinicName.trim()) updates.push(['clinic_name', clinicName.trim()]);
   if (typeof currencyCode === 'string' && currencyCode.trim()) updates.push(['currency_code', currencyCode.trim().toUpperCase()]);
@@ -621,6 +750,12 @@ router.put('/admin/settings', requireAuth, requirePermission('admin.user.manage'
   if (expenseAutoPostLimit !== undefined && Number(expenseAutoPostLimit) >= 0) {
     updates.push(['expense_auto_post_limit', String(Number(expenseAutoPostLimit))]);
   }
+  if (profile && typeof profile === 'object') updates.push(['clinic_profile_json', JSON.stringify(profile)]);
+  if (clinical && typeof clinical === 'object') updates.push(['clinical_config_json', JSON.stringify(clinical)]);
+  if (billing && typeof billing === 'object') updates.push(['billing_config_json', JSON.stringify(billing)]);
+  if (notifications && typeof notifications === 'object') updates.push(['notifications_config_json', JSON.stringify(notifications)]);
+  if (documents && typeof documents === 'object') updates.push(['documents_config_json', JSON.stringify(documents)]);
+  if (security && typeof security === 'object') updates.push(['security_config_json', JSON.stringify(security)]);
 
   for (const [k, v] of updates) {
     const existing = await queryOne('SELECT setting_key FROM system_settings WHERE setting_key = ?', [k]);
@@ -646,7 +781,7 @@ router.put('/admin/settings', requireAuth, requirePermission('admin.user.manage'
     action: 'admin.settings.update',
     entityType: 'system_settings',
     entityId: 'global',
-    after: Object.fromEntries(updates),
+    after: Object.fromEntries(updates.map(([k]) => [k, k.endsWith('_json') ? 'updated' : updates.find(([uk]) => uk === k)?.[1]])),
     req,
   });
 
@@ -689,35 +824,42 @@ router.post('/auth/login', async (req, res) => {
     resetAt: ipRate && ipRate.resetAt > now ? ipRate.resetAt : now + 60_000,
   });
 
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+  const { email, username, password } = req.body || {};
+  const identifier = String(email || username || '').trim().toLowerCase();
+  if (!identifier || !password) {
+    return res.status(400).json({ error: 'Email or username and password are required.' });
   }
 
   const user = await queryOne<{
     id: number;
+    employee_id: number | null;
     full_name: string;
     email: string;
+    username: string | null;
     password_hash: string;
     active: number;
+    status: string | null;
     failed_attempts: number;
     locked_until: string | null;
     branch_id: number;
-  }>('SELECT * FROM users WHERE email = ?', [String(email).trim().toLowerCase()]);
+  }>('SELECT * FROM users WHERE LOWER(email) = ? OR LOWER(username) = ? LIMIT 1', [identifier, identifier]);
 
   if (!user) {
     await writeAuditLog({
       action: 'auth.login.failed',
       entityType: 'user',
-      entityId: String(email),
-      after: { reason: 'unknown_email' },
+      entityId: identifier,
+      after: { reason: 'unknown_identifier' },
       req,
     });
-    return res.status(401).json({ error: 'Invalid email or password.' });
+    return res.status(401).json({ error: 'Invalid credentials.' });
   }
 
-  if (!user.active) {
+  if (!user.active || user.status === 'inactive') {
     return res.status(403).json({ error: 'Account is deactivated. Contact your administrator.' });
+  }
+  if (user.status === 'locked') {
+    return res.status(423).json({ error: 'Account is locked by administrator.' });
   }
 
   if (user.locked_until) {
@@ -727,13 +869,33 @@ router.post('/auth/login', async (req, res) => {
     }
   }
 
+  const hrEmp = await getLinkedHrEmployeeStatus(user.id, user.employee_id ?? null);
+  if (hrEmp && hrEmp.status !== 'active') {
+    await writeAuditLog({
+      user: { id: user.id, fullName: user.full_name, roles: [], branchId: user.branch_id },
+      action: 'auth.login.blocked_hr_offboarded',
+      entityType: 'user',
+      entityId: user.id,
+      after: { hrEmployeeId: hrEmp.id, hrStatus: hrEmp.status },
+      req,
+    });
+    return res.status(403).json({ error: 'Account access suspended: linked HR employee record is inactive or offboarded.' });
+  }
+
+  const settings = await getClinicSettings();
+  const maxFailed = Math.max(3, Number(settings.security?.maxFailedLoginAttempts || 5));
+  const lockoutMinutes = Math.max(5, Number(settings.security?.lockoutDurationMinutes || 15));
+  const sessionMinutes = Math.max(15, Number(settings.security?.sessionTimeoutMinutes || 720));
+
   const valid = await bcrypt.compare(String(password), user.password_hash);
   if (!valid) {
     const nextFails = user.failed_attempts + 1;
-    const lockUntil = nextFails >= 5 ? nowSql(new Date(now + 15 * 60_000)) : null;
-    await execute('UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?', [
+    const shouldLock = nextFails >= maxFailed;
+    const lockUntil = shouldLock ? nowSql(new Date(now + lockoutMinutes * 60_000)) : null;
+    await execute('UPDATE users SET failed_attempts = ?, locked_until = ?, status = ? WHERE id = ?', [
       nextFails,
       lockUntil,
+      shouldLock ? 'locked' : user.status || 'active',
       user.id,
     ]);
     await writeAuditLog({
@@ -741,20 +903,20 @@ router.post('/auth/login', async (req, res) => {
       action: 'auth.login.failed',
       entityType: 'user',
       entityId: user.id,
-      after: { failedAttempts: nextFails },
+      after: { failedAttempts: nextFails, locked: shouldLock },
       req,
     });
-    return res.status(401).json({ error: 'Invalid email or password.' });
+    return res.status(401).json({ error: 'Invalid credentials.' });
   }
 
-  await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?', [
+  await execute("UPDATE users SET failed_attempts = 0, locked_until = NULL, status = 'active', last_login_at = ? WHERE id = ?", [
     nowSql(),
     user.id,
   ]);
 
   const ctx = await loadUserContext(user.id);
   if (!ctx) {
-    return res.status(403).json({ error: 'Unable to load user permissions.' });
+    return res.status(403).json({ error: 'Unable to load user permissions or account is inactive.' });
   }
 
   if (ctx.twoFaEnabled) {
@@ -783,7 +945,11 @@ router.post('/auth/login', async (req, res) => {
     });
   }
 
-  const token = signAccessToken(ctx);
+  if (settings.security?.allowMultipleActiveSessions === false) {
+    await revokeAllUserSessions(ctx.id, ctx.id);
+  }
+  const { token } = await issueSessionToken(ctx, req, sessionMinutes);
+  setSessionCookie(req, res, token, sessionMinutes);
   await writeAuditLog({
     user: ctx,
     action: 'auth.login.success',
@@ -792,10 +958,25 @@ router.post('/auth/login', async (req, res) => {
     req,
   });
 
-  res.json({ token, user: ctx, dialect: getDialect() });
+  res.json({
+    token,
+    user: ctx,
+    roles: ctx.roles,
+    permissions: ctx.permissions,
+    departments: ctx.departments,
+    clinic_units: ctx.clinicUnits,
+    dashboard_type: ctx.defaultDashboard,
+    defaultDashboard: ctx.defaultDashboard,
+    authorizedDashboards: ctx.authorizedDashboards,
+    dialect: getDialect(),
+  });
 });
 
 router.post('/auth/verify-2fa', async (req, res) => {
+  const ip = req.ip || '127.0.0.1';
+  if (isRateLimited(twoFaAttemptsByIp, ip, 15, 60_000)) {
+    return res.status(429).json({ error: 'Too many 2FA verification requests. Please wait a minute.' });
+  }
   const { challengeId, code } = req.body || {};
   if (!challengeId || !code) {
     return res.status(400).json({ error: 'Verification challenge and 6-digit code are required.' });
@@ -824,7 +1005,7 @@ router.post('/auth/verify-2fa', async (req, res) => {
 
   const ctx = await loadUserContext(challenge.user_id);
   if (!ctx) {
-    return res.status(403).json({ error: 'Unable to load user permissions.' });
+    return res.status(403).json({ error: 'Unable to load user permissions or account is inactive.' });
   }
 
   if (String(code).trim() !== challenge.code) {
@@ -841,7 +1022,13 @@ router.post('/auth/verify-2fa', async (req, res) => {
   }
 
   await execute('DELETE FROM auth_2fa_challenges WHERE id = ?', [challenge.id]);
-  const token = signAccessToken(ctx);
+  const settings = await getClinicSettings();
+  const sessionMinutes = Math.max(15, Number(settings.security?.sessionTimeoutMinutes || 720));
+  if (settings.security?.allowMultipleActiveSessions === false) {
+    await revokeAllUserSessions(ctx.id, ctx.id);
+  }
+  const { token } = await issueSessionToken(ctx, req, sessionMinutes);
+  setSessionCookie(req, res, token, sessionMinutes);
   await writeAuditLog({
     user: ctx,
     action: 'auth.2fa.verified',
@@ -849,18 +1036,37 @@ router.post('/auth/verify-2fa', async (req, res) => {
     entityId: ctx.id,
     req,
   });
-  res.json({ token, user: ctx, dialect: getDialect() });
+  res.json({
+    token,
+    user: ctx,
+    roles: ctx.roles,
+    permissions: ctx.permissions,
+    departments: ctx.departments,
+    clinic_units: ctx.clinicUnits,
+    dashboard_type: ctx.defaultDashboard,
+    defaultDashboard: ctx.defaultDashboard,
+    authorizedDashboards: ctx.authorizedDashboards,
+    dialect: getDialect(),
+  });
 });
 
 router.post('/auth/forgot-password', async (req, res) => {
+  const ip = req.ip || '127.0.0.1';
   const email = String(req.body?.email || '').trim().toLowerCase();
+  if (isRateLimited(passwordResetAttemptsByIp, `fp:${ip}`, 10, 60_000) || (email && isRateLimited(passwordResetAttemptsByIp, `fp:${email}`, 5, 60_000))) {
+    return res.status(429).json({ error: 'Too many password reset requests. Please wait a minute.' });
+  }
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-  const user = await queryOne<{ id: number; full_name: string; active: number }>(
-    'SELECT id, full_name, active FROM users WHERE email = ?',
+  const user = await queryOne<{ id: number; employee_id: number | null; full_name: string; active: number; status: string | null }>(
+    'SELECT id, employee_id, full_name, active, status FROM users WHERE LOWER(email) = ?',
     [email]
   );
-  if (!user || !user.active) {
+  if (!user || !user.active || user.status === 'inactive') {
+    return res.json({ ok: true, message: 'If an active account matches that email, a reset token has been generated.' });
+  }
+  const hrEmp = await getLinkedHrEmployeeStatus(user.id, user.employee_id ?? null);
+  if (hrEmp && hrEmp.status !== 'active') {
     return res.json({ ok: true, message: 'If an active account matches that email, a reset token has been generated.' });
   }
 
@@ -888,9 +1094,18 @@ router.post('/auth/forgot-password', async (req, res) => {
 });
 
 router.post('/auth/reset-password', async (req, res) => {
+  const ip = req.ip || '127.0.0.1';
+  if (isRateLimited(passwordResetAttemptsByIp, `rp:${ip}`, 15, 60_000)) {
+    return res.status(429).json({ error: 'Too many password reset attempts. Please wait a minute.' });
+  }
   const { token, newPassword } = req.body || {};
-  if (!token || !newPassword || String(newPassword).length < 8) {
-    return res.status(400).json({ error: 'Reset token and a new password (min 8 characters) are required.' });
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Reset token and newPassword are required.' });
+  }
+  const settings = await getClinicSettings();
+  const policyErr = validatePasswordPolicy(String(newPassword), settings.security);
+  if (policyErr) {
+    return res.status(400).json({ error: policyErr });
   }
   const tokenHash = crypto.createHash('sha256').update(String(token).trim()).digest('hex');
   const rec = await queryOne<{ id: number; user_id: number; expires_at: string; used_at: string | null }>(
@@ -900,8 +1115,19 @@ router.post('/auth/reset-password', async (req, res) => {
   if (!rec || rec.used_at || rec.expires_at <= nowSql()) {
     return res.status(400).json({ error: 'Password reset token is invalid or has expired.' });
   }
+  const userRow = await queryOne<{ id: number; employee_id: number | null; active: number; status: string | null }>(
+    'SELECT id, employee_id, active, status FROM users WHERE id = ?',
+    [rec.user_id]
+  );
+  if (!userRow || !userRow.active || userRow.status === 'inactive') {
+    return res.status(403).json({ error: 'Account is deactivated and cannot complete password reset.' });
+  }
+  const hrEmp = await getLinkedHrEmployeeStatus(userRow.id, userRow.employee_id ?? null);
+  if (hrEmp && hrEmp.status !== 'active') {
+    return res.status(403).json({ error: 'Linked HR employee record is not active.' });
+  }
 
-  const nextHash = await bcrypt.hash(String(newPassword), 10);
+  const nextHash = await bcrypt.hash(String(newPassword), 12);
   await withTransaction(async () => {
     await execute('UPDATE users SET password_hash = ?, must_change_password = 0, failed_attempts = 0, locked_until = NULL WHERE id = ?', [
       nextHash,
@@ -909,6 +1135,7 @@ router.post('/auth/reset-password', async (req, res) => {
     ]);
     await execute('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?', [nowSql(), rec.id]);
   });
+  await revokeAllUserSessions(rec.user_id, rec.user_id);
 
   await writeAuditLog({
     action: 'auth.password.reset_completed',
@@ -921,8 +1148,13 @@ router.post('/auth/reset-password', async (req, res) => {
 
 router.post('/auth/change-password', requireAuth, async (req: AuthRequest, res: Response) => {
   const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !newPassword || String(newPassword).length < 8) {
-    return res.status(400).json({ error: 'Current password and a new password of at least 8 characters are required.' });
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Current password and new password are required.' });
+  }
+  const settings = await getClinicSettings();
+  const policyErr = validatePasswordPolicy(String(newPassword), settings.security);
+  if (policyErr) {
+    return res.status(400).json({ error: policyErr });
   }
   const userRow = await queryOne<{ id: number; password_hash: string }>('SELECT id, password_hash FROM users WHERE id = ?', [
     req.user!.id,
@@ -934,11 +1166,12 @@ router.post('/auth/change-password', requireAuth, async (req: AuthRequest, res: 
     return res.status(401).json({ error: 'Current password is incorrect.' });
   }
   if (String(currentPassword) === String(newPassword)) {
-    return res.status(400).json({ error: 'New password must be different from your temporary password.' });
+    return res.status(400).json({ error: 'New password must be different from your current password.' });
   }
 
-  const nextHash = await bcrypt.hash(String(newPassword), 10);
+  const nextHash = await bcrypt.hash(String(newPassword), 12);
   await execute('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?', [nextHash, req.user!.id]);
+  await revokeAllUserSessions(req.user!.id, req.user!.id, req.authJti ?? null);
 
   await writeAuditLog({
     user: req.user,
@@ -949,15 +1182,37 @@ router.post('/auth/change-password', requireAuth, async (req: AuthRequest, res: 
   });
 
   const updatedCtx = await loadUserContext(req.user!.id);
-  res.json({ ok: true, user: updatedCtx });
+  res.json({
+    ok: true,
+    user: updatedCtx,
+    roles: updatedCtx?.roles ?? [],
+    permissions: updatedCtx?.permissions ?? [],
+    departments: updatedCtx?.departments ?? [],
+    clinic_units: updatedCtx?.clinicUnits ?? [],
+    dashboard_type: updatedCtx?.defaultDashboard ?? 'general',
+    defaultDashboard: updatedCtx?.defaultDashboard ?? 'general',
+    authorizedDashboards: updatedCtx?.authorizedDashboards ?? [],
+  });
 });
 
 router.get('/auth/me', requireAuth, async (req: AuthRequest, res: Response) => {
-  res.json({ user: req.user, dialect: getDialect() });
+  const ctx = req.user!;
+  res.json({
+    user: ctx,
+    roles: ctx.roles,
+    permissions: ctx.permissions,
+    departments: ctx.departments,
+    clinic_units: ctx.clinicUnits,
+    dashboard_type: ctx.defaultDashboard,
+    defaultDashboard: ctx.defaultDashboard,
+    authorizedDashboards: ctx.authorizedDashboards,
+    dialect: getDialect(),
+  });
 });
 
 router.post('/auth/logout', requireAuth, async (req: AuthRequest, res: Response) => {
-  await revokeToken(req.authJti, req.authExp);
+  await revokeToken(req.authJti, req.authExp, req.user?.id);
+  clearSessionCookie(req, res);
   await writeAuditLog({
     user: req.user,
     action: 'auth.logout',
@@ -971,25 +1226,64 @@ router.post('/auth/logout', requireAuth, async (req: AuthRequest, res: Response)
 router.get('/notifications', requireAuth, async (req: AuthRequest, res: Response) => {
   const roles = req.user!.roles;
   if (roles.length === 0) return res.json({ notifications: [], unreadCount: 0 });
+  const doctorScoped = isDoctorOnly(req.user!);
   const placeholders = roles.map(() => '?').join(',');
-  const notifications = await query(
-    `SELECT * FROM notifications WHERE target_role IN (${placeholders}) OR target_role = 'ALL' ORDER BY id DESC LIMIT 25`,
-    roles
-  );
+  const notifications = doctorScoped
+    ? await query(
+        `SELECT * FROM notifications
+         WHERE (target_user_id = ? OR (target_user_id IS NULL AND target_role = 'ALL'))
+         ORDER BY id DESC LIMIT 25`,
+        [req.user!.id]
+      )
+    : await query(
+        `SELECT * FROM notifications
+         WHERE (target_user_id = ? OR (target_user_id IS NULL AND (target_role IN (${placeholders}) OR target_role = 'ALL')))
+         ORDER BY id DESC LIMIT 25`,
+        [req.user!.id, ...roles]
+      );
   const unreadCount = notifications.filter((n) => (n as { is_read: number }).is_read === 0).length;
   res.json({ notifications, unreadCount });
 });
 
-router.post('/notifications/:id/read', requireAuth, async (req, res) => {
-  await execute('UPDATE notifications SET is_read = 1 WHERE id = ?', [Number(req.params.id)]);
+router.post('/notifications/:id/read', requireAuth, async (req: AuthRequest, res: Response) => {
+  const roles = req.user!.roles;
+  if (roles.length === 0) return res.json({ ok: true });
+  const doctorScoped = isDoctorOnly(req.user!);
+  const placeholders = roles.map(() => '?').join(',');
+  if (doctorScoped) {
+    await execute(
+      `UPDATE notifications SET is_read = 1
+       WHERE id = ? AND (target_user_id = ? OR (target_user_id IS NULL AND target_role = 'ALL'))`,
+      [Number(req.params.id), req.user!.id]
+    );
+  } else {
+    await execute(
+      `UPDATE notifications SET is_read = 1
+       WHERE id = ? AND (target_user_id = ? OR (target_user_id IS NULL AND (target_role IN (${placeholders}) OR target_role = 'ALL')))`,
+      [Number(req.params.id), req.user!.id, ...roles]
+    );
+  }
   res.json({ ok: true });
 });
 
 router.post('/notifications/read-all', requireAuth, async (req: AuthRequest, res: Response) => {
   const roles = req.user!.roles;
   if (roles.length > 0) {
+    const doctorScoped = isDoctorOnly(req.user!);
     const placeholders = roles.map(() => '?').join(',');
-    await execute(`UPDATE notifications SET is_read = 1 WHERE target_role IN (${placeholders})`, roles);
+    if (doctorScoped) {
+      await execute(
+        `UPDATE notifications SET is_read = 1
+         WHERE (target_user_id = ? OR (target_user_id IS NULL AND target_role = 'ALL'))`,
+        [req.user!.id]
+      );
+    } else {
+      await execute(
+        `UPDATE notifications SET is_read = 1
+         WHERE (target_user_id = ? OR (target_user_id IS NULL AND (target_role IN (${placeholders}) OR target_role = 'ALL')))`,
+        [req.user!.id, ...roles]
+      );
+    }
   }
   res.json({ ok: true });
 });
@@ -1000,58 +1294,207 @@ router.post('/notifications/read-all', requireAuth, async (req: AuthRequest, res
 router.get('/dashboard', requireAuth, async (req: AuthRequest, res: Response) => {
   const user = req.user!;
   const today = await getClinicToday();
+  const doctorScoped = isDoctorOnly(user);
 
-  const patientCount = await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM patients WHERE status = 'active'");
-  const todayAppts = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM appointments WHERE appointment_date = ? AND status != 'cancelled'",
-    [today]
-  );
-  const activeQueue = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM queue_tickets WHERE status IN ('waiting','called','in_service')"
-  );
-  const openVisits = await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM visits WHERE status != 'closed'");
-  const pendingLabs = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM lab_orders WHERE status IN ('ordered','collected','resulted')"
-  );
-  const pendingImaging = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status IN ('ordered','scheduled','performed','reported_draft')"
-  );
-  const pendingRx = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM prescriptions WHERE status IN ('awaiting_stock_check','pending_payment','pending','paid_ready_to_dispense')"
-  );
-  const pendingApprovals = await queryOne<{ cnt: number }>(
-    "SELECT COUNT(*) AS cnt FROM approval_requests WHERE status = 'pending'"
-  );
+  const patientCount = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT p.id) AS cnt FROM patients p
+         WHERE p.status = 'active'
+           AND (
+             EXISTS (SELECT 1 FROM visits v WHERE v.patient_id = p.id AND v.doctor_id = ?)
+             OR EXISTS (SELECT 1 FROM appointments a WHERE a.patient_id = p.id AND a.doctor_id = ? AND a.status != 'cancelled')
+             OR EXISTS (SELECT 1 FROM admissions adm WHERE adm.patient_id = p.id AND adm.admitting_doctor_id = ? AND adm.status = 'admitted')
+           )`,
+        [user.id, user.id, user.id]
+      )
+    : await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM patients WHERE status = 'active'");
+
+  const todayAppts = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM appointments WHERE appointment_date = ? AND status != 'cancelled' AND doctor_id = ?",
+        [today, user.id]
+      )
+    : await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM appointments WHERE appointment_date = ? AND status != 'cancelled'",
+        [today]
+      );
+
+  const activeQueue = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM queue_tickets q
+         INNER JOIN visits v ON v.id = q.visit_id
+         WHERE q.status IN ('waiting','called','in_service') AND v.doctor_id = ?`,
+        [user.id]
+      )
+    : await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM queue_tickets WHERE status IN ('waiting','called','in_service')"
+      );
+
+  const openVisits = doctorScoped
+    ? await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM visits WHERE status != 'closed' AND doctor_id = ?", [user.id])
+    : await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM visits WHERE status != 'closed'");
+
+  const pendingLabs = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM lab_orders lo
+         INNER JOIN visits v ON v.id = lo.visit_id
+         WHERE lo.status IN ('ordered','collected','resulted') AND v.doctor_id = ?`,
+        [user.id]
+      )
+    : await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM lab_orders WHERE status IN ('ordered','collected','resulted')"
+      );
+
+  const pendingImaging = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM imaging_orders io
+         INNER JOIN visits v ON v.id = io.visit_id
+         WHERE io.status IN ('ordered','scheduled','performed','reported_draft') AND v.doctor_id = ?`,
+        [user.id]
+      )
+    : await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status IN ('ordered','scheduled','performed','reported_draft')"
+      );
+
+  const pendingRx = doctorScoped
+    ? await queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM prescriptions pr
+         LEFT JOIN visits v ON v.id = pr.visit_id
+         WHERE pr.status IN ('awaiting_stock_check','pending_payment','pending','paid_ready_to_dispense')
+           AND (v.doctor_id = ? OR pr.doctor_id = ?)`,
+        [user.id, user.id]
+      )
+    : await queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM prescriptions WHERE status IN ('awaiting_stock_check','pending_payment','pending','paid_ready_to_dispense')"
+      );
+
+  const pendingApprovals = hasPermission(user, 'approval.decide') || hasPermission(user, 'approval.request')
+    ? await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM approval_requests WHERE status = 'pending'")
+    : { cnt: 0 };
   const occupiedBeds = await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM beds WHERE status = 'occupied'");
   const totalBeds = await queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM beds WHERE status != 'out_of_service'");
 
   const canSeeFinance =
     hasPermission(user, 'finance.report.view') ||
     hasPermission(user, 'billing.payment.create') ||
-    hasPermission(user, 'accounting.ledger.manage');
+    hasPermission(user, 'accounting.ledger.manage') ||
+    hasPermission(user, 'finance.bank.manage') ||
+    hasPermission(user, 'accounting.expense.create');
   let revenueTotal = 0;
   let unpaidBalance = 0;
+  let financialSnapshot: {
+    totalInvoicedRevenue: number;
+    collectedInvoiceRevenue: number;
+    unpaidInvoiceBalance: number;
+    invoiceCount: number;
+    totalExpenses: number;
+    paidExpenses: number;
+    pendingExpenseCount: number;
+    expenseCount: number;
+    cashOnHand: number;
+    cashVaultBalance: number;
+    cashDrawerNet: number;
+    bankBalance: number;
+  } | null = null;
+
   if (canSeeFinance) {
-    const revRow = await queryOne<{ total: number }>(
-      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status IN ('completed','refunded')"
-    );
-    const unpaidRow = await queryOne<{ total: number }>(
-      "SELECT COALESCE(SUM(total_amount - paid_amount), 0) AS total FROM invoices WHERE status IN ('unpaid','partial')"
-    );
+    const [revRow, invStats, expStats, cashBankStats, cashGlRow] = await Promise.all([
+      queryOne<{ total: number }>(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status IN ('completed','refunded')"
+      ),
+      queryOne<{
+        total_invoiced: number;
+        total_collected: number;
+        unpaid_balance: number;
+        invoice_count: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN status NOT IN ('voided','refunded') THEN total_amount ELSE 0 END), 0) AS total_invoiced,
+           COALESCE(SUM(CASE WHEN status NOT IN ('voided','refunded') THEN paid_amount ELSE 0 END), 0) AS total_collected,
+           COALESCE(SUM(CASE WHEN status IN ('unpaid','partial') THEN (total_amount - paid_amount) ELSE 0 END), 0) AS unpaid_balance,
+           COUNT(CASE WHEN status NOT IN ('voided','refunded') THEN 1 END) AS invoice_count
+         FROM invoices`
+      ),
+      queryOne<{
+        total_expenses: number;
+        paid_expenses: number;
+        pending_count: number;
+        voucher_count: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN status != 'rejected' THEN amount ELSE 0 END), 0) AS total_expenses,
+           COALESCE(SUM(CASE WHEN status != 'rejected' THEN (CASE WHEN status = 'paid' AND paid_amount = 0 THEN amount ELSE paid_amount END) ELSE 0 END), 0) AS paid_expenses,
+           COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending_count,
+           COUNT(CASE WHEN status != 'rejected' THEN 1 END) AS voucher_count
+         FROM expense_vouchers`
+      ),
+      queryOne<{
+        cash_opening: number;
+        cash_current: number;
+        bank_current: number;
+      }>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN active = 1 AND account_type = 'cash' THEN opening_balance ELSE 0 END), 0) AS cash_opening,
+           COALESCE(SUM(CASE WHEN active = 1 AND account_type = 'cash' THEN current_balance ELSE 0 END), 0) AS cash_current,
+           COALESCE(SUM(CASE WHEN active = 1 AND account_type = 'bank' THEN current_balance ELSE 0 END), 0) AS bank_current
+         FROM finance_cash_bank_accounts`
+      ),
+      queryOne<{ gl_net: number }>(
+        `SELECT COALESCE(SUM(jl.debit - jl.credit), 0) AS gl_net
+         FROM journal_lines jl
+         INNER JOIN chart_of_accounts coa ON coa.id = jl.account_id
+         WHERE coa.code = '1010'
+            OR coa.code IN (SELECT DISTINCT coa_code FROM finance_cash_bank_accounts WHERE active = 1 AND account_type = 'cash')`
+      ),
+    ]);
+
     revenueTotal = Number(revRow?.total || 0);
-    unpaidBalance = Number(unpaidRow?.total || 0);
+    unpaidBalance = Number(invStats?.unpaid_balance || 0);
+
+    const cashVaultOpening = Number(cashBankStats?.cash_opening || 0);
+    const cashVaultBalance = Number(cashBankStats?.cash_current || 0);
+    const cashGlNet = Number(cashGlRow?.gl_net || 0);
+    const cashOnHand = Number((cashVaultOpening + cashGlNet).toFixed(2));
+    const cashDrawerNet = Number((cashOnHand - cashVaultBalance).toFixed(2));
+
+    financialSnapshot = {
+      totalInvoicedRevenue: Number(Number(invStats?.total_invoiced || 0).toFixed(2)),
+      collectedInvoiceRevenue: Number(Number(invStats?.total_collected || 0).toFixed(2)),
+      unpaidInvoiceBalance: Number(unpaidBalance.toFixed(2)),
+      invoiceCount: Number(invStats?.invoice_count || 0),
+      totalExpenses: Number(Number(expStats?.total_expenses || 0).toFixed(2)),
+      paidExpenses: Number(Number(expStats?.paid_expenses || 0).toFixed(2)),
+      pendingExpenseCount: Number(expStats?.pending_count || 0),
+      expenseCount: Number(expStats?.voucher_count || 0),
+      cashOnHand,
+      cashVaultBalance: Number(cashVaultBalance.toFixed(2)),
+      cashDrawerNet,
+      bankBalance: Number(Number(cashBankStats?.bank_current || 0).toFixed(2)),
+    };
   }
 
   const recentQueue = hasPermission(user, 'queue.manage') || hasPermission(user, 'visit.read') || hasPermission(user, 'patient.read')
-    ? await query(
-        `SELECT q.id, q.ticket_number, q.department, q.priority, q.status, q.created_at,
-                p.mrn, p.first_name, p.last_name
-         FROM queue_tickets q
-         INNER JOIN patients p ON p.id = q.patient_id
-         WHERE q.status IN ('waiting','called','in_service')
-         ORDER BY CASE q.priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, q.id ASC
-         LIMIT 8`
-      )
+    ? doctorScoped
+      ? await query(
+          `SELECT q.id, q.ticket_number, q.department, q.priority, q.status, q.created_at,
+                  p.mrn, p.first_name, p.last_name
+           FROM queue_tickets q
+           INNER JOIN patients p ON p.id = q.patient_id
+           INNER JOIN visits v ON v.id = q.visit_id
+           WHERE q.status IN ('waiting','called','in_service') AND v.doctor_id = ?
+           ORDER BY CASE q.priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, q.id ASC
+           LIMIT 8`,
+          [user.id]
+        )
+      : await query(
+          `SELECT q.id, q.ticket_number, q.department, q.priority, q.status, q.created_at,
+                  p.mrn, p.first_name, p.last_name
+           FROM queue_tickets q
+           INNER JOIN patients p ON p.id = q.patient_id
+           WHERE q.status IN ('waiting','called','in_service')
+           ORDER BY CASE q.priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, q.id ASC
+           LIMIT 8`
+        )
     : [];
 
   const upcomingAppointments = hasPermission(user, 'appointment.read')
@@ -1061,10 +1504,10 @@ router.get('/dashboard', requireAuth, async (req: AuthRequest, res: Response) =>
          FROM appointments a
          INNER JOIN patients p ON p.id = a.patient_id
          INNER JOIN users u ON u.id = a.doctor_id
-         WHERE a.appointment_date >= ? AND a.status IN ('scheduled','checked_in')
+         WHERE a.appointment_date >= ? AND a.status IN ('scheduled','checked_in')${doctorScoped ? ' AND a.doctor_id = ?' : ''}
          ORDER BY a.appointment_date ASC, a.start_time ASC
          LIMIT 8`,
-        [today]
+        doctorScoped ? [today, user.id] : [today]
       )
     : [];
 
@@ -1082,11 +1525,824 @@ router.get('/dashboard', requireAuth, async (req: AuthRequest, res: Response) =>
       totalBeds: Number(totalBeds?.cnt || 0),
       revenueTotal: canSeeFinance ? revenueTotal : null,
       unpaidBalance: canSeeFinance ? unpaidBalance : null,
+      isDoctorScoped: doctorScoped,
     },
+    financialSnapshot,
     recentQueue,
     upcomingAppointments,
   });
 });
+
+router.get(
+  '/dashboard/admin',
+  requireAuth,
+  requirePermission('admin.user.manage', 'audit.read', 'admin.config.manage'),
+  async (_req: AuthRequest, res: Response) => {
+    const nowStr = formatUtcSqlDatetime();
+    const [
+      totalUsersRow,
+      activeUsersRow,
+      inactiveUsersRow,
+      lockedUsersRow,
+      hrActiveRow,
+      unlinkedHrRow,
+      accessReviewRow,
+      activeRolesRow,
+      activeDeptsRow,
+      activeRoomsRow,
+      activeSessionsRow,
+      audit24hRow,
+      recentAudits,
+      pendingAccessUsers,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM users'),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM users WHERE active = 1 AND (status IS NULL OR status = 'active')"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM users WHERE active = 0 OR status = 'inactive'"),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM users WHERE status = 'locked' OR (locked_until IS NOT NULL AND locked_until > ?)",
+        [nowStr]
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM hr_employees WHERE status = 'active'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM hr_employees WHERE status = 'active' AND user_id IS NULL"),
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM hr_employees WHERE access_review_required = 1'),
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM roles'),
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM departments WHERE active = 1'),
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM clinic_rooms WHERE active = 1'),
+      queryOne<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM user_sessions WHERE revoked_at IS NULL AND expires_at > ?',
+        [nowStr]
+      ),
+      queryOne<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM audit_logs WHERE occurred_at >= ?',
+        [formatUtcSqlDatetime(new Date(Date.now() - 24 * 3600_000))]
+      ),
+      query(
+        `SELECT id, occurred_at, user_name, role_at_time, action, entity_type, entity_id, reason
+         FROM audit_logs
+         ORDER BY id DESC
+         LIMIT 12`
+      ),
+      query(
+        `SELECT he.id AS employee_id, he.employee_number, he.full_name, he.department_name, he.job_position, he.status AS hr_status,
+                he.access_review_required, he.terminated_at, he.user_id, u.email, u.active AS user_active, u.status AS user_status
+         FROM hr_employees he
+         LEFT JOIN users u ON u.id = he.user_id
+         WHERE he.access_review_required = 1 OR (he.status = 'active' AND he.user_id IS NULL)
+         ORDER BY he.access_review_required DESC, he.id DESC
+         LIMIT 12`
+      ),
+    ]);
+
+    const chainCheck = await verifyAuditChain().catch(() => ({ valid: true, totalRows: 0, brokenAtId: null }));
+
+    res.json({
+      metrics: {
+        totalUsers: Number(totalUsersRow?.cnt || 0),
+        activeUsers: Number(activeUsersRow?.cnt || 0),
+        inactiveUsers: Number(inactiveUsersRow?.cnt || 0),
+        lockedUsers: Number(lockedUsersRow?.cnt || 0),
+        activeHrEmployees: Number(hrActiveRow?.cnt || 0),
+        unlinkedHrEmployees: Number(unlinkedHrRow?.cnt || 0),
+        accessReviewAlerts: Number(accessReviewRow?.cnt || 0),
+        totalRoles: Number(activeRolesRow?.cnt || 0),
+        activeDepartments: Number(activeDeptsRow?.cnt || 0),
+        activeRooms: Number(activeRoomsRow?.cnt || 0),
+        activeSessions: Number(activeSessionsRow?.cnt || 0),
+        auditEvents24h: Number(audit24hRow?.cnt || 0),
+      },
+      auditIntegrity: chainCheck,
+      recentAudits,
+      accessReviewQueue: pendingAccessUsers,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/doctor',
+  requireAuth,
+  requirePermission('visit.read', 'patient.read'),
+  async (req: AuthRequest, res: Response) => {
+    const user = req.user!;
+    const today = await getClinicToday();
+    const doctorId = user.id;
+
+    const [
+      assignedPatientsRow,
+      waitingQueueRow,
+      activeConsultsRow,
+      resultsReadyRow,
+      todayApptsRow,
+      pendingLabsRow,
+      pendingImagingRow,
+      assignedQueue,
+      todayAppointments,
+      recentConsultations,
+      pendingLabResults,
+      pendingImagingResults,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT p.id) AS cnt
+         FROM patients p
+         WHERE p.status = 'active'
+           AND (
+             EXISTS (SELECT 1 FROM visits v WHERE v.patient_id = p.id AND v.doctor_id = ?)
+             OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.patient_id = p.id AND da.doctor_id = ? AND da.status = 'active')
+             OR EXISTS (SELECT 1 FROM appointments a WHERE a.patient_id = p.id AND a.doctor_id = ? AND a.status != 'cancelled')
+             OR EXISTS (SELECT 1 FROM admissions adm WHERE adm.patient_id = p.id AND adm.admitting_doctor_id = ? AND adm.status = 'admitted')
+           )`,
+        [doctorId, doctorId, doctorId, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT v.id) AS cnt
+         FROM visits v
+         WHERE v.status != 'closed'
+           AND (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))
+           AND v.workflow_stage IN ('paid_awaiting_vitals','ready_for_doctor','in_consultation')`,
+        [doctorId, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT v.id) AS cnt
+         FROM visits v
+         WHERE v.status != 'closed'
+           AND (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))`,
+        [doctorId, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(DISTINCT v.id) AS cnt
+         FROM visits v
+         WHERE v.status != 'closed'
+           AND v.workflow_stage = 'results_ready'
+           AND (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))`,
+        [doctorId, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM appointments WHERE appointment_date = ? AND doctor_id = ? AND status != 'cancelled'`,
+        [today, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt
+         FROM lab_orders lo
+         INNER JOIN visits v ON v.id = lo.visit_id
+         WHERE lo.status IN ('ordered','collected','resulted')
+           AND (v.doctor_id = ? OR lo.ordered_by = ?)`,
+        [doctorId, doctorId]
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt
+         FROM imaging_orders io
+         INNER JOIN visits v ON v.id = io.visit_id
+         WHERE io.status IN ('ordered','scheduled','performed','reported_draft')
+           AND (v.doctor_id = ? OR io.ordered_by = ?)`,
+        [doctorId, doctorId]
+      ),
+      query(
+        `SELECT v.id AS visit_id, v.visit_number, v.triage_priority, v.workflow_stage, v.chief_complaint, v.status, v.created_at,
+                p.id AS patient_id, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth,
+                q.ticket_number, q.status AS queue_status,
+                (SELECT vt.bp_systolic FROM vitals vt WHERE vt.visit_id = v.id ORDER BY vt.id DESC LIMIT 1) AS bp_systolic,
+                (SELECT vt.bp_diastolic FROM vitals vt WHERE vt.visit_id = v.id ORDER BY vt.id DESC LIMIT 1) AS bp_diastolic,
+                (SELECT vt.temperature FROM vitals vt WHERE vt.visit_id = v.id ORDER BY vt.id DESC LIMIT 1) AS temperature,
+                (SELECT vt.spo2 FROM vitals vt WHERE vt.visit_id = v.id ORDER BY vt.id DESC LIMIT 1) AS spo2,
+                (SELECT vt.early_warning_flag FROM vitals vt WHERE vt.visit_id = v.id ORDER BY vt.id DESC LIMIT 1) AS early_warning_flag
+         FROM visits v
+         INNER JOIN patients p ON p.id = v.patient_id
+         LEFT JOIN queue_tickets q ON q.visit_id = v.id AND q.status IN ('waiting','called','in_service')
+         WHERE v.status != 'closed'
+           AND (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))
+         ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, v.id ASC
+         LIMIT 15`,
+        [doctorId, doctorId]
+      ),
+      query(
+        `SELECT a.id, a.appointment_date, a.start_time, a.end_time, a.visit_type, a.status, a.reason,
+                p.id AS patient_id, p.mrn, p.first_name, p.last_name
+         FROM appointments a
+         INNER JOIN patients p ON p.id = a.patient_id
+         WHERE a.doctor_id = ? AND a.appointment_date >= ? AND a.status IN ('scheduled','checked_in')
+         ORDER BY a.appointment_date ASC, a.start_time ASC
+         LIMIT 10`,
+        [doctorId, today]
+      ),
+      query(
+        `SELECT v.id, v.visit_number, v.diagnosis_code, v.diagnosis_text, v.status, v.workflow_stage, v.updated_at,
+                p.mrn, p.first_name, p.last_name
+         FROM visits v
+         INNER JOIN patients p ON p.id = v.patient_id
+         WHERE v.doctor_id = ?
+         ORDER BY v.updated_at DESC, v.id DESC
+         LIMIT 8`,
+        [doctorId]
+      ),
+      query(
+        `SELECT lo.id, lo.visit_id, lo.status, lo.abnormal_flag, lo.result_value, lo.verified_at, lo.created_at,
+                lt.code AS test_code, lt.name AS test_name, lt.unit,
+                p.mrn, p.first_name, p.last_name
+         FROM lab_orders lo
+         INNER JOIN lab_tests lt ON lt.id = lo.test_id
+         INNER JOIN visits v ON v.id = lo.visit_id
+         INNER JOIN patients p ON p.id = lo.patient_id
+         WHERE (v.doctor_id = ? OR lo.ordered_by = ?)
+           AND lo.status IN ('ordered','collected','resulted','verified')
+         ORDER BY CASE WHEN lo.status = 'verified' THEN 0 ELSE 1 END, lo.id DESC
+         LIMIT 10`,
+        [doctorId, doctorId]
+      ),
+      query(
+        `SELECT io.id, io.visit_id, io.status, io.impression, io.finalised_at, io.created_at,
+                ic.code AS exam_code, ic.name AS exam_name, ic.modality,
+                p.mrn, p.first_name, p.last_name
+         FROM imaging_orders io
+         INNER JOIN imaging_catalog ic ON ic.id = io.catalog_id
+         INNER JOIN visits v ON v.id = io.visit_id
+         INNER JOIN patients p ON p.id = io.patient_id
+         WHERE (v.doctor_id = ? OR io.ordered_by = ?)
+           AND io.status IN ('ordered','scheduled','performed','reported_draft','reported_final')
+         ORDER BY CASE WHEN io.status = 'reported_final' THEN 0 ELSE 1 END, io.id DESC
+         LIMIT 10`,
+        [doctorId, doctorId]
+      ),
+    ]);
+
+    res.json({
+      doctorScoped: true,
+      metrics: {
+        assignedPatients: Number(assignedPatientsRow?.cnt || 0),
+        waitingQueue: Number(waitingQueueRow?.cnt || 0),
+        activeConsultations: Number(activeConsultsRow?.cnt || 0),
+        resultsReady: Number(resultsReadyRow?.cnt || 0),
+        todayAppointments: Number(todayApptsRow?.cnt || 0),
+        pendingLabs: Number(pendingLabsRow?.cnt || 0),
+        pendingImaging: Number(pendingImagingRow?.cnt || 0),
+      },
+      assignedQueue,
+      todayAppointments,
+      recentConsultations,
+      pendingLabResults,
+      pendingImagingResults,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/nurse',
+  requireAuth,
+  requirePermission('vitals.create', 'vitals.read', 'ipd.mar.give', 'ipd.bed.assign'),
+  async (req: AuthRequest, res: Response) => {
+    const user = req.user!;
+    const unitIds = user.clinicUnitIds || [];
+    const deptNamesLower = (user.departmentNames || []).map((n) => n.toLowerCase());
+    const hasRestrictedScope =
+      unitIds.length > 0 &&
+      !user.roles.includes('ADM') &&
+      !user.roles.includes('MGR') &&
+      !user.departmentCodes.includes('TRIAGE') &&
+      !user.departmentCodes.includes('WRD');
+
+    const unitPlaceholders = unitIds.map(() => '?').join(',');
+    const unitTriageFilter = hasRestrictedScope
+      ? ` AND (
+            EXISTS (
+              SELECT 1 FROM doctor_assignments da
+              WHERE da.visit_id = v.id AND da.status = 'active' AND da.clinic_room_id IN (${unitPlaceholders})
+            )
+            OR EXISTS (
+              SELECT 1 FROM clinic_rooms cr
+              LEFT JOIN specialties sp ON sp.id = cr.specialty_id
+              WHERE cr.id IN (${unitPlaceholders})
+                AND (sp.name = v.specialty OR LOWER(cr.room_type) = LOWER(COALESCE(q.department, '')))
+            )
+          )`
+      : '';
+    const unitTriageParams = hasRestrictedScope ? [...unitIds, ...unitIds] : [];
+    const deptMatchWards =
+      deptNamesLower.length > 0 && !user.departmentCodes.includes('TRIAGE') && !user.departmentCodes.includes('WRD') && !user.roles.includes('ADM') && !user.roles.includes('MGR');
+
+    const [
+      awaitingVitalsRow,
+      abnormalVitalsRow,
+      pendingProcRow,
+      dueMarRow,
+      occupiedBedsRow,
+      totalBedsRow,
+      triageQueue,
+      abnormalVitals,
+      pendingProcedures,
+      dueMedications,
+      wardSnapshot,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt
+         FROM visits v
+         LEFT JOIN queue_tickets q ON q.visit_id = v.id AND q.status IN ('waiting','called','in_service')
+         WHERE v.status != 'closed'
+           AND (
+             v.workflow_stage = 'paid_awaiting_vitals'
+             OR NOT EXISTS (SELECT 1 FROM vitals vt WHERE vt.visit_id = v.id)
+           )${unitTriageFilter}`,
+        unitTriageParams
+      ),
+      queryOne<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt
+         FROM vitals vt
+         WHERE vt.early_warning_flag = 1
+            OR vt.temperature >= 38
+            OR vt.spo2 < 94
+            OR vt.pulse > 110
+            OR vt.pulse < 50
+            OR vt.bp_systolic >= 140
+            OR vt.bp_systolic <= 90`
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM nursing_procedures WHERE status = 'pending'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM medication_administrations WHERE status = 'due'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM beds WHERE status = 'occupied'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM beds WHERE status != 'out_of_service'"),
+      query(
+        `SELECT v.id AS visit_id, v.visit_number, v.triage_priority, v.workflow_stage, v.chief_complaint, v.specialty, v.created_at,
+                p.id AS patient_id, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth,
+                q.ticket_number, q.department, q.status AS queue_status,
+                u.full_name AS doctor_name,
+                (SELECT COUNT(*) FROM vitals vt WHERE vt.visit_id = v.id) AS vitals_count
+         FROM visits v
+         INNER JOIN patients p ON p.id = v.patient_id
+         LEFT JOIN queue_tickets q ON q.visit_id = v.id AND q.status IN ('waiting','called','in_service')
+         LEFT JOIN users u ON u.id = v.doctor_id
+         WHERE v.status != 'closed'
+           AND (
+             v.workflow_stage IN ('paid_awaiting_vitals','ready_for_doctor')
+             OR NOT EXISTS (SELECT 1 FROM vitals vt WHERE vt.visit_id = v.id)
+           )${unitTriageFilter}
+         ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, v.id ASC
+         LIMIT 15`,
+        unitTriageParams
+      ),
+      query(
+        `SELECT vt.id, vt.visit_id, vt.admission_id, vt.patient_id, vt.bp_systolic, vt.bp_diastolic, vt.temperature,
+                vt.pulse, vt.spo2, vt.respiratory_rate, vt.early_warning_flag, vt.recorded_at,
+                p.mrn, p.first_name, p.last_name
+         FROM vitals vt
+         INNER JOIN patients p ON p.id = vt.patient_id
+         WHERE vt.early_warning_flag = 1
+            OR vt.temperature >= 38
+            OR vt.spo2 < 94
+            OR vt.pulse > 110
+            OR vt.pulse < 50
+            OR vt.bp_systolic >= 140
+            OR vt.bp_systolic <= 90
+         ORDER BY vt.id DESC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT np.id, np.visit_id, np.patient_id, np.service_code, np.service_name, np.status, np.created_at,
+                p.mrn, p.first_name, p.last_name
+         FROM nursing_procedures np
+         INNER JOIN patients p ON p.id = np.patient_id
+         WHERE np.status = 'pending'
+         ORDER BY np.id ASC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT ma.id, ma.admission_id, ma.patient_id, ma.medicine_name, ma.dose, ma.scheduled_time, ma.status,
+                p.mrn, p.first_name, p.last_name,
+                w.name AS ward_name, w.department AS ward_department, b.bed_number
+         FROM medication_administrations ma
+         INNER JOIN admissions adm ON adm.id = ma.admission_id
+         INNER JOIN patients p ON p.id = ma.patient_id
+         LEFT JOIN wards w ON w.id = adm.ward_id
+         LEFT JOIN beds b ON b.id = adm.bed_id
+         WHERE ma.status = 'due' AND adm.status = 'admitted'
+         ORDER BY ma.scheduled_time ASC, ma.id ASC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT w.id, w.code, w.name, w.department,
+                COUNT(b.id) AS total_beds,
+                SUM(CASE WHEN b.status = 'occupied' THEN 1 ELSE 0 END) AS occupied_beds,
+                SUM(CASE WHEN b.status = 'vacant' THEN 1 ELSE 0 END) AS available_beds
+         FROM wards w
+         LEFT JOIN beds b ON b.ward_id = w.id AND b.status != 'out_of_service'
+         GROUP BY w.id, w.code, w.name, w.department
+         ORDER BY w.name ASC`
+      ),
+    ]);
+
+    const scopedWards = deptMatchWards
+      ? (wardSnapshot as Array<{ department?: string; name?: string }>).filter((w) =>
+          deptNamesLower.some(
+            (dn) =>
+              String(w.department || '').toLowerCase().includes(dn) ||
+              dn.includes(String(w.department || '').toLowerCase())
+          )
+        )
+      : wardSnapshot;
+
+    res.json({
+      unitScoped: hasRestrictedScope || deptMatchWards,
+      assignedUnits: user.clinicUnits,
+      metrics: {
+        awaitingVitals: Number(awaitingVitalsRow?.cnt || 0),
+        abnormalVitals: Number(abnormalVitalsRow?.cnt || 0),
+        pendingProcedures: Number(pendingProcRow?.cnt || 0),
+        dueMedications: Number(dueMarRow?.cnt || 0),
+        occupiedBeds: Number(occupiedBedsRow?.cnt || 0),
+        totalBeds: Number(totalBedsRow?.cnt || 0),
+      },
+      triageQueue,
+      abnormalVitals,
+      pendingProcedures,
+      dueMedications,
+      wardSnapshot: scopedWards,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/cashier',
+  requireAuth,
+  requirePermission('billing.invoice.read', 'billing.payment.create', 'billing.shift.manage'),
+  async (req: AuthRequest, res: Response) => {
+    const user = req.user!;
+    const today = await getClinicToday();
+
+    const [
+      openShift,
+      unpaidStatsRow,
+      todayCollectionsRow,
+      todayPaymentsByMethod,
+      pendingBypassesRow,
+      recentUnpaidInvoices,
+      recentReceipts,
+    ] = await Promise.all([
+      queryOne(
+        `SELECT id, opening_float, expected_cash, status, opened_at
+         FROM cashier_shifts
+         WHERE cashier_id = ? AND status = 'open'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [user.id]
+      ),
+      queryOne<{ cnt: number; balance: number }>(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(total_amount - paid_amount), 0) AS balance
+         FROM invoices
+         WHERE status IN ('unpaid','partial')`
+      ),
+      queryOne<{ cnt: number; total: number }>(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+         FROM payments
+         WHERE status = 'completed' AND substr(created_at, 1, 10) = ?`,
+        [today]
+      ),
+      query(
+        `SELECT method, COUNT(*) AS tx_count, COALESCE(SUM(amount), 0) AS total_amount
+         FROM payments
+         WHERE status = 'completed' AND substr(created_at, 1, 10) = ?
+         GROUP BY method
+         ORDER BY total_amount DESC`,
+        [today]
+      ),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM payment_gate_bypasses WHERE follow_up_status = 'pending_billing'"
+      ),
+      query(
+        `SELECT i.id, i.invoice_number, i.patient_id, i.visit_id, i.total_amount, i.paid_amount,
+                (i.total_amount - i.paid_amount) AS balance_due, i.payer_type, i.status, i.created_at,
+                p.mrn, p.first_name, p.last_name
+         FROM invoices i
+         INNER JOIN patients p ON p.id = i.patient_id
+         WHERE i.status IN ('unpaid','partial')
+         ORDER BY i.id DESC
+         LIMIT 12`
+      ),
+      query(
+        `SELECT pm.id, pm.receipt_number, pm.amount, pm.method, pm.reference_no, pm.status, pm.created_at,
+                i.invoice_number, p.mrn, p.first_name, p.last_name
+         FROM payments pm
+         INNER JOIN invoices i ON i.id = pm.invoice_id
+         INNER JOIN patients p ON p.id = pm.patient_id
+         ORDER BY pm.id DESC
+         LIMIT 10`
+      ),
+    ]);
+
+    res.json({
+      openShift: openShift || null,
+      metrics: {
+        unpaidInvoiceCount: Number(unpaidStatsRow?.cnt || 0),
+        outstandingReceivables: Number(Number(unpaidStatsRow?.balance || 0).toFixed(2)),
+        todayReceiptCount: Number(todayCollectionsRow?.cnt || 0),
+        todayCollectionsTotal: Number(Number(todayCollectionsRow?.total || 0).toFixed(2)),
+        pendingPaymentBypasses: Number(pendingBypassesRow?.cnt || 0),
+        shiftOpen: Boolean(openShift),
+        shiftExpectedCash: Number(Number((openShift as { expected_cash?: number } | null)?.expected_cash || 0).toFixed(2)),
+      },
+      todayPaymentsByMethod,
+      recentUnpaidInvoices,
+      recentReceipts,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/lab',
+  requireAuth,
+  requirePermission('lab.order.read', 'lab.sample.collect', 'lab.result.enter', 'lab.result.verify'),
+  async (_req: AuthRequest, res: Response) => {
+    const today = await getClinicToday();
+
+    const [
+      orderedRow,
+      collectedRow,
+      resultedRow,
+      verifiedTodayRow,
+      criticalUnackRow,
+      rejectedRow,
+      pendingWorklist,
+      criticalAlerts,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM lab_orders WHERE status = 'ordered'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM lab_orders WHERE status = 'collected'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM lab_orders WHERE status = 'resulted'"),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM lab_orders WHERE status IN ('verified','amended') AND substr(COALESCE(verified_at, created_at), 1, 10) = ?",
+        [today]
+      ),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM lab_orders WHERE abnormal_flag = 'critical' AND critical_ack_by IS NULL"
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM lab_orders WHERE status = 'rejected'"),
+      query(
+        `SELECT lo.id, lo.visit_id, lo.patient_id, lo.sample_barcode, lo.status, lo.abnormal_flag, lo.result_value, lo.created_at,
+                lt.code AS test_code, lt.name AS test_name, lt.sample_type, lt.unit,
+                p.mrn, p.first_name, p.last_name,
+                v.triage_priority,
+                i.status AS invoice_status
+         FROM lab_orders lo
+         INNER JOIN lab_tests lt ON lt.id = lo.test_id
+         INNER JOIN patients p ON p.id = lo.patient_id
+         LEFT JOIN visits v ON v.id = lo.visit_id
+         LEFT JOIN invoices i ON i.id = lo.invoice_id
+         WHERE lo.status IN ('ordered','collected','resulted')
+         ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, lo.id ASC
+         LIMIT 18`
+      ),
+      query(
+        `SELECT lo.id, lo.visit_id, lo.result_value, lo.abnormal_flag, lo.status, lo.verified_at, lo.created_at,
+                lt.code AS test_code, lt.name AS test_name, lt.unit,
+                p.mrn, p.first_name, p.last_name
+         FROM lab_orders lo
+         INNER JOIN lab_tests lt ON lt.id = lo.test_id
+         INNER JOIN patients p ON p.id = lo.patient_id
+         WHERE lo.abnormal_flag IN ('critical','high','low')
+         ORDER BY CASE WHEN lo.abnormal_flag = 'critical' AND lo.critical_ack_by IS NULL THEN 0 ELSE 1 END, lo.id DESC
+         LIMIT 10`
+      ),
+    ]);
+
+    res.json({
+      metrics: {
+        awaitingCollection: Number(orderedRow?.cnt || 0),
+        collectedInProgress: Number(collectedRow?.cnt || 0),
+        awaitingVerification: Number(resultedRow?.cnt || 0),
+        verifiedToday: Number(verifiedTodayRow?.cnt || 0),
+        criticalUnacknowledged: Number(criticalUnackRow?.cnt || 0),
+        rejectedSamples: Number(rejectedRow?.cnt || 0),
+      },
+      pendingWorklist,
+      criticalAlerts,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/radiology',
+  requireAuth,
+  requirePermission('imaging.order.read', 'imaging.exam.perform', 'imaging.report.finalise'),
+  async (_req: AuthRequest, res: Response) => {
+    const today = await getClinicToday();
+
+    const [
+      orderedRow,
+      scheduledRow,
+      performedRow,
+      draftRow,
+      finalisedTodayRow,
+      worklist,
+      modalityBreakdown,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status = 'ordered'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status = 'scheduled'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status = 'performed'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status = 'reported_draft'"),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM imaging_orders WHERE status = 'reported_final' AND substr(COALESCE(finalised_at, created_at), 1, 10) = ?",
+        [today]
+      ),
+      query(
+        `SELECT io.id, io.visit_id, io.patient_id, io.status, io.findings, io.impression, io.created_at,
+                ic.code AS exam_code, ic.name AS exam_name, ic.modality, ic.body_region,
+                p.mrn, p.first_name, p.last_name,
+                v.triage_priority,
+                i.status AS invoice_status
+         FROM imaging_orders io
+         INNER JOIN imaging_catalog ic ON ic.id = io.catalog_id
+         INNER JOIN patients p ON p.id = io.patient_id
+         LEFT JOIN visits v ON v.id = io.visit_id
+         LEFT JOIN invoices i ON i.id = io.invoice_id
+         WHERE io.status IN ('ordered','scheduled','performed','reported_draft')
+         ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, io.id ASC
+         LIMIT 18`
+      ),
+      query(
+        `SELECT ic.modality, COUNT(*) AS open_count
+         FROM imaging_orders io
+         INNER JOIN imaging_catalog ic ON ic.id = io.catalog_id
+         WHERE io.status IN ('ordered','scheduled','performed','reported_draft')
+         GROUP BY ic.modality
+         ORDER BY open_count DESC`
+      ),
+    ]);
+
+    res.json({
+      metrics: {
+        orderedQueue: Number(orderedRow?.cnt || 0),
+        scheduledQueue: Number(scheduledRow?.cnt || 0),
+        awaitingReport: Number(performedRow?.cnt || 0),
+        draftReports: Number(draftRow?.cnt || 0),
+        finalisedToday: Number(finalisedTodayRow?.cnt || 0),
+      },
+      worklist,
+      modalityBreakdown,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/pharmacy',
+  requireAuth,
+  requirePermission('pharmacy.prescription.read', 'pharmacy.dispense'),
+  async (_req: AuthRequest, res: Response) => {
+    const today = await getClinicToday();
+    const thirtyDaysAhead = new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10);
+
+    const [
+      readyDispenseRow,
+      pendingPaymentRow,
+      dispensedTodayRow,
+      lowStockRow,
+      expiringBatchesRow,
+      pendingReqRow,
+      dispenseQueue,
+      lowStockMedicines,
+      expiringBatches,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM prescriptions WHERE status IN ('paid_ready_to_dispense','awaiting_stock_check','pending')"
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM prescriptions WHERE status = 'pending_payment'"),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM prescriptions WHERE status = 'dispensed' AND substr(COALESCE(dispensed_at, created_at), 1, 10) = ?",
+        [today]
+      ),
+      queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM medicines WHERE stock_qty <= reorder_level'),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM stock_batches WHERE qty_on_hand > 0 AND status = 'active' AND expiry_date <= ?",
+        [thirtyDaysAhead]
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM stock_requisitions WHERE status IN ('pending','approved')").catch(
+        () => ({ cnt: 0 })
+      ),
+      query(
+        `SELECT pr.id, pr.visit_id, pr.patient_id, pr.status, pr.notes, pr.created_at,
+                p.mrn, p.first_name, p.last_name,
+                u.full_name AS doctor_name,
+                i.invoice_number, i.status AS invoice_status,
+                (SELECT COUNT(*) FROM prescription_items pi WHERE pi.prescription_id = pr.id) AS item_count
+         FROM prescriptions pr
+         INNER JOIN patients p ON p.id = pr.patient_id
+         LEFT JOIN users u ON u.id = pr.doctor_id
+         LEFT JOIN invoices i ON i.id = pr.invoice_id
+         WHERE pr.status IN ('paid_ready_to_dispense','awaiting_stock_check','pending_payment','pending')
+         ORDER BY CASE WHEN pr.status = 'paid_ready_to_dispense' THEN 0 ELSE 1 END, pr.id ASC
+         LIMIT 15`
+      ),
+      query(
+        `SELECT id, code, generic_name, strength, form, stock_qty, reorder_level, expiry_date
+         FROM medicines
+         WHERE stock_qty <= reorder_level
+         ORDER BY stock_qty ASC, generic_name ASC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT sb.id, sb.batch_number, sb.location, sb.expiry_date, sb.qty_on_hand,
+                si.code AS item_code, si.name AS item_name, si.unit
+         FROM stock_batches sb
+         INNER JOIN store_items si ON si.id = sb.item_id
+         WHERE sb.qty_on_hand > 0 AND sb.status = 'active' AND sb.expiry_date <= ?
+         ORDER BY sb.expiry_date ASC
+         LIMIT 10`,
+        [thirtyDaysAhead]
+      ),
+    ]);
+
+    res.json({
+      metrics: {
+        readyToDispense: Number(readyDispenseRow?.cnt || 0),
+        pendingPayment: Number(pendingPaymentRow?.cnt || 0),
+        dispensedToday: Number(dispensedTodayRow?.cnt || 0),
+        lowStockCount: Number(lowStockRow?.cnt || 0),
+        expiringBatchesCount: Number(expiringBatchesRow?.cnt || 0),
+        pendingRequisitions: Number(pendingReqRow?.cnt || 0),
+      },
+      dispenseQueue,
+      lowStockMedicines,
+      expiringBatches,
+    });
+  }
+);
+
+router.get(
+  '/dashboard/hr',
+  requireAuth,
+  requirePermission('hr.manage', 'hr.attendance.manage', 'hr.overtime.manage', 'hr.payroll.submit'),
+  async (_req: AuthRequest, res: Response) => {
+    const today = await getClinicToday();
+
+    const [
+      activeStaffRow,
+      inactiveStaffRow,
+      presentTodayRow,
+      lateTodayRow,
+      pendingLeaveRow,
+      pendingOvertimeRow,
+      draftPayrollRow,
+      departmentBreakdown,
+      pendingLeaveRequests,
+      pendingOvertimeList,
+      recentPayrollRuns,
+    ] = await Promise.all([
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM hr_employees WHERE status = 'active'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM hr_employees WHERE status != 'active'"),
+      queryOne<{ cnt: number }>(
+        "SELECT COUNT(*) AS cnt FROM hr_attendance WHERE attendance_date = ? AND status IN ('present','late')",
+        [today]
+      ),
+      queryOne<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM hr_attendance WHERE attendance_date = ? AND late_minutes > 0',
+        [today]
+      ),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM leave_requests WHERE status = 'pending'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM hr_overtime WHERE status = 'pending'"),
+      queryOne<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM payroll_runs WHERE status IN ('draft','submitted','verified','approved')"),
+      query(
+        `SELECT department_name, COUNT(*) AS staff_count
+         FROM hr_employees
+         WHERE status = 'active'
+         GROUP BY department_name
+         ORDER BY staff_count DESC, department_name ASC`
+      ),
+      query(
+        `SELECT lr.id, lr.leave_type, lr.start_date, lr.end_date, lr.days_count, lr.reason, lr.status,
+                COALESCE(he.full_name, u.full_name, 'Staff') AS staff_name, he.department_name
+         FROM leave_requests lr
+         LEFT JOIN hr_employees he ON he.id = lr.employee_id OR (lr.employee_id IS NULL AND he.user_id = lr.user_id)
+         LEFT JOIN users u ON u.id = lr.user_id
+         WHERE lr.status = 'pending'
+         ORDER BY lr.id ASC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT ot.id, ot.overtime_date, ot.hours, ot.day_type, ot.computed_amount, ot.reason, ot.status,
+                he.full_name AS staff_name, he.department_name
+         FROM hr_overtime ot
+         INNER JOIN hr_employees he ON he.id = ot.employee_id
+         WHERE ot.status = 'pending'
+         ORDER BY ot.id ASC
+         LIMIT 10`
+      ),
+      query(
+        `SELECT id, run_number, pay_month, total_gross, total_deductions, total_net, status, created_at
+         FROM payroll_runs
+         ORDER BY id DESC
+         LIMIT 6`
+      ),
+    ]);
+
+    res.json({
+      metrics: {
+        activeEmployees: Number(activeStaffRow?.cnt || 0),
+        inactiveEmployees: Number(inactiveStaffRow?.cnt || 0),
+        presentToday: Number(presentTodayRow?.cnt || 0),
+        lateToday: Number(lateTodayRow?.cnt || 0),
+        pendingLeaves: Number(pendingLeaveRow?.cnt || 0),
+        pendingOvertime: Number(pendingOvertimeRow?.cnt || 0),
+        openPayrollRuns: Number(draftPayrollRow?.cnt || 0),
+      },
+      departmentBreakdown,
+      pendingLeaveRequests,
+      pendingOvertimeList,
+      recentPayrollRuns,
+    });
+  }
+);
 
 router.get('/catalog/services', requireAuth, async (_req, res) => {
   const services = await query('SELECT * FROM services WHERE active = 1 ORDER BY category, name');
@@ -1120,6 +2376,24 @@ router.get('/doctors', requireAuth, async (_req, res) => {
   res.json({ doctors });
 });
 
+router.get('/doctors/activity', requireAuth, requirePermission('audit.read', 'finance.report.view', 'admin.user.manage'), async (_req, res) => {
+  const today = await getClinicToday();
+  const doctors = await query(
+    `SELECT u.id, u.full_name, u.email, u.specialty,
+            (SELECT COUNT(*) FROM visits v WHERE v.doctor_id = u.id AND v.status != 'closed') AS active_visits,
+            (SELECT COUNT(*) FROM visits v WHERE v.doctor_id = u.id AND v.status = 'closed') AS completed_visits,
+            (SELECT COUNT(*) FROM queue_tickets q INNER JOIN visits v ON v.id = q.visit_id WHERE v.doctor_id = u.id AND q.status IN ('waiting','called','in_service')) AS queue_count,
+            (SELECT COUNT(*) FROM appointments a WHERE a.doctor_id = u.id AND a.appointment_date = ? AND a.status != 'cancelled') AS today_appointments
+     FROM users u
+     INNER JOIN user_roles ur ON ur.user_id = u.id
+     INNER JOIN roles r ON r.id = ur.role_id
+     WHERE r.code = 'DOC' AND u.active = 1
+     ORDER BY active_visits DESC, u.full_name ASC`,
+    [today]
+  );
+  res.json({ doctors });
+});
+
 // ---------------------------------------------------------------------------
 // PATIENTS, DUPLICATE CHECK, MERGE & QUEUE
 // ---------------------------------------------------------------------------
@@ -1130,9 +2404,16 @@ router.get('/patients', requireAuth, requirePermission('patient.read'), async (r
   const page = Math.max(1, Number(req.query.page || 1));
   const offset = (page - 1) * limit;
   const canSeeClinical = hasPermission(req.user!, 'patient.clinical.read');
+  const doctorScoped = isDoctorOnly(req.user!);
 
   let whereSql = " WHERE status = 'active'";
   const params: unknown[] = [];
+
+  if (doctorScoped) {
+    whereSql +=
+      " AND (EXISTS (SELECT 1 FROM visits v WHERE v.patient_id = patients.id AND v.doctor_id = ?) OR EXISTS (SELECT 1 FROM appointments a WHERE a.patient_id = patients.id AND a.doctor_id = ? AND a.status != 'cancelled') OR EXISTS (SELECT 1 FROM admissions adm WHERE adm.patient_id = patients.id AND adm.admitting_doctor_id = ? AND adm.status = 'admitted'))";
+    params.push(req.user!.id, req.user!.id, req.user!.id);
+  }
 
   if (search) {
     const tokens = search.split(/\s+/).filter(Boolean).slice(0, 5);
@@ -1168,7 +2449,14 @@ router.get('/patients', requireAuth, requirePermission('patient.read'), async (r
   sql += ` FROM patients${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`;
 
   const patients = await query(sql, [...params, limit, offset]);
-  res.json({ patients, clinicalMasked: !canSeeClinical, total: Number(countRow?.cnt || 0), page, limit });
+  res.json({
+    patients,
+    clinicalMasked: !canSeeClinical,
+    isDoctorScoped: doctorScoped,
+    total: Number(countRow?.cnt || 0),
+    page,
+    limit,
+  });
 });
 
 router.get('/patients/check-duplicate', requireAuth, requirePermission('patient.read'), async (req: AuthRequest, res: Response) => {
@@ -1299,7 +2587,15 @@ router.post('/patients/merge', requireAuth, requirePermission('patient.merge'), 
   res.json(result);
 });
 
-router.get('/patients/:id', requireAuth, requirePermission('patient.read'), async (req: AuthRequest, res: Response) => {
+router.get(
+  '/patients/:id',
+  requireAuth,
+  authorize('patient.read', {
+    checkDoctorAssignment: true,
+    patientIdParam: 'id',
+    audit: { action: 'patient.read', entityType: 'patient', entityIdParam: 'id', patientIdParam: 'id', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const patient = await queryOne<Record<string, unknown>>('SELECT * FROM patients WHERE id = ?', [id]);
   if (!patient) {
@@ -1320,14 +2616,16 @@ router.get('/patients/:id', requireAuth, requirePermission('patient.read'), asyn
 
   const safePatient = maskPatientRecord(patient, req.user!);
 
+  const doctorScoped = isDoctorOnly(req.user!) && !access.breakGlassActive;
+
   const appointments = hasPermission(req.user!, 'appointment.read')
     ? await query(
         `SELECT a.*, u.full_name AS doctor_name
          FROM appointments a
          INNER JOIN users u ON u.id = a.doctor_id
-         WHERE a.patient_id = ?
+         WHERE a.patient_id = ?${doctorScoped ? ' AND a.doctor_id = ?' : ''}
          ORDER BY a.appointment_date DESC, a.start_time DESC`,
-        [id]
+        doctorScoped ? [id, req.user!.id] : [id]
       )
     : [];
 
@@ -1336,14 +2634,22 @@ router.get('/patients/:id', requireAuth, requirePermission('patient.read'), asyn
         `SELECT v.*, u.full_name AS doctor_name
          FROM visits v
          LEFT JOIN users u ON u.id = v.doctor_id
-         WHERE v.patient_id = ?
+         WHERE v.patient_id = ?${doctorScoped ? ' AND v.doctor_id = ?' : ''}
          ORDER BY v.id DESC`,
-        [id]
+        doctorScoped ? [id, req.user!.id] : [id]
       )
     : [];
 
   const vitals = canSeeClinical
-    ? await query('SELECT * FROM vitals WHERE patient_id = ? ORDER BY id DESC LIMIT 10', [id])
+    ? doctorScoped
+      ? await query(
+          `SELECT vt.* FROM vitals vt
+           INNER JOIN visits v ON v.id = vt.visit_id
+           WHERE vt.patient_id = ? AND v.doctor_id = ?
+           ORDER BY vt.id DESC LIMIT 10`,
+          [id, req.user!.id]
+        )
+      : await query('SELECT * FROM vitals WHERE patient_id = ? ORDER BY id DESC LIMIT 10', [id])
     : [];
 
   const invoices = canSeeBilling
@@ -1659,11 +2965,12 @@ router.patch('/patients/:id', requireAuth, requirePermission('patient.update'), 
 });
 
 // Queue Management
-router.get('/queue', requireAuth, requirePermission('queue.manage', 'visit.read', 'patient.read'), async (req, res) => {
+router.get('/queue', requireAuth, requirePermission('queue.manage', 'visit.read', 'patient.read'), async (req: AuthRequest, res: Response) => {
   const dept = req.query.department ? String(req.query.department) : null;
+  const doctorScoped = isDoctorOnly(req.user!);
   let sql = `
     SELECT q.*, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.patient_type,
-           v.visit_number, v.specialty, v.workflow_stage,
+           v.visit_number, v.specialty, v.workflow_stage, v.doctor_id,
            d.full_name AS doctor_name,
            ci.id AS consultation_invoice_id,
            ci.invoice_number AS consultation_invoice_number,
@@ -1678,6 +2985,10 @@ router.get('/queue', requireAuth, requirePermission('queue.manage', 'visit.read'
     WHERE q.status IN ('waiting','called','in_service')
   `;
   const params: unknown[] = [];
+  if (doctorScoped) {
+    sql += ' AND v.doctor_id = ?';
+    params.push(req.user!.id);
+  }
   if (dept && dept !== 'ALL') {
     sql += ' AND q.department = ?';
     params.push(dept);
@@ -1772,9 +3083,10 @@ router.patch('/queue/:id/status', requireAuth, requirePermission('queue.manage')
 // ---------------------------------------------------------------------------
 // APPOINTMENTS & DOCTOR AVAILABILITY BLOCKS
 // ---------------------------------------------------------------------------
-router.get('/appointments/blocks', requireAuth, requirePermission('appointment.read'), async (req, res) => {
+router.get('/appointments/blocks', requireAuth, requirePermission('appointment.read'), async (req: AuthRequest, res: Response) => {
   const date = req.query.date ? String(req.query.date) : null;
-  const doctorId = req.query.doctorId ? Number(req.query.doctorId) : null;
+  const doctorScoped = isDoctorOnly(req.user!);
+  const doctorId = doctorScoped ? req.user!.id : req.query.doctorId ? Number(req.query.doctorId) : null;
   let sql = `
     SELECT db.*, u.full_name AS doctor_name, u.specialty
     FROM doctor_blocks db
@@ -1831,9 +3143,10 @@ router.delete('/appointments/blocks/:id', requireAuth, requirePermission('appoin
   res.json({ ok: true });
 });
 
-router.get('/appointments', requireAuth, requirePermission('appointment.read'), async (req, res) => {
+router.get('/appointments', requireAuth, requirePermission('appointment.read'), async (req: AuthRequest, res: Response) => {
   const date = req.query.date ? String(req.query.date) : null;
-  const doctorId = req.query.doctorId ? Number(req.query.doctorId) : null;
+  const doctorScoped = isDoctorOnly(req.user!);
+  const doctorId = doctorScoped ? req.user!.id : req.query.doctorId ? Number(req.query.doctorId) : null;
 
   let sql = `
     SELECT a.*, p.mrn, p.first_name, p.last_name, p.phone, p.patient_type,
@@ -1854,7 +3167,7 @@ router.get('/appointments', requireAuth, requirePermission('appointment.read'), 
   }
   sql += ' ORDER BY a.appointment_date ASC, a.start_time ASC';
   const appointments = await query(sql, params);
-  res.json({ appointments });
+  res.json({ appointments, isDoctorScoped: doctorScoped });
 });
 
 router.post('/appointments', requireAuth, requirePermission('appointment.create'), async (req: AuthRequest, res: Response) => {
@@ -1916,6 +3229,9 @@ router.patch('/appointments/:id', requireAuth, requirePermission('appointment.up
   const id = Number(req.params.id);
   const existing = await queryOne<Record<string, unknown>>('SELECT * FROM appointments WHERE id = ?', [id]);
   if (!existing) return res.status(404).json({ error: 'Appointment not found' });
+  if (isDoctorOnly(req.user!) && Number(existing.doctor_id) !== req.user!.id) {
+    return res.status(403).json({ error: 'You may only update your own assigned appointments.' });
+  }
   if (existing.status === 'cancelled' || existing.status === 'completed') {
     return res.status(409).json({ error: `Appointment is already ${existing.status} and cannot be modified.` });
   }
@@ -2080,10 +3396,19 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
   const limit = Math.min(200, Math.max(10, Number(req.query.limit || 60)));
   const page = Math.max(1, Number(req.query.page || 1));
   const offset = (page - 1) * limit;
+  const doctorScoped = isDoctorOnly(req.user!);
 
   const stages = stageFilter ? stageFilter.split(',').map((s) => s.trim()).filter(Boolean) : [];
   const clauses: string[] = [];
   const params: unknown[] = [];
+
+  if (doctorScoped) {
+    clauses.push('v.doctor_id = ?');
+    params.push(req.user!.id);
+  } else if (doctorIdFilter) {
+    clauses.push('v.doctor_id = ?');
+    params.push(doctorIdFilter);
+  }
 
   if (stages.length > 0) {
     const ph = stages.map(() => '?').join(',');
@@ -2094,10 +3419,6 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
     clauses.push("v.status != 'closed'");
   } else if (statusFilter === 'closed') {
     clauses.push("v.status = 'closed'");
-  }
-  if (doctorIdFilter) {
-    clauses.push('v.doctor_id = ?');
-    params.push(doctorIdFilter);
   }
   if (dateFilter) {
     clauses.push('substr(v.created_at, 1, 10) = ?');
@@ -2126,9 +3447,8 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
   );
 
   const canSeeClinical = hasPermission(req.user!, 'patient.clinical.read');
-  const isDoctorOnly = req.user!.roles.includes('DOC') && !req.user!.roles.includes('MGR') && !req.user!.roles.includes('ADM');
   let activeBreakGlassPatients = new Set<number>();
-  if (isDoctorOnly && rows.length > 0) {
+  if (doctorScoped && rows.length > 0) {
     const bgRows = await query<{ patient_id: number }>(
       'SELECT DISTINCT patient_id FROM break_glass_logs WHERE user_id = ? AND expires_at > ?',
       [req.user!.id, nowSql()]
@@ -2148,10 +3468,8 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
       v.workflow_stage === 'results_ready' || (completedDiag > 0 && pendingDiag === 0 && v.status !== 'closed');
 
     const docAuthorized =
-      !isDoctorOnly ||
+      !doctorScoped ||
       Number(v.doctor_id) === req.user!.id ||
-      Number(v.created_by) === req.user!.id ||
-      (v.doctor_id == null && v.status !== 'closed') ||
       activeBreakGlassPatients.has(Number(v.patient_id));
 
     if (!canSeeClinical || !docAuthorized) {
@@ -2178,13 +3496,22 @@ router.get('/visits', requireAuth, requirePermission('visit.read', 'vitals.read'
   res.json({
     visits,
     clinicalMasked: !canSeeClinical,
+    isDoctorScoped: doctorScoped,
     total: Number(countRow?.cnt || 0),
     page,
     limit,
   });
 });
 
-router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.read'), async (req: AuthRequest, res: Response) => {
+router.get(
+  '/visits/:id',
+  requireAuth,
+  authorize(['visit.read', 'vitals.read'], {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'visit.read', entityType: 'visit', entityIdParam: 'id' },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
   const visitRow = await queryOne<Record<string, unknown>>(
     `SELECT v.*, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.allergies, p.blood_group, p.patient_type,
@@ -2208,10 +3535,18 @@ router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.r
       patientId: Number(visitRow.patient_id),
     });
   }
+  if (isDoctorOnly(req.user!) && Number(visitRow.doctor_id) !== req.user!.id && !access.breakGlassActive) {
+    return res.status(403).json({
+      error: 'Access denied: this visit is assigned to another clinician.',
+      breakGlassRequired: true,
+      patientId: Number(visitRow.patient_id),
+    });
+  }
   const canSeeClinical = access.clinicalAuthorized;
+  const canSeeVitals = canSeeClinical || hasPermission(req.user!, 'vitals.read');
 
   const [vitals, labOrders, imagingOrders, prescriptions, nursingProcedures] = await Promise.all([
-    canSeeClinical ? query('SELECT * FROM vitals WHERE visit_id = ? ORDER BY id DESC', [id]) : Promise.resolve([]),
+    canSeeVitals ? query('SELECT * FROM vitals WHERE visit_id = ? ORDER BY id DESC', [id]) : Promise.resolve([]),
     query<Record<string, unknown>>(
       `SELECT lo.*, lt.code AS test_code, lt.name AS test_name, lt.unit, lt.reference_range, lt.analyte_template_json,
               i.invoice_number, i.status AS invoice_status
@@ -2231,27 +3566,31 @@ router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.r
        WHERE io.visit_id = ?`,
       [id]
     ),
-    query<Record<string, unknown>>(
-      `SELECT pr.*, i.invoice_number, i.status AS invoice_status
-       FROM prescriptions pr
-       LEFT JOIN invoices i ON i.id = pr.invoice_id
-       WHERE pr.visit_id = ?`,
-      [id]
-    ),
-    query(
-      `SELECT np.*, s.unit_price, u1.full_name AS ordered_by_name, u2.full_name AS performed_by_name, i.invoice_number, i.status AS invoice_status
-       FROM nursing_procedures np
-       LEFT JOIN services s ON s.id = np.service_id
-       LEFT JOIN users u1 ON u1.id = np.ordered_by
-       LEFT JOIN users u2 ON u2.id = np.performed_by
-       LEFT JOIN invoices i ON i.id = np.invoice_id
-       WHERE np.visit_id = ?
-       ORDER BY np.id DESC`,
-      [id]
-    ),
+    canSeeClinical
+      ? query<Record<string, unknown>>(
+          `SELECT pr.*, i.invoice_number, i.status AS invoice_status
+           FROM prescriptions pr
+           LEFT JOIN invoices i ON i.id = pr.invoice_id
+           WHERE pr.visit_id = ?`,
+          [id]
+        )
+      : Promise.resolve([]),
+    canSeeClinical
+      ? query(
+          `SELECT np.*, s.unit_price, u1.full_name AS ordered_by_name, u2.full_name AS performed_by_name, i.invoice_number, i.status AS invoice_status
+           FROM nursing_procedures np
+           LEFT JOIN services s ON s.id = np.service_id
+           LEFT JOIN users u1 ON u1.id = np.ordered_by
+           LEFT JOIN users u2 ON u2.id = np.performed_by
+           LEFT JOIN invoices i ON i.id = np.invoice_id
+           WHERE np.visit_id = ?
+           ORDER BY np.id DESC`,
+          [id]
+        )
+      : Promise.resolve([]),
   ]);
 
-  if (prescriptions.length > 0) {
+  if (canSeeClinical && prescriptions.length > 0) {
     const rxIds = prescriptions.map((pr) => pr.id);
     const ph = rxIds.map(() => '?').join(',');
     const allItems = await query<Record<string, unknown>>(
@@ -2311,6 +3650,88 @@ router.get('/visits/:id', requireAuth, requirePermission('visit.read', 'vitals.r
     prescriptions,
     nursingProcedures,
   });
+});
+
+router.patch('/visits/:id/assign-doctor', requireAuth, requirePermission('visit.assign_doctor', 'visit.create', 'vitals.create', 'queue.manage'), async (req: AuthRequest, res: Response) => {
+  const visitId = Number(req.params.id);
+  const { doctor_id, specialty, notes } = req.body || {};
+  const doctorId = Number(doctor_id);
+  if (!doctorId) {
+    return res.status(400).json({ error: 'Valid doctor_id is required to assign an OPD doctor.' });
+  }
+
+  const visit = await queryOne<{
+    id: number;
+    visit_number: string;
+    patient_id: number;
+    doctor_id: number | null;
+    specialty: string | null;
+    status: string;
+    workflow_stage: string | null;
+  }>('SELECT id, visit_number, patient_id, doctor_id, specialty, status, workflow_stage FROM visits WHERE id = ?', [visitId]);
+  if (!visit) return res.status(404).json({ error: 'Visit not found' });
+  if (visit.status === 'closed') {
+    return res.status(409).json({ error: 'Cannot reassign a closed visit.' });
+  }
+
+  const doc = await queryOne<{ id: number; full_name: string; specialty: string | null }>(
+    `SELECT u.id, u.full_name, u.specialty
+     FROM users u
+     INNER JOIN user_roles ur ON ur.user_id = u.id
+     INNER JOIN roles r ON r.id = ur.role_id
+     WHERE u.id = ? AND r.code = 'DOC' AND u.active = 1`,
+    [doctorId]
+  );
+  if (!doc) {
+    return res.status(404).json({ error: 'Selected active OPD doctor not found.' });
+  }
+
+  const patient = await queryOne<{ mrn: string; first_name: string; last_name: string }>(
+    'SELECT mrn, first_name, last_name FROM patients WHERE id = ?',
+    [visit.patient_id]
+  );
+  const resolvedSpecialty = (specialty ? String(specialty).trim() : '') || doc.specialty || visit.specialty || 'General Medicine';
+
+  await execute('UPDATE visits SET doctor_id = ?, specialty = ? WHERE id = ?', [doc.id, resolvedSpecialty, visitId]);
+  await execute("UPDATE doctor_assignments SET status = 'reassigned' WHERE visit_id = ? AND status = 'active'", [visitId]);
+  await execute(
+    'INSERT INTO doctor_assignments (visit_id, patient_id, doctor_id, assigned_by, specialty, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [visitId, visit.patient_id, doc.id, req.user!.id, resolvedSpecialty, 'active', notes ? String(notes).trim() : 'OPD doctor assignment']
+  );
+
+  const activeTicket = await queryOne<{ id: number; department: string }>(
+    "SELECT id, department FROM queue_tickets WHERE visit_id = ? AND status IN ('waiting','called','in_service') ORDER BY id DESC LIMIT 1",
+    [visitId]
+  );
+  if (activeTicket) {
+    const noteText = notes ? `${notes} — Assigned to ${doc.full_name}` : `Assigned to ${doc.full_name}`;
+    await execute('UPDATE queue_tickets SET notes = ? WHERE id = ?', [noteText, activeTicket.id]);
+  }
+
+  await createNotification({
+    targetRole: 'DOC',
+    targetUserId: doc.id,
+    title: 'OPD Patient Assigned',
+    message: `${patient ? `${patient.first_name} ${patient.last_name} (${patient.mrn})` : `Visit ${visit.visit_number}`} assigned to ${doc.full_name} (${visit.visit_number}).`,
+    severity: 'info',
+    entityType: 'visit',
+    entityId: visitId,
+  });
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'visit.assign_doctor',
+    entityType: 'visit',
+    entityId: visitId,
+    patientId: visit.patient_id,
+    before: { doctor_id: visit.doctor_id, specialty: visit.specialty },
+    after: { doctor_id: doc.id, doctor_name: doc.full_name, specialty: resolvedSpecialty },
+    req,
+  });
+
+  broadcastClinicEvent('visit:updated', { visitId });
+  broadcastClinicEvent('queue:updated', { visitId });
+  res.json({ ok: true, doctor_id: doc.id, doctor_name: doc.full_name, specialty: resolvedSpecialty });
 });
 
 router.post('/visits', requireAuth, requirePermission('visit.create'), async (req: AuthRequest, res: Response) => {
@@ -2499,6 +3920,12 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
     if (consultInvId) {
       await execute('UPDATE invoices SET visit_id = ? WHERE id = ?', [inserted.insertId, consultInvId]);
     }
+    if (doctor_id) {
+      await execute(
+        'INSERT INTO doctor_assignments (visit_id, patient_id, doctor_id, assigned_by, specialty, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [inserted.insertId, patient.id, Number(doctor_id), req.user!.id, resolvedSpecialty, 'active', 'Assigned during visit registration']
+      );
+    }
 
     if (triage_priority === 'emergency' && isSelfPay && consultInvId && !paidAtCheckIn) {
       await recordPaymentGateBypass({
@@ -2535,9 +3962,12 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
 
     if (triage_priority === 'emergency') {
       await createNotification({
-        targetRole: 'DOC',
+        targetRole: doctor_id ? 'DOC' : 'MGR',
+        targetUserId: doctor_id ? Number(doctor_id) : null,
         title: 'Emergency Visit Started',
-        message: `Emergency visit ${visitNum} requires immediate assessment.`,
+        message: doctor_id
+          ? `Emergency visit ${visitNum} assigned to ${doctorName || 'doctor'} requires immediate assessment.`
+          : `Emergency visit ${visitNum} requires immediate OPD doctor assignment.`,
         severity: 'critical',
         entityType: 'visit',
         entityId: inserted.insertId,
@@ -2551,6 +3981,17 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
         entityType: 'visit',
         entityId: inserted.insertId,
       });
+      if (doctor_id) {
+        await createNotification({
+          targetRole: 'DOC',
+          targetUserId: Number(doctor_id),
+          title: 'OPD Visit Assigned',
+          message: `Walk-in visit ${visitNum} assigned to ${doctorName || 'you'} (awaiting triage vitals).`,
+          severity: 'info',
+          entityType: 'visit',
+          entityId: inserted.insertId,
+        });
+      }
     } else {
       await createNotification({
         targetRole: 'CSH',
@@ -2560,6 +4001,17 @@ router.post('/visits', requireAuth, requirePermission('visit.create'), async (re
         entityType: 'visit',
         entityId: inserted.insertId,
       });
+      if (doctor_id) {
+        await createNotification({
+          targetRole: 'DOC',
+          targetUserId: Number(doctor_id),
+          title: 'OPD Visit Assigned (Payment Pending)',
+          message: `Walk-in visit ${visitNum} assigned to ${doctorName || 'you'} (awaiting consultation payment).`,
+          severity: 'info',
+          entityType: 'visit',
+          entityId: inserted.insertId,
+        });
+      }
     }
 
     await writeAuditLog({
@@ -2635,6 +4087,9 @@ router.post('/visits/:id/vitals', requireAuth, requirePermission('vitals.create'
     [visitId]
   );
   if (!visit) return res.status(404).json({ error: 'Visit not found' });
+  if (visit.status === 'closed') {
+    return res.status(409).json({ error: 'Cannot record vitals on a closed visit.' });
+  }
 
   const {
     bp_systolic,
@@ -2780,18 +4235,29 @@ router.post('/visits/:id/vitals', requireAuth, requirePermission('vitals.create'
 
   if (earlyWarning || triage_priority === 'emergency') {
     await createNotification({
-      targetRole: 'DOC',
+      targetRole: assignedDoctorId ? 'DOC' : 'MGR',
+      targetUserId: assignedDoctorId ? Number(assignedDoctorId) : null,
       title: 'Early-Warning Vitals Alert',
       message: `Visit ${visit.visit_number} flagged abnormal vitals (SpO2 ${spo2}%, Temp ${temperature}°C) — routed to ${doctorLabel}.`,
       severity: 'critical',
       entityType: 'visit',
       entityId: visitId,
     });
-  } else {
+  } else if (assignedDoctorId) {
     await createNotification({
       targetRole: 'DOC',
+      targetUserId: Number(assignedDoctorId),
       title: 'Ready for Doctor',
       message: `Vitals recorded for ${visit.visit_number}. Patient routed to ${doctorLabel}.`,
+      severity: 'info',
+      entityType: 'visit',
+      entityId: visitId,
+    });
+  } else {
+    await createNotification({
+      targetRole: 'REC',
+      title: 'Vitals Recorded — Assign OPD Doctor',
+      message: `Vitals recorded for ${visit.visit_number}. Ready for OPD doctor assignment.`,
       severity: 'info',
       entityType: 'visit',
       entityId: visitId,
@@ -2833,6 +4299,25 @@ router.post('/vitals/:id/correct', requireAuth, requirePermission('vitals.create
     recorded_at: string;
   }>('SELECT * FROM vitals WHERE id = ?', [vitalId]);
   if (!existing) return res.status(404).json({ error: 'Vitals entry not found' });
+
+  if (existing.visit_id) {
+    const parentVisit = await queryOne<{ status: string }>('SELECT status FROM visits WHERE id = ?', [existing.visit_id]);
+    if (parentVisit?.status === 'closed') {
+      return res.status(409).json({ error: 'Cannot amend vitals on a closed visit.' });
+    }
+  }
+  if (existing.admission_id) {
+    const parentAdm = await queryOne<{ status: string }>('SELECT status FROM admissions WHERE id = ?', [existing.admission_id]);
+    if (parentAdm?.status === 'discharged') {
+      return res.status(409).json({ error: 'Cannot amend vitals on a discharged admission.' });
+    }
+  }
+  if (isDoctorOnly(req.user!)) {
+    const access = await assertPatientAccess(req.user!, existing.patient_id);
+    if (!access.allowed) {
+      return res.status(403).json({ error: access.reason || 'Access denied: patient vitals are not assigned to you.' });
+    }
+  }
 
   const recordedMs = new Date(`${String(existing.recorded_at).replace(' ', 'T')}Z`).getTime();
   if (Number.isFinite(recordedMs) && Date.now() - recordedMs > 24 * 3600 * 1000) {
@@ -2921,7 +4406,15 @@ router.post('/vitals/:id/correct', requireAuth, requirePermission('vitals.create
   res.status(201).json({ id: inserted.insertId, correctedOfId: vitalId, bmi, earlyWarningFlag: Boolean(earlyWarning) });
 });
 
-router.patch('/visits/:id/consultation', requireAuth, requirePermission('visit.update'), async (req: AuthRequest, res: Response) => {
+router.patch(
+  '/visits/:id/consultation',
+  requireAuth,
+  authorize('visit.update', {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'visit.update', entityType: 'visit', entityIdParam: 'id', captureBody: true, dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const licenceCheck = await checkActiveClinicianLicence(req.user!.id);
   if (!licenceCheck.valid) {
@@ -2945,6 +4438,14 @@ router.patch('/visits/:id/consultation', requireAuth, requirePermission('visit.u
     return res.status(403).json({
       error: 'This visit is assigned to another clinician. Reassignment or Manager override is required.',
     });
+  }
+  if (isDoctorOnly(req.user!) && visit.doctor_id == null) {
+    const access = await assertPatientAccess(req.user!, Number(visit.patient_id));
+    if (!access.allowed && !access.breakGlassActive) {
+      return res.status(403).json({
+        error: 'This visit has not been assigned to you yet. OPD Doctor Assignment or Break-Glass is required.',
+      });
+    }
   }
 
   const { chief_complaint, history_notes, exam_notes, diagnosis_code, diagnosis_text, treatment_plan, follow_up_date } = req.body || {};
@@ -3012,7 +4513,15 @@ router.patch('/visits/:id/consultation', requireAuth, requirePermission('visit.u
   res.json({ ok: true, followUpAppointmentId });
 });
 
-router.post('/visits/:id/close', requireAuth, requirePermission('visit.close'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/close',
+  requireAuth,
+  authorize('visit.close', {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'visit.close', entityType: 'visit', entityIdParam: 'id', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const { force_partial_close, reason } = req.body || {};
   const result = await closeVisit({
@@ -3028,7 +4537,13 @@ router.post('/visits/:id/close', requireAuth, requirePermission('visit.close'), 
   res.json({ ok: true });
 });
 
-router.post('/visits/:id/reopen', requireAuth, requirePermission('visit.reopen'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/reopen',
+  requireAuth,
+  authorize('visit.reopen', {
+    audit: { action: 'visit.reopen', entityType: 'visit', entityIdParam: 'id', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const { reason } = req.body || {};
   if (!reason?.trim()) return res.status(400).json({ error: 'A formal reason is required to reopen a closed visit.' });
@@ -3050,14 +4565,31 @@ router.post('/visits/:id/reopen', requireAuth, requirePermission('visit.reopen')
   res.json({ ok: true });
 });
 
-router.post('/visits/:id/orders/lab', requireAuth, requirePermission('order.lab.create'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/orders/lab',
+  requireAuth,
+  authorize('order.lab.create', {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'lab.order.create', entityType: 'lab_order', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const { test_id } = req.body || {};
   if (!test_id) return res.status(400).json({ error: 'test_id is required' });
 
   const result = await withTransaction(async () => {
-    const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
+    const visit = await queryOne<{ id: number; patient_id: number; doctor_id: number | null; status: string }>(
+      'SELECT id, patient_id, doctor_id, status FROM visits WHERE id = ?',
+      [visitId]
+    );
     if (!visit) return { ok: false as const, error: 'Visit not found', httpStatus: 404 };
+    if (isDoctorOnly(req.user!) && Number(visit.doctor_id) !== req.user!.id) {
+      const access = await assertPatientAccess(req.user!, visit.patient_id);
+      if (!access.breakGlassActive) {
+        return { ok: false as const, error: 'You may only order lab tests for your own assigned patients.', httpStatus: 403 };
+      }
+    }
     if (visit.status === 'closed') return { ok: false as const, error: 'Cannot order tests on a closed visit.', httpStatus: 409 };
 
     const test = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM lab_tests WHERE id = ?', [test_id]);
@@ -3139,14 +4671,31 @@ router.post('/visits/:id/orders/lab', requireAuth, requirePermission('order.lab.
   res.status(201).json(result);
 });
 
-router.post('/visits/:id/orders/imaging', requireAuth, requirePermission('order.imaging.create'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/orders/imaging',
+  requireAuth,
+  authorize('order.imaging.create', {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'imaging.order.create', entityType: 'imaging_order', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const { catalog_id, clinical_question } = req.body || {};
   if (!catalog_id) return res.status(400).json({ error: 'catalog_id is required' });
 
   const result = await withTransaction(async () => {
-    const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
+    const visit = await queryOne<{ id: number; patient_id: number; doctor_id: number | null; status: string }>(
+      'SELECT id, patient_id, doctor_id, status FROM visits WHERE id = ?',
+      [visitId]
+    );
     if (!visit) return { ok: false as const, error: 'Visit not found', httpStatus: 404 };
+    if (isDoctorOnly(req.user!) && Number(visit.doctor_id) !== req.user!.id) {
+      const access = await assertPatientAccess(req.user!, visit.patient_id);
+      if (!access.breakGlassActive) {
+        return { ok: false as const, error: 'You may only order imaging for your own assigned patients.', httpStatus: 403 };
+      }
+    }
     if (visit.status === 'closed') return { ok: false as const, error: 'Cannot order imaging on a closed visit.', httpStatus: 409 };
 
     const exam = await queryOne<{ id: number; code: string; name: string; price: number }>('SELECT * FROM imaging_catalog WHERE id = ?', [catalog_id]);
@@ -3217,7 +4766,15 @@ router.post('/visits/:id/orders/imaging', requireAuth, requirePermission('order.
   res.status(201).json(result);
 });
 
-router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('prescription.create'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/orders/prescription',
+  requireAuth,
+  authorize('prescription.create', {
+    checkDoctorAssignment: true,
+    visitIdParam: 'id',
+    audit: { action: 'prescription.create', entityType: 'prescription', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const licenceCheck = await checkActiveClinicianLicence(req.user!.id);
   if (!licenceCheck.valid) {
@@ -3242,8 +4799,17 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
     }
   }
 
-  const visit = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM visits WHERE id = ?', [visitId]);
+  const visit = await queryOne<{ id: number; patient_id: number; doctor_id: number | null; status: string }>(
+    'SELECT id, patient_id, doctor_id, status FROM visits WHERE id = ?',
+    [visitId]
+  );
   if (!visit) return res.status(404).json({ error: 'Visit not found' });
+  if (isDoctorOnly(req.user!) && Number(visit.doctor_id) !== req.user!.id) {
+    const access = await assertPatientAccess(req.user!, visit.patient_id);
+    if (!access.breakGlassActive) {
+      return res.status(403).json({ error: 'You may only prescribe for your own assigned patients.' });
+    }
+  }
   if (visit.status === 'closed') return res.status(409).json({ error: 'Cannot prescribe on a closed visit.' });
 
   const medIds = [...new Set(normalizedItems.map((it) => Number(it.medicine_id)))];
@@ -3326,7 +4892,11 @@ router.post('/visits/:id/orders/prescription', requireAuth, requirePermission('p
   res.status(201).json({ id: rxRes.insertId, status: 'awaiting_stock_check', patientAllergies: patient?.allergies });
 });
 
-router.post('/visits/:id/nursing-procedures', requireAuth, requirePermission('nursing.procedure.perform', 'order.lab.create'), async (req: AuthRequest, res: Response) => {
+router.post(
+  '/visits/:id/nursing-procedures',
+  requireAuth,
+  authorize(['nursing.procedure.perform', 'order.lab.create'], { checkDoctorAssignment: true, visitIdParam: 'id' }),
+  async (req: AuthRequest, res: Response) => {
   const visitId = Number(req.params.id);
   const { service_code, quantity = 1, notes, clinical_notes, perform_now = true } = req.body || {};
   if (!service_code) return res.status(400).json({ error: 'service_code (e.g. NUR-INJ or NUR-NEB) is required.' });
@@ -3415,8 +4985,49 @@ router.post('/visits/:id/nursing-procedures', requireAuth, requirePermission('nu
 
 router.patch('/nursing-procedures/:id/complete', requireAuth, requirePermission('nursing.procedure.perform'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const existing = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM nursing_procedures WHERE id = ?', [id]);
+  const existing = await queryOne<{ id: number; visit_id: number; patient_id: number; invoice_id: number | null; status: string }>(
+    'SELECT id, visit_id, patient_id, invoice_id, status FROM nursing_procedures WHERE id = ?',
+    [id]
+  );
   if (!existing) return res.status(404).json({ error: 'Nursing procedure not found' });
+  if (existing.status === 'completed' || existing.status === 'cancelled') {
+    return res.status(409).json({ error: `Nursing procedure is already ${existing.status}.` });
+  }
+  const visit = await queryOne<{ status: string; triage_priority: string }>(
+    'SELECT status, triage_priority FROM visits WHERE id = ?',
+    [existing.visit_id]
+  );
+  if (visit?.status === 'closed') {
+    return res.status(409).json({ error: 'Cannot complete nursing procedures on a closed visit.' });
+  }
+  if (existing.invoice_id) {
+    const inv = await queryOne<{ status: string; payer_type: string }>('SELECT status, payer_type FROM invoices WHERE id = ?', [
+      existing.invoice_id,
+    ]);
+    if (inv && inv.payer_type === 'self-pay' && inv.status !== 'paid') {
+      const bypassCheck = canBypassPaymentGate(
+        req.user!,
+        visit?.triage_priority === 'emergency',
+        req.body?.bypass_payment_gate,
+        req.body?.bypass_reason
+      );
+      if (bypassCheck.allowed) {
+        await recordPaymentGateBypass({
+          visitId: existing.visit_id,
+          patientId: existing.patient_id,
+          entityType: 'nursing_procedure',
+          entityId: id,
+          user: req.user!,
+          reason: bypassCheck.reasonText,
+          req,
+        });
+      } else {
+        return res.status(402).json({
+          error: 'Payment Gate: Self-pay nursing procedure invoice must be paid at Cashier before completion.',
+        });
+      }
+    }
+  }
   const { notes, clinical_notes } = req.body || {};
   const finalNote = (notes || clinical_notes || '').trim() || null;
   await execute(
@@ -3456,6 +5067,25 @@ router.post('/orders/:type/:id/cancel', requireAuth, requirePermission('order.la
       [id]
     );
     if (!row) return { ok: false as const, error: 'Order not found', httpStatus: 404 };
+    const visit = await queryOne<{ status: string; doctor_id: number | null }>(
+      'SELECT status, doctor_id FROM visits WHERE id = ?',
+      [row.visit_id]
+    );
+    if (visit?.status === 'closed') {
+      return { ok: false as const, error: 'Cannot cancel orders on a closed visit.', httpStatus: 409 };
+    }
+    if (isDoctorOnly(req.user!)) {
+      const activeAssign = await queryOne<{ id: number }>(
+        "SELECT id FROM doctor_assignments WHERE visit_id = ? AND doctor_id = ? AND status = 'active' LIMIT 1",
+        [row.visit_id, req.user!.id]
+      ).catch(() => null);
+      if (Number(visit?.doctor_id) !== req.user!.id && !activeAssign) {
+        const access = await assertPatientAccess(req.user!, row.patient_id);
+        if (!access.allowed) {
+          return { ok: false as const, error: 'Access denied: order belongs to another clinician.', httpStatus: 403 };
+        }
+      }
+    }
     if (!cfg.allowedStatuses.includes(row.status)) {
       return { ok: false as const, error: `Order cannot be cancelled once in '${row.status}' state.`, httpStatus: 409 };
     }
@@ -3505,10 +5135,11 @@ router.post('/orders/:type/:id/cancel', requireAuth, requirePermission('order.la
 // ---------------------------------------------------------------------------
 // LABORATORY WORKLIST (Two-Step Verify, Multi-Analyte Panels, Reject, Amend)
 // ---------------------------------------------------------------------------
-router.get('/lab/orders', requireAuth, requirePermission('lab.order.read'), async (_req, res) => {
+router.get('/lab/orders', requireAuth, requirePermission('lab.order.read'), async (req: AuthRequest, res: Response) => {
+  const doctorScoped = isDoctorOnly(req.user!);
   const orders = await query(
     `SELECT lo.*, lt.code AS test_code, lt.name AS test_name, lt.sample_type, lt.unit, lt.reference_range, lt.analyte_template_json,
-            p.mrn, p.first_name, p.last_name, p.patient_type, v.triage_priority,
+            p.mrn, p.first_name, p.last_name, p.patient_type, v.triage_priority, v.visit_number, v.doctor_id,
             i.invoice_number, i.status AS invoice_status,
             u_ent.full_name AS entered_by_name, u_ver.full_name AS verified_by_name
      FROM lab_orders lo
@@ -3518,9 +5149,11 @@ router.get('/lab/orders', requireAuth, requirePermission('lab.order.read'), asyn
      LEFT JOIN invoices i ON i.id = lo.invoice_id
      LEFT JOIN users u_ent ON u_ent.id = lo.entered_by
      LEFT JOIN users u_ver ON u_ver.id = lo.verified_by
-     ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, lo.id DESC LIMIT 60`
+     ${doctorScoped ? "WHERE (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))" : ''}
+     ORDER BY CASE v.triage_priority WHEN 'emergency' THEN 1 WHEN 'urgent' THEN 2 ELSE 3 END, lo.id DESC LIMIT 60`,
+    doctorScoped ? [req.user!.id, req.user!.id] : []
   );
-  res.json({ orders });
+  res.json({ orders, isDoctorScoped: doctorScoped });
 });
 
 router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.collect', 'lab.result.enter', 'lab.result.verify', 'lab.sample.recollect', 'lab.critical.ack'), async (req: AuthRequest, res: Response) => {
@@ -3536,13 +5169,34 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
     abnormal_flag: string | null;
   }>('SELECT * FROM lab_orders WHERE id = ?', [id]);
   if (!order) return res.status(404).json({ error: 'Lab order not found' });
+  if (order.status === 'cancelled') {
+    return res.status(409).json({ error: 'Cancelled lab order cannot be modified.' });
+  }
 
-  const visit = await queryOne<{ triage_priority: string }>('SELECT triage_priority FROM visits WHERE id = ?', [order.visit_id]);
+  const visit = await queryOne<{ triage_priority: string; doctor_id: number | null }>(
+    'SELECT triage_priority, doctor_id FROM visits WHERE id = ?',
+    [order.visit_id]
+  );
   const { action, result_value, abnormal_flag, result_notes, rejection_reason, amend_reason, bypass_payment_gate, panel_results } = req.body || {};
 
   if (action === 'ack_critical') {
     if (!hasPermission(req.user!, 'lab.critical.ack')) {
       return res.status(403).json({ error: 'Missing lab.critical.ack permission' });
+    }
+    if (!['resulted', 'verified', 'amended'].includes(order.status)) {
+      return res.status(409).json({ error: `Cannot acknowledge critical result while lab order is '${order.status}'.` });
+    }
+    if (isDoctorOnly(req.user!)) {
+      const activeAssign = await queryOne<{ id: number }>(
+        "SELECT id FROM doctor_assignments WHERE visit_id = ? AND doctor_id = ? AND status = 'active' LIMIT 1",
+        [order.visit_id, req.user!.id]
+      ).catch(() => null);
+      if (Number(visit?.doctor_id) !== req.user!.id && !activeAssign) {
+        const access = await assertPatientAccess(req.user!, order.patient_id);
+        if (!access.allowed) {
+          return res.status(403).json({ error: 'Access denied: lab order belongs to another clinician.' });
+        }
+      }
     }
     await execute('UPDATE lab_orders SET critical_ack_by = ?, critical_ack_at = ? WHERE id = ?', [req.user!.id, nowSql(), id]);
     await writeAuditLog({
@@ -3621,6 +5275,7 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
     await execute("UPDATE lab_orders SET status = 'rejected', rejection_reason = ? WHERE id = ?", [rejection_reason.trim(), id]);
     await createNotification({
       targetRole: 'DOC',
+      targetUserId: visit?.doctor_id ?? null,
       title: 'Lab Sample Rejected',
       message: `Lab order #${id} rejected: ${rejection_reason.trim()}`,
       severity: 'warning',
@@ -3689,6 +5344,7 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
     if (derivedFlag === 'critical') {
       await createNotification({
         targetRole: 'DOC',
+        targetUserId: visit?.doctor_id ?? null,
         title: 'CRITICAL Lab Finding Entered',
         message: `Lab order #${id} flagged CRITICAL (${computedSummary}). Pending senior verification.`,
         severity: 'critical',
@@ -3744,6 +5400,7 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
 
     await createNotification({
       targetRole: 'DOC',
+      targetUserId: visit?.doctor_id ?? null,
       title: order.abnormal_flag === 'critical' ? 'CRITICAL Lab Result Released' : allDiagDone ? 'Results Ready — Lab Verified' : 'Lab Result Verified',
       message: `Lab order #${id} verified (${order.result_value}).${allDiagDone ? ' Patient ready for Doctor review.' : ''}`,
       severity: order.abnormal_flag === 'critical' ? 'critical' : 'info',
@@ -3804,23 +5461,47 @@ router.patch('/lab/orders/:id', requireAuth, requirePermission('lab.sample.colle
 // ---------------------------------------------------------------------------
 // IMAGING / RADIOLOGY WORKLIST & ATTACHMENTS
 // ---------------------------------------------------------------------------
-router.get('/imaging/orders', requireAuth, requirePermission('imaging.order.read'), async (_req, res) => {
+router.get('/imaging/orders', requireAuth, requirePermission('imaging.order.read'), async (req: AuthRequest, res: Response) => {
+  const doctorScoped = isDoctorOnly(req.user!);
   const orders = await query(
     `SELECT io.*, ic.code AS exam_code, ic.name AS exam_name, ic.modality, ic.body_region,
             p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.patient_type,
+            v.visit_number, v.doctor_id,
             i.invoice_number, i.status AS invoice_status,
             (SELECT COUNT(*) FROM imaging_attachments ia WHERE ia.imaging_order_id = io.id) AS attachment_count
      FROM imaging_orders io
      INNER JOIN imaging_catalog ic ON ic.id = io.catalog_id
      INNER JOIN patients p ON p.id = io.patient_id
+     LEFT JOIN visits v ON v.id = io.visit_id
      LEFT JOIN invoices i ON i.id = io.invoice_id
-     ORDER BY io.id DESC LIMIT 60`
+     ${doctorScoped ? "WHERE (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))" : ''}
+     ORDER BY io.id DESC LIMIT 60`,
+    doctorScoped ? [req.user!.id, req.user!.id] : []
   );
-  res.json({ orders });
+  res.json({ orders, isDoctorScoped: doctorScoped });
 });
 
-router.get('/imaging/orders/:id/attachments', requireAuth, requirePermission('imaging.order.read', 'visit.read'), async (req, res) => {
+router.get('/imaging/orders/:id/attachments', requireAuth, requirePermission('imaging.order.read', 'visit.read'), async (req: AuthRequest, res: Response) => {
   const orderId = Number(req.params.id);
+  if (isDoctorOnly(req.user!)) {
+    const ord = await queryOne<{ visit_id: number | null; patient_id: number; doctor_id: number | null }>(
+      `SELECT io.visit_id, io.patient_id, v.doctor_id FROM imaging_orders io LEFT JOIN visits v ON v.id = io.visit_id WHERE io.id = ?`,
+      [orderId]
+    );
+    if (!ord) return res.status(404).json({ error: 'Imaging order not found' });
+    const activeAssign = ord.visit_id
+      ? await queryOne<{ id: number }>(
+          "SELECT id FROM doctor_assignments WHERE visit_id = ? AND doctor_id = ? AND status = 'active' LIMIT 1",
+          [ord.visit_id, req.user!.id]
+        ).catch(() => null)
+      : null;
+    if (Number(ord.doctor_id) !== req.user!.id && !activeAssign) {
+      const access = await assertPatientAccess(req.user!, ord.patient_id);
+      if (!access.allowed) {
+        return res.status(403).json({ error: 'Access denied: imaging order belongs to another clinician.' });
+      }
+    }
+  }
   const attachments = await query(
     `SELECT ia.*, u.full_name AS uploaded_by_name
      FROM imaging_attachments ia
@@ -3849,10 +5530,6 @@ function validateDataUrlSignature(mimeType: string, dataUrl: string): boolean {
   if (mimeType === 'image/gif') return buf.slice(0, 3).toString('ascii') === 'GIF';
   if (mimeType === 'image/webp') return buf.slice(0, 4).toString('ascii') === 'RIFF';
   if (mimeType === 'application/pdf') return buf.slice(0, 4).toString('ascii') === '%PDF';
-  if (mimeType === 'image/svg+xml') {
-    const txt = buf.toString('utf8').toLowerCase();
-    return txt.includes('<svg') || txt.includes('<?xml');
-  }
   return false;
 }
 
@@ -3863,15 +5540,21 @@ router.post('/imaging/orders/:id/attachments', requireAuth, requirePermission('i
     return res.status(400).json({ error: 'file_name, mime_type, and data_url are required.' });
   }
   const normMime = String(mime_type).trim().toLowerCase();
-  const allowedMimes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'application/pdf']);
+  const allowedMimes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf']);
   if (!allowedMimes.has(normMime) || !validateDataUrlSignature(normMime, String(data_url))) {
-    return res.status(400).json({ error: 'Unsupported or corrupted file payload. Valid PNG, JPEG, WEBP, GIF, SVG, or PDF base64 required.' });
+    return res.status(400).json({ error: 'Unsupported or corrupted file payload. Valid PNG, JPEG, WEBP, GIF, or PDF base64 required.' });
   }
   if (String(data_url).length > 4_200_000) {
     return res.status(400).json({ error: 'File exceeds maximum allowed 3 MB attachment limit.' });
   }
-  const order = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM imaging_orders WHERE id = ?', [orderId]);
+  const order = await queryOne<{ id: number; patient_id: number; status: string }>(
+    'SELECT id, patient_id, status FROM imaging_orders WHERE id = ?',
+    [orderId]
+  );
   if (!order) return res.status(404).json({ error: 'Imaging order not found' });
+  if (order.status === 'cancelled' || order.status === 'reported_final') {
+    return res.status(409).json({ error: `Cannot attach files to an imaging order in '${order.status}' state.` });
+  }
 
   const inserted = await execute(
     'INSERT INTO imaging_attachments (imaging_order_id, file_name, mime_type, data_url, caption, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)',
@@ -4024,8 +5707,10 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
       );
     }
 
+    const imgVisit = await queryOne<{ doctor_id: number | null }>('SELECT doctor_id FROM visits WHERE id = ?', [order.visit_id]);
     await createNotification({
       targetRole: 'DOC',
+      targetUserId: imgVisit?.doctor_id ?? null,
       title: allDiagDone ? 'Results Ready — Imaging Finalised' : 'Imaging Report Finalised',
       message: `Imaging order #${id} report is finalised and ready for review.`,
       severity: 'info',
@@ -4068,12 +5753,12 @@ router.patch('/imaging/orders/:id', requireAuth, requirePermission('imaging.exam
   res.status(400).json({ error: 'Unsupported imaging action' });
 });
 
-router.get('/lab/orders/:id/report', requireAuth, requirePermission('lab.order.read', 'visit.read'), async (req, res) => {
+router.get('/lab/orders/:id/report', requireAuth, requirePermission('lab.order.read', 'visit.read'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const report = await queryOne(
+  const report = await queryOne<Record<string, unknown>>(
     `SELECT lo.*, lt.code AS test_code, lt.name AS test_name, lt.sample_type, lt.unit, lt.reference_range,
             p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.phone,
-            v.visit_number, u_ord.full_name AS ordered_by_name,
+            v.visit_number, v.doctor_id, u_ord.full_name AS ordered_by_name,
             u_ent.full_name AS entered_by_name, u_ver.full_name AS verified_by_name
      FROM lab_orders lo
      INNER JOIN lab_tests lt ON lt.id = lo.test_id
@@ -4086,15 +5771,29 @@ router.get('/lab/orders/:id/report', requireAuth, requirePermission('lab.order.r
     [id]
   );
   if (!report) return res.status(404).json({ error: 'Lab order not found' });
+  if (isDoctorOnly(req.user!) && Number(report.doctor_id) !== req.user!.id) {
+    const activeAssign = report.visit_id
+      ? await queryOne<{ id: number }>(
+          "SELECT id FROM doctor_assignments WHERE visit_id = ? AND doctor_id = ? AND status = 'active' LIMIT 1",
+          [report.visit_id, req.user!.id]
+        ).catch(() => null)
+      : null;
+    if (!activeAssign) {
+      const access = await assertPatientAccess(req.user!, Number(report.patient_id));
+      if (!access.allowed) {
+        return res.status(403).json({ error: 'Access denied: lab report belongs to another clinician.' });
+      }
+    }
+  }
   res.json({ report });
 });
 
-router.get('/imaging/orders/:id/report', requireAuth, requirePermission('imaging.order.read', 'visit.read'), async (req, res) => {
+router.get('/imaging/orders/:id/report', requireAuth, requirePermission('imaging.order.read', 'visit.read'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const report = await queryOne(
+  const report = await queryOne<Record<string, unknown>>(
     `SELECT io.*, ic.code AS exam_code, ic.name AS exam_name, ic.modality, ic.body_region,
             p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth,
-            v.visit_number, u_ord.full_name AS ordered_by_name,
+            v.visit_number, v.doctor_id, u_ord.full_name AS ordered_by_name,
             u_perf.full_name AS performed_by_name, u_rep.full_name AS reported_by_name
      FROM imaging_orders io
      INNER JOIN imaging_catalog ic ON ic.id = io.catalog_id
@@ -4107,23 +5806,40 @@ router.get('/imaging/orders/:id/report', requireAuth, requirePermission('imaging
     [id]
   );
   if (!report) return res.status(404).json({ error: 'Imaging order not found' });
+  if (isDoctorOnly(req.user!) && Number(report.doctor_id) !== req.user!.id) {
+    const activeAssign = report.visit_id
+      ? await queryOne<{ id: number }>(
+          "SELECT id FROM doctor_assignments WHERE visit_id = ? AND doctor_id = ? AND status = 'active' LIMIT 1",
+          [report.visit_id, req.user!.id]
+        ).catch(() => null)
+      : null;
+    if (!activeAssign) {
+      const access = await assertPatientAccess(req.user!, Number(report.patient_id));
+      if (!access.allowed) {
+        return res.status(403).json({ error: 'Access denied: imaging report belongs to another clinician.' });
+      }
+    }
+  }
   res.json({ report });
 });
 
 // ---------------------------------------------------------------------------
 // PHARMACY DISPENSING (Batched Query + Multi-Batch FEFO + COGS + Partial)
 // ---------------------------------------------------------------------------
-router.get('/pharmacy/prescriptions', requireAuth, requirePermission('pharmacy.prescription.read'), async (_req, res) => {
+router.get('/pharmacy/prescriptions', requireAuth, requirePermission('pharmacy.prescription.read'), async (req: AuthRequest, res: Response) => {
+  const doctorScoped = isDoctorOnly(req.user!);
   const prescriptions = await query<Record<string, unknown>>(
     `SELECT pr.*, p.mrn, p.first_name, p.last_name, p.allergies, p.patient_type,
             u.full_name AS doctor_name, i.invoice_number, i.status AS invoice_status,
-            v.visit_number, v.workflow_stage, v.status AS visit_status
+            v.visit_number, v.workflow_stage, v.status AS visit_status, v.doctor_id AS visit_doctor_id
      FROM prescriptions pr
      INNER JOIN patients p ON p.id = pr.patient_id
      INNER JOIN users u ON u.id = pr.doctor_id
      LEFT JOIN visits v ON v.id = pr.visit_id
      LEFT JOIN invoices i ON i.id = pr.invoice_id
-     ORDER BY pr.id DESC LIMIT 60`
+     ${doctorScoped ? 'WHERE (v.doctor_id = ? OR pr.doctor_id = ?)' : ''}
+     ORDER BY pr.id DESC LIMIT 60`,
+    doctorScoped ? [req.user!.id, req.user!.id] : []
   );
 
   if (prescriptions.length > 0) {
@@ -4197,8 +5913,14 @@ router.post('/pharmacy/prescriptions/:id/bill', requireAuth, requirePermission('
       [id]
     );
     if (!rx) return { ok: false as const, error: 'Prescription not found', httpStatus: 404 };
-    if (rx.status !== 'awaiting_stock_check' && rx.invoice_id) {
-      return { ok: false as const, error: 'Pharmacy invoice has already been generated for this prescription.', httpStatus: 409 };
+    if (rx.status !== 'awaiting_stock_check') {
+      return { ok: false as const, error: `Prescription cannot be billed in '${rx.status}' status.`, httpStatus: 409 };
+    }
+    const visit = rx.visit_id
+      ? await queryOne<{ status: string }>('SELECT status FROM visits WHERE id = ?', [rx.visit_id])
+      : null;
+    if (visit?.status === 'closed') {
+      return { ok: false as const, error: 'Cannot generate pharmacy bill for a closed visit.', httpStatus: 409 };
     }
 
     const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
@@ -4390,6 +6112,9 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
       [id]
     );
     if (!rx) return { ok: false as const, error: 'Prescription not found', httpStatus: 404 };
+    if (rx.status === 'cancelled') {
+      return { ok: false as const, error: 'Cancelled prescription cannot be dispensed.', httpStatus: 409 };
+    }
     if (rx.status === 'dispensed') return { ok: false as const, error: 'Prescription already fully dispensed.', httpStatus: 409 };
     if (rx.status === 'awaiting_stock_check') {
       return {
@@ -4397,6 +6122,9 @@ router.post('/pharmacy/dispense/:id', requireAuth, requirePermission('pharmacy.d
         error: 'Stock Check Required: Confirm available quantities and generate the Pharmacy Bill before dispensing.',
         httpStatus: 409,
       };
+    }
+    if (!['pending_payment', 'paid_ready_to_dispense', 'partially_dispensed', 'pending'].includes(rx.status)) {
+      return { ok: false as const, error: `Prescription cannot be dispensed in '${rx.status}' status.`, httpStatus: 409 };
     }
 
     const visit = await queryOne<{ triage_priority: string; status: string }>('SELECT triage_priority, status FROM visits WHERE id = ?', [
@@ -4990,7 +6718,8 @@ router.post('/store/batches/:id/block', requireAuth, requirePermission('store.ex
 // ---------------------------------------------------------------------------
 // INPATIENT (IPD) WARDS, BED BOARD, ADMISSIONS, MAR, BED BILLING & DEPOSITS
 // ---------------------------------------------------------------------------
-router.get('/ipd/overview', requireAuth, requirePermission('ipd.admission.read'), async (_req, res) => {
+router.get('/ipd/overview', requireAuth, requirePermission('ipd.admission.read'), async (req: AuthRequest, res: Response) => {
+  const doctorScoped = isDoctorOnly(req.user!);
   const [wards, beds, admissions, mar, deposits, admInvoices] = await Promise.all([
     query('SELECT * FROM wards ORDER BY id ASC'),
     query(
@@ -5010,7 +6739,9 @@ router.get('/ipd/overview', requireAuth, requirePermission('ipd.admission.read')
        INNER JOIN wards w ON w.id = a.ward_id
        LEFT JOIN beds b ON b.id = a.bed_id
        INNER JOIN users u ON u.id = a.admitting_doctor_id
-       ORDER BY a.id DESC LIMIT 30`
+       ${doctorScoped ? 'WHERE a.admitting_doctor_id = ?' : ''}
+       ORDER BY a.id DESC LIMIT 30`,
+      doctorScoped ? [req.user!.id] : []
     ),
     query(
       `SELECT ma.*, p.mrn, p.first_name, p.last_name, a.admission_number, b.bed_number
@@ -5018,8 +6749,9 @@ router.get('/ipd/overview', requireAuth, requirePermission('ipd.admission.read')
        INNER JOIN admissions a ON a.id = ma.admission_id
        INNER JOIN patients p ON p.id = ma.patient_id
        LEFT JOIN beds b ON b.id = a.bed_id
-       WHERE a.status IN ('admitted','discharge_ordered')
-       ORDER BY ma.id DESC LIMIT 40`
+       WHERE a.status IN ('admitted','discharge_ordered')${doctorScoped ? ' AND a.admitting_doctor_id = ?' : ''}
+       ORDER BY ma.id DESC LIMIT 40`,
+      doctorScoped ? [req.user!.id] : []
     ),
     query<{ patient_id: number; remaining_amount: number }>(
       "SELECT patient_id, remaining_amount FROM patient_deposits WHERE status = 'active' AND remaining_amount > 0"
@@ -5053,10 +6785,10 @@ router.get('/ipd/overview', requireAuth, requirePermission('ipd.admission.read')
     adm.outstanding_invoices = Number((unpaidByPatient.get(Number(adm.patient_id)) || 0).toFixed(2));
   }
 
-  res.json({ wards, beds, admissions, mar });
+  res.json({ wards, beds, admissions, mar, isDoctorScoped: doctorScoped });
 });
 
-router.get('/ipd/admissions/:id/statement', requireAuth, requirePermission('ipd.admission.read'), async (req, res) => {
+router.get('/ipd/admissions/:id/statement', requireAuth, requirePermission('ipd.admission.read'), async (req: AuthRequest, res: Response) => {
   const admId = Number(req.params.id);
   const admission = await queryOne<Record<string, unknown>>(
     `SELECT a.*, p.mrn, p.first_name, p.last_name, p.sex, p.date_of_birth, p.phone, p.patient_type, p.payer_name,
@@ -5070,6 +6802,16 @@ router.get('/ipd/admissions/:id/statement', requireAuth, requirePermission('ipd.
     [admId]
   );
   if (!admission) return res.status(404).json({ error: 'Admission not found' });
+  if (isDoctorOnly(req.user!) && Number(admission.admitting_doctor_id) !== req.user!.id) {
+    const access = await assertPatientAccess(req.user!, Number(admission.patient_id));
+    if (!access.allowed) {
+      return res.status(403).json({
+        error: access.reason || 'Access denied: inpatient admission is assigned to another clinician.',
+        breakGlassRequired: true,
+        patientId: Number(admission.patient_id),
+      });
+    }
+  }
 
   // Auto-flag overdue scheduled MAR doses created on an earlier date as missed
   const today = await getClinicToday();
@@ -5142,6 +6884,7 @@ router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ip
       admission_number: string;
       patient_id: number;
       visit_id: number | null;
+      status: string;
       bed_days_billed: number;
       admitted_at: string;
       daily_tariff: number;
@@ -5157,6 +6900,9 @@ router.post('/ipd/admissions/:id/accrue-bed', requireAuth, requirePermission('ip
       [admId]
     );
     if (!adm) return { ok: false as const, error: 'Admission not found', httpStatus: 404 };
+    if (adm.status === 'discharged') {
+      return { ok: false as const, error: 'Cannot accrue bed charges on a discharged admission.', httpStatus: 409 };
+    }
 
     const daysStayed = Math.max(1, Math.ceil((Date.now() - new Date(adm.admitted_at).getTime()) / 86400000));
     const defaultUnbilled = Math.max(1, daysStayed - Number(adm.bed_days_billed || 0));
@@ -5321,8 +7067,17 @@ router.post('/ipd/admissions/:id/medication-orders', requireAuth, requirePermiss
   if (!medicine_name?.trim() || !dose?.trim()) {
     return res.status(400).json({ error: 'Medication name and dose are required.' });
   }
-  const adm = await queryOne<{ id: number; patient_id: number; status: string }>('SELECT id, patient_id, status FROM admissions WHERE id = ?', [admId]);
+  const adm = await queryOne<{ id: number; patient_id: number; admitting_doctor_id: number; status: string }>(
+    'SELECT id, patient_id, admitting_doctor_id, status FROM admissions WHERE id = ?',
+    [admId]
+  );
   if (!adm || adm.status === 'discharged') return res.status(404).json({ error: 'Active admission not found.' });
+  if (isDoctorOnly(req.user!) && Number(adm.admitting_doctor_id) !== req.user!.id) {
+    const access = await assertPatientAccess(req.user!, adm.patient_id);
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Access denied: inpatient admission belongs to another clinician.' });
+    }
+  }
 
   const scheduleByFreq: Record<string, string[]> = {
     OD: ['08:00'],
@@ -5367,8 +7122,18 @@ router.post('/ipd/admissions/:id/rounds', requireAuth, requirePermission('ipd.ad
   if (!assessment?.trim() || !plan?.trim()) {
     return res.status(400).json({ error: 'Ward round assessment and plan are required.' });
   }
-  const adm = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM admissions WHERE id = ?', [admId]);
+  const adm = await queryOne<{ id: number; patient_id: number; admitting_doctor_id: number; status: string }>(
+    'SELECT id, patient_id, admitting_doctor_id, status FROM admissions WHERE id = ?',
+    [admId]
+  );
   if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+  if (adm.status === 'discharged') return res.status(409).json({ error: 'Cannot record ward rounds on a discharged admission.' });
+  if (isDoctorOnly(req.user!) && Number(adm.admitting_doctor_id) !== req.user!.id) {
+    const access = await assertPatientAccess(req.user!, adm.patient_id);
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Access denied: inpatient admission belongs to another clinician.' });
+    }
+  }
 
   const inserted = await execute(
     `INSERT INTO ward_rounds (admission_id, patient_id, doctor_id, subjective, objective, assessment, plan)
@@ -5390,8 +7155,12 @@ router.post('/ipd/admissions/:id/nursing-notes', requireAuth, requirePermission(
   const admId = Number(req.params.id);
   const { note_type = 'Shift Note', note } = req.body || {};
   if (!note?.trim()) return res.status(400).json({ error: 'Nursing note content is required.' });
-  const adm = await queryOne<{ id: number; patient_id: number }>('SELECT id, patient_id FROM admissions WHERE id = ?', [admId]);
+  const adm = await queryOne<{ id: number; patient_id: number; status: string }>(
+    'SELECT id, patient_id, status FROM admissions WHERE id = ?',
+    [admId]
+  );
   if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+  if (adm.status === 'discharged') return res.status(409).json({ error: 'Cannot add nursing notes to a discharged admission.' });
 
   const inserted = await execute(
     'INSERT INTO nursing_notes (admission_id, patient_id, nurse_id, note_type, note) VALUES (?, ?, ?, ?, ?)',
@@ -5423,11 +7192,12 @@ router.post('/ipd/admissions/:id/vitals', requireAuth, requirePermission('vitals
     height_cm,
     notes,
   } = req.body || {};
-  const adm = await queryOne<{ id: number; patient_id: number; visit_id: number | null }>(
-    'SELECT id, patient_id, visit_id FROM admissions WHERE id = ?',
+  const adm = await queryOne<{ id: number; patient_id: number; visit_id: number | null; status: string }>(
+    'SELECT id, patient_id, visit_id, status FROM admissions WHERE id = ?',
     [admId]
   );
   if (!adm) return res.status(404).json({ error: 'Admission not found.' });
+  if (adm.status === 'discharged') return res.status(409).json({ error: 'Cannot record vitals on a discharged admission.' });
 
   const sys = bp_systolic !== undefined && bp_systolic !== '' ? Number(bp_systolic) : null;
   const dia = bp_diastolic !== undefined && bp_diastolic !== '' ? Number(bp_diastolic) : null;
@@ -5541,11 +7311,20 @@ router.post('/ipd/mar/:id/administer', requireAuth, requirePermission('ipd.mar.g
     return res.status(400).json({ error: 'A clinical reason is required when withholding medication.' });
   }
 
-  const row = await queryOne<{ id: number; patient_id: number; medicine_name: string }>(
-    'SELECT * FROM medication_administrations WHERE id = ?',
+  const row = await queryOne<{ id: number; patient_id: number; medicine_name: string; status: string; adm_status: string }>(
+    `SELECT ma.id, ma.patient_id, ma.medicine_name, ma.status, a.status AS adm_status
+     FROM medication_administrations ma
+     INNER JOIN admissions a ON a.id = ma.admission_id
+     WHERE ma.id = ?`,
     [marId]
   );
   if (!row) return res.status(404).json({ error: 'MAR entry not found' });
+  if (row.adm_status === 'discharged') {
+    return res.status(409).json({ error: 'Cannot administer MAR medications for a discharged admission.' });
+  }
+  if (row.status === 'given' || row.status === 'withheld') {
+    return res.status(409).json({ error: `MAR entry is already marked '${row.status}'.` });
+  }
 
   await execute(
     'UPDATE medication_administrations SET status = ?, reason_not_given = ?, administered_by_name = ?, administered_at = ? WHERE id = ?',
@@ -5568,11 +7347,17 @@ router.post('/ipd/admissions/:id/discharge-order', requireAuth, requirePermissio
   const admId = Number(req.params.id);
   const { discharge_summary } = req.body || {};
   if (!discharge_summary?.trim()) return res.status(400).json({ error: 'Discharge summary is required.' });
-  const adm = await queryOne<{ id: number; patient_id: number; admission_number: string; status: string }>(
-    'SELECT id, patient_id, admission_number, status FROM admissions WHERE id = ?',
+  const adm = await queryOne<{ id: number; patient_id: number; admitting_doctor_id: number; admission_number: string; status: string }>(
+    'SELECT id, patient_id, admitting_doctor_id, admission_number, status FROM admissions WHERE id = ?',
     [admId]
   );
   if (!adm) return res.status(404).json({ error: 'Admission not found' });
+  if (isDoctorOnly(req.user!) && Number(adm.admitting_doctor_id) !== req.user!.id) {
+    const access = await assertPatientAccess(req.user!, adm.patient_id);
+    if (!access.allowed) {
+      return res.status(403).json({ error: 'Access denied: inpatient admission belongs to another clinician.' });
+    }
+  }
   if (adm.status !== 'admitted') {
     return res.status(409).json({ error: `Discharge order can only be created from 'admitted' status (current: ${adm.status}).` });
   }
@@ -5613,15 +7398,19 @@ router.post('/ipd/admissions/:id/clear', requireAuth, requirePermission('ipd.dis
       bed_id: number | null;
       bed_days_billed: number;
       admitted_at: string;
+      status: string;
       patient_type: string;
     }>(
-      `SELECT a.id, a.patient_id, a.bed_id, a.bed_days_billed, a.admitted_at, p.patient_type
+      `SELECT a.id, a.patient_id, a.bed_id, a.bed_days_billed, a.admitted_at, a.status, p.patient_type
        FROM admissions a
        INNER JOIN patients p ON p.id = a.patient_id
        WHERE a.id = ?`,
       [admId]
     );
     if (!adm) return { ok: false as const, error: 'Admission not found', httpStatus: 404 };
+    if (adm.status === 'discharged') {
+      return { ok: false as const, error: 'Admission has already been cleared and discharged.', httpStatus: 409 };
+    }
 
     const daysStayed = Math.max(1, Math.ceil((Date.now() - new Date(adm.admitted_at).getTime()) / 86400000));
     const unbilledDays = Math.max(0, daysStayed - Number(adm.bed_days_billed || 0));
@@ -5701,8 +7490,12 @@ router.patch('/ipd/beds/:id/status', requireAuth, requirePermission('ipd.bed.ass
 // ---------------------------------------------------------------------------
 // SECURE BILLING, SHIFTS, RECEIPTS (REPRINTS), BYPASSES & APPROVALS
 // ---------------------------------------------------------------------------
-router.get('/billing/shifts', requireAuth, requirePermission('billing.shift.manage', 'finance.report.view'), async (req: AuthRequest, res: Response) => {
-  const isCashierOnly = req.user!.roles.includes('CSH') && !req.user!.roles.includes('ACC') && !req.user!.roles.includes('MGR');
+router.get('/billing/shifts', requireAuth, requirePermission('billing.shift.manage', 'billing.shift.reconcile', 'finance.report.view'), async (req: AuthRequest, res: Response) => {
+  const isCashierOnly =
+    !hasPermission(req.user!, 'finance.report.view') &&
+    !req.user!.roles.includes('ADM') &&
+    !req.user!.roles.includes('MGR') &&
+    !req.user!.roles.includes('ACC');
   let sql = `
     SELECT cs.*, u.full_name AS cashier_name
     FROM cashier_shifts cs
@@ -5885,6 +7678,13 @@ router.post('/billing/invoices', requireAuth, requirePermission('billing.invoice
   if (!patient_id || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'Patient and at least one billable item are required.' });
   }
+  for (const item of items) {
+    const qty = Number(item?.quantity ?? 1);
+    const price = Number(item?.unit_price ?? 0);
+    if (!String(item?.description || '').trim() || !Number.isFinite(qty) || qty <= 0 || !Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ error: 'Every invoice line item requires a description, positive quantity, and non-negative unit_price.' });
+    }
+  }
 
   const result = await withTransaction(async () => {
     const patient = await queryOne<{ patient_type: string; payer_name: string | null }>(
@@ -5894,7 +7694,7 @@ router.post('/billing/invoices', requireAuth, requirePermission('billing.invoice
     if (!patient) return { ok: false as const, error: 'Patient not found', httpStatus: 404 };
 
     const subtotal = items.reduce((sum: number, item: { quantity?: number; unit_price: number }) => {
-      return sum + Number(item.quantity || 1) * Number(item.unit_price || 0);
+      return sum + Number(item.quantity ?? 1) * Number(item.unit_price ?? 0);
     }, 0);
 
     const invNum = await nextSequence('INV');
@@ -5912,11 +7712,11 @@ router.post('/billing/invoices', requireAuth, requirePermission('billing.invoice
     );
 
     for (const item of items) {
-      const qty = Number(item.quantity || 1);
-      const price = patient.patient_type === 'exempt' ? 0 : Number(item.unit_price || 0);
+      const qty = Number(item.quantity ?? 1);
+      const price = patient.patient_type === 'exempt' ? 0 : Number(item.unit_price ?? 0);
       await execute(
         'INSERT INTO invoice_items (invoice_id, service_code, description, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [invRes.insertId, item.service_code || null, item.description, item.category || 'consultation', qty, price, Number((qty * price).toFixed(2))]
+        [invRes.insertId, item.service_code || null, String(item.description).trim(), item.category || 'consultation', qty, price, Number((qty * price).toFixed(2))]
       );
     }
 
@@ -6339,10 +8139,38 @@ router.post('/billing/approvals', requireAuth, requirePermission('billing.approv
   const resolvedEntityType =
     entity_type || (request_type === 'discharge_override' ? 'admission' : request_type === 'payer_exempt' ? 'patient' : 'invoice');
 
+  let parsedAmount: number | null = requested_amount != null && requested_amount !== '' ? Number(requested_amount) : null;
+  if (['discount', 'refund'].includes(String(request_type))) {
+    if (parsedAmount === null || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: `${String(request_type)} requires a positive requested_amount.` });
+    }
+    parsedAmount = Number(parsedAmount.toFixed(2));
+  }
+
+  if (resolvedEntityType === 'invoice') {
+    const inv = await queryOne<{ id: number; status: string; subtotal: number; discount_amount: number; paid_amount: number }>(
+      'SELECT id, status, subtotal, discount_amount, paid_amount FROM invoices WHERE id = ?',
+      [Number(entity_id)]
+    );
+    if (!inv) return res.status(404).json({ error: 'Target invoice not found.' });
+    if (inv.status === 'voided' || inv.status === 'refunded') {
+      return res.status(409).json({ error: `Cannot create approval request on a '${inv.status}' invoice.` });
+    }
+    if (request_type === 'discount' && parsedAmount! > Number(inv.subtotal) - Number(inv.discount_amount || 0) + 0.01) {
+      return res.status(400).json({ error: 'Requested discount exceeds remaining invoice subtotal.' });
+    }
+    if (request_type === 'refund' && parsedAmount! > Number(inv.paid_amount) + 0.01) {
+      return res.status(400).json({ error: 'Requested refund exceeds paid amount on invoice.' });
+    }
+    if (request_type === 'void_invoice' && Number(inv.paid_amount) > 0) {
+      return res.status(409).json({ error: 'Paid invoices cannot be voided directly. Submit a Refund request instead.' });
+    }
+  }
+
   const inserted = await execute(
     `INSERT INTO approval_requests (request_type, entity_type, entity_id, requested_amount, reason, status, requested_by)
      VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-    [request_type, resolvedEntityType, Number(entity_id), requested_amount ? Number(requested_amount) : null, reason.trim(), req.user!.id]
+    [request_type, resolvedEntityType, Number(entity_id), parsedAmount, reason.trim(), req.user!.id]
   );
 
   await createNotification({
@@ -6359,7 +8187,7 @@ router.post('/billing/approvals', requireAuth, requirePermission('billing.approv
     action: 'billing.approval.request',
     entityType: 'approval_request',
     entityId: inserted.insertId,
-    after: { request_type, entity_type: resolvedEntityType, entity_id, requested_amount },
+    after: { request_type, entity_type: resolvedEntityType, entity_id, requested_amount: parsedAmount },
     reason: reason.trim(),
     req,
   });
@@ -6415,15 +8243,19 @@ router.post('/billing/approvals/:id/decide', requireAuth, requirePermission('bil
           invoice_number: string;
           patient_id: number;
           payer_type: string;
+          status: string;
           subtotal: number;
           discount_amount: number;
           total_amount: number;
           paid_amount: number;
         }>(
-          'SELECT id, invoice_number, patient_id, payer_type, subtotal, discount_amount, total_amount, paid_amount FROM invoices WHERE id = ?',
+          'SELECT id, invoice_number, patient_id, payer_type, status, subtotal, discount_amount, total_amount, paid_amount FROM invoices WHERE id = ?',
           [reqRow.entity_id]
         );
         if (inv) {
+          if (inv.status === 'voided' || inv.status === 'refunded') {
+            return { ok: false as const, error: `Invoice is already ${inv.status}.`, httpStatus: 409 };
+          }
           const hasAccrual = await hasInvoiceAccrualJE(inv.id);
           const receivableAcct = inv.payer_type === 'insurance' || inv.payer_type === 'credit' ? '1100' : '1150';
 
@@ -6584,7 +8416,7 @@ router.post('/billing/approvals/:id/decide', requireAuth, requirePermission('bil
 });
 
 // ---------------------------------------------------------------------------
-// ADMINISTRATION, AUDIT LOG, EXCEPTIONS & TRACE
+// ADMINISTRATION, HR EMPLOYEE INTEGRATION, CONFIG, AUDIT LOG & BACKUP
 // ---------------------------------------------------------------------------
 router.get('/admin/roles', requireAuth, requirePermission('admin.role.manage', 'admin.user.manage', 'audit.read'), async (_req, res) => {
   const roles = await query(
@@ -6601,6 +8433,66 @@ router.get('/admin/roles', requireAuth, requirePermission('admin.role.manage', '
   );
   const allPermissions = await query('SELECT id, code, module, description FROM permissions ORDER BY module ASC, code ASC');
   res.json({ roles, rolePerms, allPermissions });
+});
+
+router.post('/admin/roles', requireAuth, requirePermission('admin.role.manage'), async (req: AuthRequest, res: Response) => {
+  const code = String(req.body?.code || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '');
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const permissionCodes: string[] = Array.isArray(req.body?.permission_codes) ? req.body.permission_codes : [];
+  if (!code || code.length < 2 || code.length > 10 || !name) {
+    return res.status(400).json({ error: 'Role code (2-10 alphanumeric characters) and role name are required.' });
+  }
+  const exists = await queryOne('SELECT id FROM roles WHERE code = ?', [code]);
+  if (exists) {
+    return res.status(409).json({ error: `Role code ${code} already exists.` });
+  }
+  const cleanCodes = [...new Set(permissionCodes.map((c) => String(c).trim()).filter(Boolean))];
+  const permRows =
+    cleanCodes.length > 0
+      ? await query<{ id: number; code: string }>(`SELECT id, code FROM permissions WHERE code IN (${cleanCodes.map(() => '?').join(',')})`, cleanCodes)
+      : [];
+
+  const createdId = await withTransaction(async () => {
+    const ins = await execute('INSERT INTO roles (code, name, description, system_role) VALUES (?, ?, ?, 0)', [
+      code,
+      name,
+      description || null,
+    ]);
+    for (const p of permRows) {
+      await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [ins.insertId, p.id, 'all']);
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'admin.role.create',
+      entityType: 'role',
+      entityId: ins.insertId,
+      after: { code, name, permissionCodes: permRows.map((p) => p.code) },
+      req,
+    });
+    return ins.insertId;
+  });
+  res.status(201).json({ id: createdId, code, name });
+});
+
+router.put('/admin/roles/:code', requireAuth, requirePermission('admin.role.manage'), async (req: AuthRequest, res: Response) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const role = await queryOne<{ id: number; name: string; description: string | null }>('SELECT id, name, description FROM roles WHERE code = ?', [code]);
+  if (!role) return res.status(404).json({ error: 'Role not found' });
+  if (!name) return res.status(400).json({ error: 'Role name is required.' });
+  await execute('UPDATE roles SET name = ?, description = ? WHERE id = ?', [name, description || null, role.id]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.role.update',
+    entityType: 'role',
+    entityId: role.id,
+    before: { name: role.name, description: role.description },
+    after: { name, description },
+    req,
+  });
+  res.json({ ok: true });
 });
 
 router.put('/admin/roles/:code/permissions', requireAuth, requirePermission('admin.role.manage'), async (req: AuthRequest, res: Response) => {
@@ -6636,19 +8528,180 @@ router.put('/admin/roles/:code/permissions', requireAuth, requirePermission('adm
   res.json({ ok: true, roleCode, permissionCount: permRows.length });
 });
 
-router.get('/admin/users', requireAuth, requirePermission('admin.user.manage', 'audit.read', 'hr.manage'), async (_req, res) => {
-  const users = await query(
-    `SELECT u.id, u.full_name, u.email, u.specialty, u.active, u.must_change_password, u.two_fa_enabled,
-            u.failed_attempts, u.locked_until, u.last_login_at, u.created_at,
-            COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_code,
-            COALESCE((SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_name
-     FROM users u
-     ORDER BY u.id ASC`
+// HR Employee Register Integration (Read-only lookup for System Admin user creation & access review)
+router.get('/admin/hr-employees', requireAuth, requirePermission('admin.user.manage', 'audit.read'), async (req: AuthRequest, res: Response) => {
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const dept = String(req.query.department || '').trim();
+  const designation = String(req.query.designation || '').trim();
+  const accountFilter = String(req.query.account_filter || 'all').trim();
+
+  const clauses: string[] = ['1=1'];
+  const params: unknown[] = [];
+  if (search) {
+    clauses.push('(LOWER(e.employee_number) LIKE ? OR LOWER(e.full_name) LIKE ? OR LOWER(e.department_name) LIKE ? OR LOWER(e.job_position) LIKE ? OR LOWER(COALESCE(e.email, \'\')) LIKE ?)');
+    const like = `%${search}%`;
+    params.push(like, like, like, like, like);
+  }
+  if (dept) {
+    clauses.push('e.department_name = ?');
+    params.push(dept);
+  }
+  if (designation) {
+    clauses.push('e.job_position = ?');
+    params.push(designation);
+  }
+  if (accountFilter === 'review_required') {
+    clauses.push('e.access_review_required = 1');
+  }
+
+  const rows = await query<{
+    id: number;
+    employee_number: string;
+    user_id: number | null;
+    full_name: string;
+    gender: string;
+    phone: string | null;
+    email: string | null;
+    department_name: string;
+    job_position: string;
+    employment_type: string;
+    status: string;
+    terminated_at: string | null;
+    termination_reason: string | null;
+    access_review_required: number;
+    access_reviewed_at: string | null;
+  }>(
+    `SELECT e.id, e.employee_number, e.user_id, e.full_name, e.gender, e.phone, e.email,
+            e.department_name, e.job_position, e.employment_type, e.status,
+            e.terminated_at, e.termination_reason, e.access_review_required, e.access_reviewed_at
+     FROM hr_employees e
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY e.access_review_required DESC, e.employee_number ASC`,
+    params
   );
-  res.json({ users });
+
+  const linkedUsers = await query<{
+    id: number;
+    employee_id: number | null;
+    username: string | null;
+    email: string;
+    active: number;
+    status: string | null;
+    role_code: string;
+  }>(
+    `SELECT u.id, u.employee_id, u.username, u.email, u.active, u.status,
+            COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_code
+     FROM users u`
+  );
+
+  const usersByEmpId = new Map<number, typeof linkedUsers>();
+  const userById = new Map<number, (typeof linkedUsers)[0]>();
+  for (const u of linkedUsers) {
+    userById.set(u.id, u);
+    if (u.employee_id) {
+      const arr = usersByEmpId.get(u.employee_id) || [];
+      arr.push(u);
+      usersByEmpId.set(u.employee_id, arr);
+    }
+  }
+
+  const enriched = rows
+    .map((e) => {
+      const matched = [...(usersByEmpId.get(e.id) || [])];
+      if (e.user_id && userById.has(e.user_id) && !matched.some((m) => m.id === e.user_id)) {
+        matched.push(userById.get(e.user_id)!);
+      }
+      const primary = matched[0] || null;
+      return {
+        ...e,
+        has_system_account: matched.length > 0,
+        account_count: matched.length,
+        linked_user_id: primary?.id ?? null,
+        linked_username: primary?.username ?? null,
+        linked_email: primary?.email ?? null,
+        linked_status: primary ? primary.status || (primary.active ? 'active' : 'inactive') : null,
+        linked_roles: primary?.role_code || '',
+      };
+    })
+    .filter((e) => {
+      if (accountFilter === 'available') return !e.has_system_account && e.status === 'active';
+      if (accountFilter === 'provisioned') return e.has_system_account;
+      return true;
+    });
+
+  res.json({ employees: enriched });
 });
 
-router.get('/admin/deployment-status', requireAuth, requirePermission('admin.user.manage', 'audit.read'), async (_req, res) => {
+router.post('/admin/hr-employees/:id/complete-access-review', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const empId = Number(req.params.id);
+  const note = String(req.body?.note || '').trim();
+  const emp = await queryOne<{ id: number; employee_number: string; full_name: string }>('SELECT id, employee_number, full_name FROM hr_employees WHERE id = ?', [empId]);
+  if (!emp) return res.status(404).json({ error: 'HR employee not found' });
+
+  await execute('UPDATE hr_employees SET access_review_required = 0, access_reviewed_at = ?, access_reviewed_by = ? WHERE id = ?', [
+    nowSql(),
+    req.user!.id,
+    empId,
+  ]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.hr.access_review_completed',
+    entityType: 'hr_employee',
+    entityId: empId,
+    after: { employee_number: emp.employee_number, full_name: emp.full_name, note: note || 'Access review completed' },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.get('/admin/users', requireAuth, requirePermission('admin.user.manage', 'audit.read', 'hr.manage'), async (_req, res) => {
+  const users = await query<Record<string, unknown>>(
+    `SELECT u.id, u.employee_id, u.username, u.full_name, u.email, u.specialty, u.active, u.status,
+            u.exception_approved, u.must_change_password, u.two_fa_enabled,
+            u.failed_attempts, u.locked_until, u.last_login_at, u.created_at,
+            e.employee_number, e.department_name AS hr_department_name, e.job_position AS hr_job_position,
+            e.status AS hr_status, e.access_review_required,
+            COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_code,
+            COALESCE((SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id), '') AS role_name,
+            COALESCE((SELECT GROUP_CONCAT(d.name) FROM user_departments ud INNER JOIN departments d ON d.id = ud.department_id WHERE ud.user_id = u.id), '') AS department_names,
+            (SELECT COUNT(*) FROM user_sessions us WHERE us.user_id = u.id AND us.revoked_at IS NULL AND us.expires_at > ?) AS active_session_count
+     FROM users u
+     LEFT JOIN hr_employees e ON e.id = u.employee_id OR e.user_id = u.id
+     ORDER BY u.id ASC`,
+    [nowSql()]
+  );
+
+  const [deptMaps, unitMaps] = await Promise.all([
+    query<{ user_id: number; department_id: number }>('SELECT user_id, department_id FROM user_departments').catch(() => []),
+    query<{ user_id: number; clinic_room_id: number }>('SELECT user_id, clinic_room_id FROM user_clinic_units').catch(() => []),
+  ]);
+  const deptIdsByUser = new Map<number, number[]>();
+  for (const d of deptMaps) {
+    const arr = deptIdsByUser.get(d.user_id) || [];
+    arr.push(d.department_id);
+    deptIdsByUser.set(d.user_id, arr);
+  }
+  const unitIdsByUser = new Map<number, number[]>();
+  for (const r of unitMaps) {
+    const arr = unitIdsByUser.get(r.user_id) || [];
+    arr.push(r.clinic_room_id);
+    unitIdsByUser.set(r.user_id, arr);
+  }
+
+  const enriched = users.map((u) => {
+    const uid = Number(u.id);
+    const derivedStatus = u.status || (Number(u.active) ? (u.locked_until ? 'locked' : 'active') : 'inactive');
+    return {
+      ...u,
+      status: derivedStatus,
+      department_ids: deptIdsByUser.get(uid) || [],
+      clinic_unit_ids: unitIdsByUser.get(uid) || [],
+    };
+  });
+  res.json({ users: enriched });
+});
+
+router.get('/admin/deployment-status', requireAuth, requirePermission('admin.user.manage', 'admin.backup.manage', 'audit.read'), async (_req, res) => {
   const cfg = getDbConfigSummary();
   const [patientsCnt, visitsCnt, jeCnt, auditCnt] = await Promise.all([
     queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM patients'),
@@ -6668,16 +8721,94 @@ router.get('/admin/deployment-status', requireAuth, requirePermission('admin.use
 });
 
 router.post('/admin/users', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
-  const { full_name, email, password, role_code, role_codes, specialty, two_fa_enabled } = req.body || {};
+  const {
+    employee_id,
+    full_name,
+    username,
+    email,
+    password,
+    generate_temp_password,
+    role_code,
+    role_codes,
+    specialty,
+    two_fa_enabled,
+    department_ids,
+    clinic_unit_ids,
+    exception_approved = false,
+  } = req.body || {};
+
   const requestedRoles: string[] = Array.isArray(role_codes) && role_codes.length > 0
     ? role_codes.map((c: unknown) => String(c).trim().toUpperCase()).filter(Boolean)
     : role_code
       ? [String(role_code).trim().toUpperCase()]
       : [];
 
-  if (!full_name || !email || !password || requestedRoles.length === 0) {
-    return res.status(400).json({ error: 'Full name, email, temporary password, and at least one role are required.' });
+  if (requestedRoles.length === 0) {
+    return res.status(400).json({ error: 'At least one system role must be explicitly assigned.' });
   }
+
+  let resolvedFullName = String(full_name || '').trim();
+  let resolvedEmail = String(email || '').trim().toLowerCase();
+  const empIdNum = employee_id ? Number(employee_id) : null;
+
+  if (empIdNum) {
+    const emp = await queryOne<{
+      id: number;
+      employee_number: string;
+      user_id: number | null;
+      full_name: string;
+      email: string | null;
+      department_name: string;
+      job_position: string;
+      status: string;
+    }>('SELECT id, employee_number, user_id, full_name, email, department_name, job_position, status FROM hr_employees WHERE id = ?', [empIdNum]);
+
+    if (!emp) {
+      return res.status(404).json({ error: 'Selected HR employee record was not found.' });
+    }
+    if (emp.status !== 'active') {
+      return res.status(409).json({ error: `Cannot provision access for HR employee ${emp.employee_number} (status: ${emp.status}).` });
+    }
+    const existingLinked = await query<{ id: number }>(
+      'SELECT id FROM users WHERE employee_id = ? OR id = ?',
+      [emp.id, emp.user_id || -1]
+    );
+    if (existingLinked.length > 0 && !exception_approved) {
+      return res.status(409).json({
+        error: `One-Account Rule: HR employee ${emp.employee_number} (${emp.full_name}) already has a linked system account. Enable explicit exception approval if a secondary account is justified.`,
+        oneAccountViolation: true,
+      });
+    }
+    resolvedFullName = emp.full_name;
+    if (!resolvedEmail && emp.email) {
+      resolvedEmail = emp.email.trim().toLowerCase();
+    }
+  } else if (!exception_approved) {
+    return res.status(400).json({ error: 'Selecting an existing HR employee record (employee_id) is required unless explicit exception_approved is set.' });
+  }
+
+  if (!resolvedFullName || !resolvedEmail) {
+    return res.status(400).json({ error: 'Employee full name and work email are required.' });
+  }
+
+  const resolvedUsername = (username ? String(username) : resolvedEmail.split('@')[0])
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '');
+  if (!resolvedUsername || resolvedUsername.length < 3) {
+    return res.status(400).json({ error: 'A valid username (min 3 characters) is required.' });
+  }
+
+  const settings = await getClinicSettings();
+  const minPwdLen = Math.max(8, Number(settings.security?.passwordMinLength || 8));
+  const rawPassword = generate_temp_password
+    ? `C360-${crypto.randomBytes(Math.max(4, Math.ceil(minPwdLen / 2))).toString('hex')}Aa!`
+    : String(password || '');
+  const pwdPolicyErr = validatePasswordPolicy(rawPassword, settings.security);
+  if (pwdPolicyErr) {
+    return res.status(400).json({ error: pwdPolicyErr });
+  }
+
   const roleRows = await query<{ id: number; code: string }>(
     `SELECT id, code FROM roles WHERE code IN (${requestedRoles.map(() => '?').join(',')})`,
     requestedRoles
@@ -6686,34 +8817,140 @@ router.post('/admin/users', requireAuth, requirePermission('admin.user.manage'),
     return res.status(400).json({ error: 'One or more invalid role codes.' });
   }
 
-  const normalizedEmail = String(email).trim().toLowerCase();
-  const existing = await queryOne<{ id: number }>('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
-  if (existing) return res.status(409).json({ error: 'A user with this email already exists.' });
+  const [existingEmail, existingUsername] = await Promise.all([
+    queryOne<{ id: number }>('SELECT id FROM users WHERE LOWER(email) = ?', [resolvedEmail]),
+    queryOne<{ id: number }>('SELECT id FROM users WHERE LOWER(username) = ?', [resolvedUsername]),
+  ]);
+  if (existingEmail) return res.status(409).json({ error: 'A system user with this email already exists.' });
+  if (existingUsername) return res.status(409).json({ error: `Username "${resolvedUsername}" is already in use.` });
 
   const hasPrivilegedRole = requestedRoles.some((c) => ['ADM', 'ACC', 'MGR'].includes(c));
   const enforce2fa = two_fa_enabled !== undefined ? (two_fa_enabled ? 1 : 0) : hasPrivilegedRole ? 1 : 0;
-  const hash = await bcrypt.hash(String(password), 10);
+  const hash = await bcrypt.hash(rawPassword, 12);
+  const deptIds = Array.isArray(department_ids) ? [...new Set(department_ids.map(Number).filter(Boolean))] : [];
+  const unitIds = Array.isArray(clinic_unit_ids) ? [...new Set(clinic_unit_ids.map(Number).filter(Boolean))] : [];
 
   const insertedId = await withTransaction(async () => {
     const inserted = await execute(
-      'INSERT INTO users (branch_id, full_name, email, password_hash, specialty, must_change_password, two_fa_enabled) VALUES (1, ?, ?, ?, ?, 1, ?)',
-      [full_name.trim(), normalizedEmail, hash, specialty || null, enforce2fa]
+      `INSERT INTO users (branch_id, department_id, employee_id, username, full_name, email, password_hash, specialty, active, status, exception_approved, must_change_password, two_fa_enabled)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, 1, ?)`,
+      [deptIds[0] ?? null, empIdNum, resolvedUsername, resolvedFullName, resolvedEmail, hash, specialty || null, exception_approved ? 1 : 0, enforce2fa]
     );
     for (const r of roleRows) {
       await execute('INSERT INTO user_roles (user_id, role_id, branch_id) VALUES (?, ?, 1)', [inserted.insertId, r.id]);
+    }
+    for (let idx = 0; idx < deptIds.length; idx++) {
+      await execute('INSERT INTO user_departments (user_id, department_id, is_primary) VALUES (?, ?, ?)', [
+        inserted.insertId,
+        deptIds[idx],
+        idx === 0 ? 1 : 0,
+      ]);
+    }
+    for (const unitId of unitIds) {
+      await execute('INSERT INTO user_clinic_units (user_id, clinic_room_id) VALUES (?, ?)', [inserted.insertId, unitId]);
+    }
+    if (empIdNum) {
+      await execute('UPDATE hr_employees SET user_id = COALESCE(user_id, ?), updated_at = ? WHERE id = ?', [
+        inserted.insertId,
+        nowSql(),
+        empIdNum,
+      ]);
     }
     await writeAuditLog({
       user: req.user,
       action: 'admin.user.create',
       entityType: 'user',
       entityId: inserted.insertId,
-      after: { email: normalizedEmail, roles: requestedRoles, must_change_password: true, two_fa_enabled: Boolean(enforce2fa) },
+      after: {
+        employee_id: empIdNum,
+        username: resolvedUsername,
+        email: resolvedEmail,
+        roles: requestedRoles,
+        department_ids: deptIds,
+        clinic_unit_ids: unitIds,
+        exception_approved: Boolean(exception_approved),
+        two_fa_enabled: Boolean(enforce2fa),
+      },
       req,
     });
     return inserted.insertId;
   });
 
-  res.status(201).json({ id: insertedId });
+  res.status(201).json({
+    id: insertedId,
+    username: resolvedUsername,
+    email: resolvedEmail,
+    tempPassword: generate_temp_password ? rawPassword : undefined,
+  });
+});
+
+router.put('/admin/users/:id', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const target = await queryOne<{
+    id: number;
+    employee_id: number | null;
+    username: string | null;
+    email: string;
+    specialty: string | null;
+    two_fa_enabled: number;
+  }>('SELECT id, employee_id, username, email, specialty, two_fa_enabled FROM users WHERE id = ?', [targetId]);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+
+  const { username, email, specialty, two_fa_enabled, department_ids, clinic_unit_ids } = req.body || {};
+  const nextEmail = email ? String(email).trim().toLowerCase() : target.email;
+  const nextUsername = username ? String(username).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '') : target.username;
+  if (!nextEmail || !nextUsername) {
+    return res.status(400).json({ error: 'Valid email and username are required.' });
+  }
+  const dupEmail = await queryOne('SELECT id FROM users WHERE LOWER(email) = ? AND id != ?', [nextEmail, targetId]);
+  if (dupEmail) return res.status(409).json({ error: 'Email already assigned to another user.' });
+  const dupUser = await queryOne('SELECT id FROM users WHERE LOWER(username) = ? AND id != ?', [nextUsername, targetId]);
+  if (dupUser) return res.status(409).json({ error: 'Username already assigned to another user.' });
+
+  const deptIds = Array.isArray(department_ids) ? [...new Set(department_ids.map(Number).filter(Boolean))] : null;
+  const unitIds = Array.isArray(clinic_unit_ids) ? [...new Set(clinic_unit_ids.map(Number).filter(Boolean))] : null;
+
+  await withTransaction(async () => {
+    await execute(
+      'UPDATE users SET username = ?, email = ?, specialty = ?, two_fa_enabled = ?, department_id = COALESCE(?, department_id), updated_at = ? WHERE id = ?',
+      [
+        nextUsername,
+        nextEmail,
+        specialty !== undefined ? specialty || null : target.specialty,
+        two_fa_enabled !== undefined ? (two_fa_enabled ? 1 : 0) : target.two_fa_enabled,
+        deptIds ? deptIds[0] ?? null : null,
+        nowSql(),
+        targetId,
+      ]
+    );
+    if (deptIds) {
+      await execute('DELETE FROM user_departments WHERE user_id = ?', [targetId]);
+      for (let i = 0; i < deptIds.length; i++) {
+        await execute('INSERT INTO user_departments (user_id, department_id, is_primary) VALUES (?, ?, ?)', [
+          targetId,
+          deptIds[i],
+          i === 0 ? 1 : 0,
+        ]);
+      }
+    }
+    if (unitIds) {
+      await execute('DELETE FROM user_clinic_units WHERE user_id = ?', [targetId]);
+      for (const uid of unitIds) {
+        await execute('INSERT INTO user_clinic_units (user_id, clinic_room_id) VALUES (?, ?)', [targetId, uid]);
+      }
+    }
+    await writeAuditLog({
+      user: req.user,
+      action: 'admin.user.update',
+      entityType: 'user',
+      entityId: targetId,
+      before: { username: target.username, email: target.email, specialty: target.specialty },
+      after: { username: nextUsername, email: nextEmail, specialty, department_ids: deptIds, clinic_unit_ids: unitIds },
+      req,
+    });
+  });
+
+  res.json({ ok: true });
 });
 
 router.put('/admin/users/:id/roles', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
@@ -6762,15 +8999,105 @@ router.put('/admin/users/:id/roles', requireAuth, requirePermission('admin.user.
   res.json({ ok: true, roles: roleCodes });
 });
 
-router.post('/admin/users/:id/unlock', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+router.patch('/admin/users/:id/status', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
   const targetId = Number(req.params.id);
-  const target = await queryOne<{ id: number; email: string; failed_attempts: number; locked_until: string | null }>(
-    'SELECT id, email, failed_attempts, locked_until FROM users WHERE id = ?',
+  const action = String(req.body?.action || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+  const allowedActions = new Set(['activate', 'deactivate', 'lock', 'unlock', 'reset_password', 'revoke_sessions']);
+  if (!allowedActions.has(action)) {
+    return res.status(400).json({ error: 'Invalid status action.' });
+  }
+  if (targetId === req.user!.id && ['deactivate', 'lock'].includes(action)) {
+    return res.status(409).json({ error: 'Administrators cannot lock or deactivate their own active session.' });
+  }
+
+  const target = await queryOne<{ id: number; employee_id: number | null; email: string; active: number; status: string | null }>(
+    'SELECT id, employee_id, email, active, status FROM users WHERE id = ?',
     [targetId]
   );
   if (!target) return res.status(404).json({ error: 'User not found' });
 
-  await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?', [targetId]);
+  let tempPasswordOut: string | undefined;
+  let revokedCount = 0;
+
+  if (action === 'activate') {
+    const hrEmp = await getLinkedHrEmployeeStatus(targetId, target.employee_id ?? null);
+    if (hrEmp && hrEmp.status !== 'active') {
+      return res.status(409).json({
+        error: `Cannot activate user account: linked HR employee is '${hrEmp.status}'. Reactivate the HR employee record first.`,
+      });
+    }
+    await execute("UPDATE users SET active = 1, status = 'active', failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?", [
+      nowSql(),
+      targetId,
+    ]);
+  } else if (action === 'deactivate') {
+    await execute("UPDATE users SET active = 0, status = 'inactive', updated_at = ? WHERE id = ?", [nowSql(), targetId]);
+    revokedCount = await revokeAllUserSessions(targetId, req.user!.id);
+  } else if (action === 'lock') {
+    await execute("UPDATE users SET status = 'locked', locked_until = '2099-12-31 23:59:59', updated_at = ? WHERE id = ?", [
+      nowSql(),
+      targetId,
+    ]);
+    revokedCount = await revokeAllUserSessions(targetId, req.user!.id);
+  } else if (action === 'unlock') {
+    const hrEmp = target.active ? await getLinkedHrEmployeeStatus(targetId, target.employee_id ?? null) : null;
+    const nextStatus = target.active && (!hrEmp || hrEmp.status === 'active') ? 'active' : 'inactive';
+    await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL, status = ?, updated_at = ? WHERE id = ?', [
+      nextStatus,
+      nowSql(),
+      targetId,
+    ]);
+  } else if (action === 'reset_password') {
+    const settings = await getClinicSettings();
+    const minPwdLen = Math.max(8, Number(settings.security?.passwordMinLength || 8));
+    const requestedPwd = req.body?.new_password ? String(req.body.new_password) : '';
+    const tempPwd = requestedPwd
+      ? requestedPwd
+      : `C360-${crypto.randomBytes(Math.max(4, Math.ceil(minPwdLen / 2))).toString('hex')}Aa!`;
+    const pwdPolicyErr = validatePasswordPolicy(tempPwd, settings.security);
+    if (pwdPolicyErr) {
+      return res.status(400).json({ error: pwdPolicyErr });
+    }
+    const hash = await bcrypt.hash(tempPwd, 12);
+    await execute('UPDATE users SET password_hash = ?, must_change_password = 1, failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?', [
+      hash,
+      nowSql(),
+      targetId,
+    ]);
+    revokedCount = await revokeAllUserSessions(targetId, req.user!.id);
+    tempPasswordOut = tempPwd;
+  } else if (action === 'revoke_sessions') {
+    revokedCount = await revokeAllUserSessions(targetId, req.user!.id);
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: `admin.user.${action}`,
+    entityType: 'user',
+    entityId: targetId,
+    before: { active: Boolean(target.active), status: target.status },
+    after: { action, revokedSessions: revokedCount },
+    reason: reason || null,
+    req,
+  });
+
+  res.json({ ok: true, action, revokedSessions: revokedCount, tempPassword: tempPasswordOut });
+});
+
+router.post('/admin/users/:id/unlock', requireAuth, requirePermission('admin.user.manage'), async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const target = await queryOne<{ id: number; email: string; active: number; failed_attempts: number; locked_until: string | null }>(
+    'SELECT id, email, active, failed_attempts, locked_until FROM users WHERE id = ?',
+    [targetId]
+  );
+  if (!target) return res.status(404).json({ error: 'User not found' });
+
+  await execute('UPDATE users SET failed_attempts = 0, locked_until = NULL, status = ?, updated_at = ? WHERE id = ?', [
+    target.active ? 'active' : 'inactive',
+    nowSql(),
+    targetId,
+  ]);
   await writeAuditLog({
     user: req.user,
     action: 'admin.user.unlock',
@@ -6788,13 +9115,30 @@ router.patch('/admin/users/:id/toggle', requireAuth, requirePermission('admin.us
   if (targetId === req.user!.id) {
     return res.status(409).json({ error: 'Administrators cannot deactivate their own account.' });
   }
-  const target = await queryOne<{ id: number; active: number; email: string }>('SELECT id, active, email FROM users WHERE id = ?', [
-    targetId,
-  ]);
+  const target = await queryOne<{ id: number; employee_id: number | null; active: number; email: string }>(
+    'SELECT id, employee_id, active, email FROM users WHERE id = ?',
+    [targetId]
+  );
   if (!target) return res.status(404).json({ error: 'User not found' });
 
   const nextActive = target.active ? 0 : 1;
-  await execute('UPDATE users SET active = ? WHERE id = ?', [nextActive, targetId]);
+  if (nextActive === 1) {
+    const hrEmp = await getLinkedHrEmployeeStatus(targetId, target.employee_id ?? null);
+    if (hrEmp && hrEmp.status !== 'active') {
+      return res.status(409).json({
+        error: `Cannot activate user account: linked HR employee is '${hrEmp.status}'. Reactivate the HR employee record first.`,
+      });
+    }
+  }
+  await execute('UPDATE users SET active = ?, status = ?, updated_at = ? WHERE id = ?', [
+    nextActive,
+    nextActive ? 'active' : 'inactive',
+    nowSql(),
+    targetId,
+  ]);
+  if (!nextActive) {
+    await revokeAllUserSessions(targetId, req.user!.id);
+  }
 
   await writeAuditLog({
     user: req.user,
@@ -6807,6 +9151,409 @@ router.patch('/admin/users/:id/toggle', requireAuth, requirePermission('admin.us
   });
 
   res.json({ ok: true, active: Boolean(nextActive) });
+});
+
+router.get(
+  '/admin/users/:id/sessions',
+  requireAuth,
+  authorize(['admin.user.manage', 'audit.read'], {
+    audit: { action: 'admin.user.sessions.read', entityType: 'user', entityIdParam: 'id' },
+  }),
+  async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const sessions = await query(
+    `SELECT jti, user_id, ip_address, user_agent, created_at, last_seen_at, expires_at, revoked_at, revoked_by
+     FROM user_sessions
+     WHERE user_id = ?
+     ORDER BY created_at DESC
+     LIMIT 30`,
+    [targetId]
+  );
+  res.json({ sessions });
+});
+
+router.delete(
+  '/admin/users/:id/sessions/:jti',
+  requireAuth,
+  authorize('admin.user.manage', {
+    audit: { action: 'admin.user.session_revoked', entityType: 'user', entityIdParam: 'id', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const jti = String(req.params.jti || '').trim();
+  const sess = await queryOne<{ jti: string; expires_at: string }>(
+    'SELECT jti, expires_at FROM user_sessions WHERE jti = ? AND user_id = ?',
+    [jti, targetId]
+  );
+  if (!sess) return res.status(404).json({ error: 'Session not found for user' });
+  const expSec = Math.floor(new Date(`${String(sess.expires_at).replace(' ', 'T')}Z`).getTime() / 1000);
+  await revokeToken(jti, Number.isFinite(expSec) ? expSec : undefined, req.user!.id);
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.user.session_revoked',
+    entityType: 'user',
+    entityId: targetId,
+    after: { jti },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.delete(
+  '/admin/users/:id/sessions',
+  requireAuth,
+  authorize('admin.user.manage', {
+    audit: { action: 'admin.user.sessions_revoked_all', entityType: 'user', entityIdParam: 'id', dedupeIfAudited: true },
+  }),
+  async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const revokedCount = await revokeAllUserSessions(targetId, req.user!.id);
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.user.sessions_revoked_all',
+    entityType: 'user',
+    entityId: targetId,
+    after: { revokedCount },
+    req,
+  });
+  res.json({ ok: true, revokedCount });
+});
+
+router.get(
+  '/admin/users/:id/activity',
+  requireAuth,
+  authorize(['admin.user.manage', 'audit.read'], {
+    audit: { action: 'admin.user.activity.read', entityType: 'user', entityIdParam: 'id' },
+  }),
+  async (req: AuthRequest, res: Response) => {
+  const targetId = Number(req.params.id);
+  const logs = await query(
+    'SELECT * FROM audit_logs WHERE user_id = ? ORDER BY id DESC LIMIT 60',
+    [targetId]
+  );
+  res.json({ logs });
+});
+
+// Department-scoped operational summary endpoint enforcing department isolation + audit hook
+router.get(
+  '/departments/:departmentId/overview',
+  requireAuth,
+  authorize(['visit.read', 'admin.config.manage', 'admin.user.manage', 'audit.read'], {
+    checkDepartment: true,
+    departmentParam: 'departmentId',
+    audit: { action: 'department.overview.read', entityType: 'department', entityIdParam: 'departmentId' },
+  }),
+  async (req: AuthRequest, res: Response) => {
+    const departmentId = Number(req.params.departmentId);
+    const dept = await queryOne<Record<string, unknown>>('SELECT * FROM departments WHERE id = ?', [departmentId]);
+    if (!dept) return res.status(404).json({ error: 'Department not found' });
+    const [rooms, staff] = await Promise.all([
+      query('SELECT id, room_code, name, room_type, capacity, active FROM clinic_rooms WHERE department_id = ? ORDER BY room_code ASC', [departmentId]),
+      query(
+        `SELECT u.id, u.username, u.full_name, u.specialty, u.status
+         FROM user_departments ud
+         INNER JOIN users u ON u.id = ud.user_id
+         WHERE ud.department_id = ? AND u.active = 1
+         ORDER BY u.full_name ASC`,
+        [departmentId]
+      ),
+    ]);
+    res.json({ department: dept, rooms, staff });
+  }
+);
+
+// Clinic Configuration: Departments, Specialties, Clinic Rooms & Doctor Profiles
+router.get('/admin/departments', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage', 'catalog.manage', 'audit.read', 'hr.manage'), async (_req, res) => {
+  const departments = await query(
+    `SELECT d.*,
+            (SELECT COUNT(*) FROM user_departments ud WHERE ud.department_id = d.id) AS assigned_staff_count,
+            (SELECT COUNT(*) FROM clinic_rooms cr WHERE cr.department_id = d.id AND cr.active = 1) AS active_room_count
+     FROM departments d
+     ORDER BY d.code ASC`
+  );
+  res.json({ departments });
+});
+
+router.post('/admin/departments', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const code = String(req.body?.code || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '');
+  const name = String(req.body?.name || '').trim();
+  const category = String(req.body?.category || 'clinical').trim().toLowerCase();
+  const headName = String(req.body?.head_name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  if (!code || !name) return res.status(400).json({ error: 'Department code and name are required.' });
+  const dup = await queryOne('SELECT id FROM departments WHERE code = ?', [code]);
+  if (dup) return res.status(409).json({ error: `Department code ${code} already exists.` });
+  const ins = await execute(
+    'INSERT INTO departments (branch_id, code, name, category, head_name, description, active) VALUES (1, ?, ?, ?, ?, ?, 1)',
+    [code, name, category || 'clinical', headName || null, description || null]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.department.create',
+    entityType: 'department',
+    entityId: ins.insertId,
+    after: { code, name, category, headName },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.put('/admin/departments/:id', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const existing = await queryOne('SELECT * FROM departments WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Department not found' });
+  const { name, category, head_name, description, active } = req.body || {};
+  await execute(
+    'UPDATE departments SET name = ?, category = ?, head_name = ?, description = ?, active = ? WHERE id = ?',
+    [
+      String(name || existing.name).trim(),
+      String(category || existing.category || 'clinical').trim(),
+      head_name !== undefined ? String(head_name || '').trim() || null : existing.head_name,
+      description !== undefined ? String(description || '').trim() || null : existing.description,
+      active !== undefined ? (Number(active) ? 1 : 0) : existing.active,
+      id,
+    ]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.department.update',
+    entityType: 'department',
+    entityId: id,
+    after: { name, category, head_name, active },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.get('/admin/specialties', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage', 'catalog.manage', 'visit.read'), async (_req, res) => {
+  const specialties = await query(
+    `SELECT s.*, d.name AS department_name
+     FROM specialties s
+     LEFT JOIN departments d ON d.id = s.department_id
+     ORDER BY s.name ASC`
+  );
+  res.json({ specialties });
+});
+
+router.post('/admin/specialties', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const code = String(req.body?.code || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '');
+  const name = String(req.body?.name || '').trim();
+  const departmentId = req.body?.department_id ? Number(req.body.department_id) : null;
+  const description = String(req.body?.description || '').trim();
+  const fee = Math.max(0, Number(req.body?.consultation_fee ?? 45));
+  if (!code || !name) return res.status(400).json({ error: 'Specialty code and name are required.' });
+  const dup = await queryOne('SELECT id FROM specialties WHERE code = ?', [code]);
+  if (dup) return res.status(409).json({ error: `Specialty code ${code} already exists.` });
+  const ins = await execute(
+    'INSERT INTO specialties (code, name, department_id, description, consultation_fee, active) VALUES (?, ?, ?, ?, ?, 1)',
+    [code, name, departmentId, description || null, fee]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.specialty.create',
+    entityType: 'specialty',
+    entityId: ins.insertId,
+    after: { code, name, fee },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.put('/admin/specialties/:id', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const existing = await queryOne('SELECT * FROM specialties WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Specialty not found' });
+  const { name, department_id, description, consultation_fee, active } = req.body || {};
+  await execute(
+    'UPDATE specialties SET name = ?, department_id = ?, description = ?, consultation_fee = ?, active = ? WHERE id = ?',
+    [
+      String(name || existing.name).trim(),
+      department_id !== undefined ? (department_id ? Number(department_id) : null) : existing.department_id,
+      description !== undefined ? String(description || '').trim() || null : existing.description,
+      consultation_fee !== undefined ? Math.max(0, Number(consultation_fee)) : existing.consultation_fee,
+      active !== undefined ? (Number(active) ? 1 : 0) : existing.active,
+      id,
+    ]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.specialty.update',
+    entityType: 'specialty',
+    entityId: id,
+    after: { name, consultation_fee, active },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.get('/admin/clinic-rooms', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage', 'catalog.manage', 'visit.read'), async (_req, res) => {
+  const rooms = await query(
+    `SELECT cr.*, d.name AS department_name, sp.name AS specialty_name
+     FROM clinic_rooms cr
+     LEFT JOIN departments d ON d.id = cr.department_id
+     LEFT JOIN specialties sp ON sp.id = cr.specialty_id
+     ORDER BY cr.room_code ASC`
+  );
+  res.json({ rooms });
+});
+
+router.post('/admin/clinic-rooms', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const roomCode = String(req.body?.room_code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  const name = String(req.body?.name || '').trim();
+  const departmentId = req.body?.department_id ? Number(req.body.department_id) : null;
+  const specialtyId = req.body?.specialty_id ? Number(req.body.specialty_id) : null;
+  const roomType = String(req.body?.room_type || 'consultation').trim().toLowerCase();
+  const capacity = Math.max(1, Number(req.body?.capacity || 1));
+  if (!roomCode || !name) return res.status(400).json({ error: 'Room code and name are required.' });
+  const dup = await queryOne('SELECT id FROM clinic_rooms WHERE room_code = ?', [roomCode]);
+  if (dup) return res.status(409).json({ error: `Room code ${roomCode} already exists.` });
+  const ins = await execute(
+    'INSERT INTO clinic_rooms (room_code, name, department_id, specialty_id, room_type, capacity, active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+    [roomCode, name, departmentId, specialtyId, roomType, capacity]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.clinic_room.create',
+    entityType: 'clinic_room',
+    entityId: ins.insertId,
+    after: { roomCode, name, roomType, capacity },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.put('/admin/clinic-rooms/:id', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const existing = await queryOne('SELECT * FROM clinic_rooms WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Clinic room not found' });
+  const { name, department_id, specialty_id, room_type, capacity, active } = req.body || {};
+  await execute(
+    'UPDATE clinic_rooms SET name = ?, department_id = ?, specialty_id = ?, room_type = ?, capacity = ?, active = ? WHERE id = ?',
+    [
+      String(name || existing.name).trim(),
+      department_id !== undefined ? (department_id ? Number(department_id) : null) : existing.department_id,
+      specialty_id !== undefined ? (specialty_id ? Number(specialty_id) : null) : existing.specialty_id,
+      String(room_type || existing.room_type).trim().toLowerCase(),
+      capacity !== undefined ? Math.max(1, Number(capacity)) : existing.capacity,
+      active !== undefined ? (Number(active) ? 1 : 0) : existing.active,
+      id,
+    ]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.clinic_room.update',
+    entityType: 'clinic_room',
+    entityId: id,
+    after: { name, room_type, capacity, active },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.get('/admin/doctors', requireAuth, requirePermission('admin.user.manage', 'admin.config.manage', 'visit.read'), async (_req, res) => {
+  const doctors = await query(
+    `SELECT u.id, u.username, u.full_name, u.email, u.specialty, u.active, u.status,
+            e.employee_number, e.department_name AS hr_department_name, e.licence_number, e.licence_expiry,
+            COALESCE((SELECT GROUP_CONCAT(cr.room_code || ' (' || cr.name || ')')
+                      FROM user_clinic_units ucu
+                      INNER JOIN clinic_rooms cr ON cr.id = ucu.clinic_room_id
+                      WHERE ucu.user_id = u.id), '') AS assigned_rooms,
+            (SELECT COUNT(*) FROM visits v WHERE v.doctor_id = u.id AND v.status != 'closed') AS active_visits_count
+     FROM users u
+     INNER JOIN user_roles ur ON ur.user_id = u.id
+     INNER JOIN roles r ON r.id = ur.role_id AND r.code = 'DOC'
+     LEFT JOIN hr_employees e ON e.id = u.employee_id OR e.user_id = u.id
+     ORDER BY u.full_name ASC`
+  );
+  res.json({ doctors });
+});
+
+router.get('/admin/backup-status', requireAuth, requirePermission('admin.user.manage', 'admin.backup.manage', 'audit.read'), async (_req, res) => {
+  const cfg = getDbConfigSummary();
+  const settings = await getClinicSettings();
+  let sqliteFileBytes: number | null = null;
+  let sqliteIntegrity = 'n/a';
+  if (cfg.dialect === 'sqlite') {
+    const dbPath = process.env.SQLITE_PATH ? path.resolve(process.env.SQLITE_PATH) : path.resolve(process.cwd(), 'clinic360.db');
+    try {
+      const stat = fs.statSync(dbPath);
+      sqliteFileBytes = stat.size;
+    } catch {
+      sqliteFileBytes = null;
+    }
+    const check = await queryOne<{ integrity_check?: string }>('PRAGMA integrity_check').catch(() => null);
+    sqliteIntegrity = check?.integrity_check || 'ok';
+  }
+  const [patientsCnt, visitsCnt, invoicesCnt, auditCnt, empCnt, userCnt, activeSessCnt] = await Promise.all([
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM patients'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM visits'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM invoices'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM audit_logs'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM hr_employees'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM users'),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM user_sessions WHERE revoked_at IS NULL AND expires_at > ?', [nowSql()]),
+  ]);
+  res.json({
+    dialect: cfg.dialect,
+    mysqlConfigured: cfg.mysqlConfigured,
+    sqliteFileBytes,
+    sqliteIntegrity,
+    lastBackupVerifiedAt: settings.lastBackupVerifiedAt,
+    lastBackupVerifiedBy: settings.lastBackupVerifiedBy,
+    tableCounts: {
+      patients: Number(patientsCnt?.cnt || 0),
+      visits: Number(visitsCnt?.cnt || 0),
+      invoices: Number(invoicesCnt?.cnt || 0),
+      auditLogs: Number(auditCnt?.cnt || 0),
+      hrEmployees: Number(empCnt?.cnt || 0),
+      users: Number(userCnt?.cnt || 0),
+      activeSessions: Number(activeSessCnt?.cnt || 0),
+    },
+  });
+});
+
+router.post('/admin/backup/verify', requireAuth, requirePermission('admin.user.manage', 'admin.backup.manage'), async (req: AuthRequest, res: Response) => {
+  const cfg = getDbConfigSummary();
+  const chain = await verifyAuditChain();
+  let integrityOk = true;
+  let integrityDetail = 'MySQL InnoDB engine active';
+  if (cfg.dialect === 'sqlite') {
+    const check = await queryOne<{ integrity_check?: string }>('PRAGMA integrity_check').catch(() => null);
+    integrityOk = (check?.integrity_check || 'ok') === 'ok';
+    integrityDetail = check?.integrity_check || 'ok';
+  }
+  const verifiedAt = nowSql();
+  const entries: Array<[string, string]> = [
+    ['last_backup_verified_at', verifiedAt],
+    ['last_backup_verified_by', req.user!.fullName],
+  ];
+  for (const [k, v] of entries) {
+    const existing = await queryOne('SELECT setting_key FROM system_settings WHERE setting_key = ?', [k]);
+    if (existing) {
+      await execute('UPDATE system_settings SET setting_value = ?, updated_by = ?, updated_at = ? WHERE setting_key = ?', [
+        v,
+        req.user!.id,
+        verifiedAt,
+        k,
+      ]);
+    } else {
+      await execute('INSERT INTO system_settings (setting_key, setting_value, updated_by, updated_at) VALUES (?, ?, ?, ?)', [
+        k,
+        v,
+        req.user!.id,
+        verifiedAt,
+      ]);
+    }
+  }
+  await writeAuditLog({
+    user: req.user,
+    action: 'admin.backup.verify',
+    entityType: 'system',
+    entityId: cfg.dialect,
+    after: { integrityOk, integrityDetail, auditChainValid: chain.valid, auditRows: chain.totalRows, verifiedAt },
+    req,
+  });
+  res.json({ ok: true, verifiedAt, integrityOk, integrityDetail, auditChain: chain });
 });
 
 router.get('/audit-logs', requireAuth, requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
@@ -6841,8 +9588,8 @@ router.get('/audit-logs', requireAuth, requirePermission('audit.read'), async (r
     sql += ' AND occurred_at <= ?';
     params.push(`${toDate} 23:59:59`);
   }
-  sql += ` ORDER BY id DESC LIMIT ${limit} OFFSET ${offset}`;
-  const logs = await query(sql, params);
+  sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
+  const logs = await query(sql, [...params, limit, offset]);
 
   const lastViewed = lastAuditViewByUser.get(req.user!.id) || 0;
   if (Date.now() - lastViewed > 60_000) {
@@ -6906,12 +9653,14 @@ router.get('/audit-logs/export', requireAuth, requirePermission('audit.read'), a
   res.send([header, ...lines].join('\n'));
 });
 
-router.get('/audit-logs/exceptions', requireAuth, requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
+router.get('/audit-logs/exceptions', requireAuth, auditAction({ action: 'audit.exceptions.viewed', entityType: 'audit_log', dedupeIfAudited: true }), requirePermission('audit.read'), async (req: AuthRequest, res: Response) => {
   const exceptions = await query(
     `SELECT * FROM audit_logs
      WHERE action IN (
-       'auth.login.failed', 'auth.2fa.failed', 'auth.password.changed',
-       'security.access_denied', 'security.segregation_violation_blocked', 'security.break_glass.access',
+       'auth.login.failed', 'auth.login.blocked_hr_offboarded', 'auth.2fa.failed', 'auth.password.changed', 'auth.password.reset_completed',
+       'security.access_denied', 'security.department_scope_denied', 'security.doctor_assignment_denied',
+       'security.segregation_violation_blocked', 'security.break_glass.access',
+       'hr.employee.terminated', 'hr.employee.resigned', 'hr.employee.inactive', 'hr.employee.rehired_pending_admin_review',
        'payment.gate.bypass', 'lab.result.amend', 'visit.reopen', 'patient.merge',
        'receipt.reprint', 'billing.approval.approved', 'billing.shift.close'
      )
@@ -6970,121 +9719,478 @@ router.get('/audit-logs/verify', requireAuth, requirePermission('audit.read'), a
 // ---------------------------------------------------------------------------
 // FULL ACCOUNTING LEDGER (CoA, Journals, Reversals, Periods, AR/AP, Expenses)
 // ---------------------------------------------------------------------------
-router.get('/accounting/overview', requireAuth, requirePermission('finance.report.view', 'accounting.ledger.manage', 'accounting.expense.create', 'accounting.expense.approve'), async (_req, res) => {
-  const [accounts, journals, journalLines, supplierBills, expenseVouchers, insuranceClaims, creditInvoices, periods, settings] = await Promise.all([
-    query<{ id: number; code: string; name: string; account_type: string; normal_balance: string; active: number }>(
-      'SELECT * FROM chart_of_accounts ORDER BY code ASC'
-    ),
-    query<Record<string, unknown>>(
-      `SELECT je.*, u.full_name AS posted_by_name
-       FROM journal_entries je
-       LEFT JOIN users u ON u.id = je.posted_by
-       ORDER BY je.id DESC LIMIT 80`
-    ),
-    query<{ entry_id: number; account_id: number; code: string; name: string; debit: number; credit: number; memo: string | null }>(
-      `SELECT jl.entry_id, jl.account_id, coa.code, coa.name, jl.debit, jl.credit, jl.memo
-       FROM journal_lines jl
-       INNER JOIN chart_of_accounts coa ON coa.id = jl.account_id`
-    ),
-    query<Record<string, unknown>>(
-      `SELECT sb.*, gr.grn_number
-       FROM supplier_bills sb
-       LEFT JOIN goods_receipts gr ON gr.id = sb.grn_id
-       ORDER BY sb.id DESC LIMIT 50`
-    ),
-    query<Record<string, unknown>>(
-      `SELECT ev.*, coa.code AS account_code, coa.name AS account_name,
-              u1.full_name AS requested_by_name, u2.full_name AS approved_by_name,
-              je.entry_number AS journal_entry_number
-       FROM expense_vouchers ev
-       INNER JOIN chart_of_accounts coa ON coa.id = ev.account_id
-       LEFT JOIN users u1 ON u1.id = ev.requested_by
-       LEFT JOIN users u2 ON u2.id = ev.approved_by
-       LEFT JOIN journal_entries je ON je.source_type = 'expense' AND je.source_id = ev.id
-       ORDER BY ev.id DESC LIMIT 50`
-    ),
-    query<Record<string, unknown>>(
-      `SELECT ic.*, i.invoice_number, p.mrn, p.first_name, p.last_name
-       FROM insurance_claims ic
-       INNER JOIN invoices i ON i.id = ic.invoice_id
-       INNER JOIN patients p ON p.id = ic.patient_id
-       ORDER BY ic.id DESC LIMIT 50`
-    ),
-    query<Record<string, unknown>>(
-      `SELECT i.id, i.invoice_number, i.payer_type, i.payer_name, i.total_amount, i.paid_amount, i.created_at,
-              p.mrn, p.first_name, p.last_name
-       FROM invoices i
-       INNER JOIN patients p ON p.id = i.patient_id
-       WHERE i.status = 'credit_billed'
-         AND i.id NOT IN (SELECT invoice_id FROM insurance_claims)
-       ORDER BY i.id DESC LIMIT 30`
-    ),
-    query(
-      `SELECT ap.*, u.full_name AS closed_by_name
-       FROM accounting_periods ap
-       LEFT JOIN users u ON u.id = ap.closed_by
-       ORDER BY ap.period_code DESC LIMIT 24`
-    ),
-    getClinicSettings(),
+router.get(
+  '/accounting/overview',
+  requireAuth,
+  requirePermission(
+    'finance.report.view',
+    'accounting.ledger.manage',
+    'accounting.expense.create',
+    'accounting.expense.approve',
+    'finance.coa.manage',
+    'finance.payroll.generate',
+    'finance.payment.manage',
+    'finance.receipt.manage',
+    'finance.bank.manage',
+    'finance.grv.manage'
+  ),
+  async (_req, res) => {
+    const [
+      accounts,
+      journals,
+      journalLines,
+      supplierBills,
+      expenseVouchers,
+      insuranceClaims,
+      creditInvoices,
+      periods,
+      settings,
+      payrollComponents,
+      cashBankAccounts,
+      cashBankTransfers,
+      financePayments,
+      financeReceipts,
+      grvs,
+      approvedHrSubmissions,
+      payrollRuns,
+      payrollItems,
+      hrEmployees,
+      storeItems,
+    ] = await Promise.all([
+      query<{
+        id: number;
+        code: string;
+        name: string;
+        account_type: string;
+        normal_balance: string;
+        active: number;
+        parent_id: number | null;
+        description: string | null;
+        tx_count: number;
+      }>(
+        `SELECT coa.*,
+                (SELECT COUNT(*) FROM journal_lines jl WHERE jl.account_id = coa.id) +
+                (SELECT COUNT(*) FROM expense_vouchers ev WHERE ev.account_id = coa.id) +
+                (SELECT COUNT(*) FROM chart_of_accounts ch WHERE ch.parent_id = coa.id) AS tx_count
+         FROM chart_of_accounts coa
+         ORDER BY coa.code ASC`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT je.*, u.full_name AS posted_by_name
+         FROM journal_entries je
+         LEFT JOIN users u ON u.id = je.posted_by
+         ORDER BY je.id DESC LIMIT 100`
+      ),
+      query<{ entry_id: number; account_id: number; code: string; name: string; debit: number; credit: number; memo: string | null }>(
+        `SELECT jl.entry_id, jl.account_id, coa.code, coa.name, jl.debit, jl.credit, jl.memo
+         FROM journal_lines jl
+         INNER JOIN chart_of_accounts coa ON coa.id = jl.account_id`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT sb.*, gr.grn_number
+         FROM supplier_bills sb
+         LEFT JOIN goods_receipts gr ON gr.id = sb.grn_id
+         ORDER BY sb.id DESC LIMIT 60`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT ev.*, coa.code AS account_code, coa.name AS account_name,
+                u1.full_name AS requested_by_name, u2.full_name AS approved_by_name,
+                je.entry_number AS journal_entry_number,
+                cba.account_name AS cash_bank_account_name
+         FROM expense_vouchers ev
+         INNER JOIN chart_of_accounts coa ON coa.id = ev.account_id
+         LEFT JOIN users u1 ON u1.id = ev.requested_by
+         LEFT JOIN users u2 ON u2.id = ev.approved_by
+         LEFT JOIN journal_entries je ON je.source_type = 'expense' AND je.source_id = ev.id
+         LEFT JOIN finance_cash_bank_accounts cba ON cba.id = ev.cash_bank_account_id
+         ORDER BY ev.id DESC LIMIT 80`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT ic.*, i.invoice_number, p.mrn, p.first_name, p.last_name
+         FROM insurance_claims ic
+         INNER JOIN invoices i ON i.id = ic.invoice_id
+         INNER JOIN patients p ON p.id = ic.patient_id
+         ORDER BY ic.id DESC LIMIT 50`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT i.id, i.invoice_number, i.payer_type, i.payer_name, i.total_amount, i.paid_amount, i.created_at,
+                p.mrn, p.first_name, p.last_name
+         FROM invoices i
+         INNER JOIN patients p ON p.id = i.patient_id
+         WHERE i.status = 'credit_billed'
+           AND i.id NOT IN (SELECT invoice_id FROM insurance_claims)
+         ORDER BY i.id DESC LIMIT 30`
+      ),
+      query(
+        `SELECT ap.*, u.full_name AS closed_by_name
+         FROM accounting_periods ap
+         LEFT JOIN users u ON u.id = ap.closed_by
+         ORDER BY ap.period_code DESC LIMIT 24`
+      ),
+      getClinicSettings(),
+      query('SELECT * FROM payroll_components ORDER BY component_type ASC, code ASC'),
+      query('SELECT * FROM finance_cash_bank_accounts ORDER BY account_type ASC, id ASC'),
+      query(
+        `SELECT t.*, f.account_name AS from_account_name, toAcc.account_name AS to_account_name,
+                u.full_name AS created_by_name, je.entry_number AS journal_entry_number
+         FROM finance_cash_bank_transfers t
+         INNER JOIN finance_cash_bank_accounts f ON f.id = t.from_account_id
+         INNER JOIN finance_cash_bank_accounts toAcc ON toAcc.id = t.to_account_id
+         LEFT JOIN users u ON u.id = t.created_by
+         LEFT JOIN journal_entries je ON je.id = t.journal_entry_id
+         ORDER BY t.id DESC LIMIT 60`
+      ),
+      query(
+        `SELECT fp.*, cba.account_name AS cash_bank_account_name, u.full_name AS created_by_name,
+                je.entry_number AS journal_entry_number
+         FROM finance_payments fp
+         INNER JOIN finance_cash_bank_accounts cba ON cba.id = fp.cash_bank_account_id
+         LEFT JOIN users u ON u.id = fp.created_by
+         LEFT JOIN journal_entries je ON je.id = fp.journal_entry_id
+         ORDER BY fp.id DESC LIMIT 100`
+      ),
+      query(
+        `SELECT fr.*, cba.account_name AS cash_bank_account_name, u.full_name AS created_by_name,
+                je.entry_number AS journal_entry_number
+         FROM finance_receipts fr
+         INNER JOIN finance_cash_bank_accounts cba ON cba.id = fr.cash_bank_account_id
+         LEFT JOIN users u ON u.id = fr.created_by
+         LEFT JOIN journal_entries je ON je.id = fr.journal_entry_id
+         ORDER BY fr.id DESC LIMIT 100`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT gr.*, u1.full_name AS received_by_name, u2.full_name AS approved_by_name,
+                sb.bill_number, sb.status AS bill_status, sb.paid_amount AS bill_paid_amount
+         FROM goods_receipts gr
+         LEFT JOIN users u1 ON u1.id = gr.received_by
+         LEFT JOIN users u2 ON u2.id = gr.approved_by
+         LEFT JOIN supplier_bills sb ON sb.grn_id = gr.id
+         ORDER BY gr.id DESC LIMIT 60`
+      ),
+      query(
+        `SELECT hms.*, u.full_name AS submitted_by_name
+         FROM hr_monthly_submissions hms
+         LEFT JOIN users u ON u.id = hms.submitted_by
+         ORDER BY hms.pay_month DESC LIMIT 24`
+      ),
+      query<Record<string, unknown>>(
+        `SELECT pr.*, je.entry_number AS journal_entry_number, pje.entry_number AS payment_journal_entry_number,
+                u.full_name AS created_by_name, uv.full_name AS verified_by_name,
+                ua.full_name AS approved_by_name, up.full_name AS paid_by_name
+         FROM payroll_runs pr
+         LEFT JOIN journal_entries je ON je.id = pr.journal_entry_id
+         LEFT JOIN journal_entries pje ON pje.id = pr.payment_journal_entry_id
+         LEFT JOIN users u ON u.id = pr.created_by
+         LEFT JOIN users uv ON uv.id = pr.verified_by
+         LEFT JOIN users ua ON ua.id = pr.approved_by
+         LEFT JOIN users up ON up.id = pr.paid_by
+         ORDER BY pr.id DESC LIMIT 24`
+      ),
+      query<Record<string, unknown>>('SELECT * FROM payroll_items ORDER BY id ASC'),
+      query(
+        `SELECT id, employee_number, full_name, department_name, job_position, basic_salary, housing_allowance, status
+         FROM hr_employees
+         WHERE status = 'active'
+         ORDER BY employee_number ASC`
+      ),
+      query('SELECT id, code, name, category, unit, unit_cost FROM store_items ORDER BY name ASC'),
+    ]);
+
+    const acctById = new Map(accounts.map((a) => [a.id, a]));
+    const enrichedAccounts = accounts.map((a) => {
+      const parent = a.parent_id ? acctById.get(a.parent_id) : null;
+      return {
+        ...a,
+        parent_code: parent?.code || null,
+        parent_name: parent?.name || null,
+      };
+    });
+
+    const linesByEntry = new Map<number, typeof journalLines>();
+    const totalsByAccount = new Map<number, { debit: number; credit: number }>();
+    for (const ln of journalLines) {
+      if (!linesByEntry.has(ln.entry_id)) linesByEntry.set(ln.entry_id, []);
+      linesByEntry.get(ln.entry_id)!.push(ln);
+
+      if (!totalsByAccount.has(ln.account_id)) totalsByAccount.set(ln.account_id, { debit: 0, credit: 0 });
+      const t = totalsByAccount.get(ln.account_id)!;
+      t.debit = Number((t.debit + Number(ln.debit || 0)).toFixed(2));
+      t.credit = Number((t.credit + Number(ln.credit || 0)).toFixed(2));
+    }
+    for (const je of journals) {
+      je.lines = linesByEntry.get(Number(je.id)) || [];
+    }
+
+    const trialBalance = enrichedAccounts.map((a) => {
+      const t = totalsByAccount.get(a.id) || { debit: 0, credit: 0 };
+      const net = a.normal_balance === 'debit' ? Number((t.debit - t.credit).toFixed(2)) : Number((t.credit - t.debit).toFixed(2));
+      return {
+        ...a,
+        debit_total: t.debit,
+        credit_total: t.credit,
+        net_balance: net,
+      };
+    });
+
+    const revenues = trialBalance.filter((a) => a.account_type === 'revenue' && a.net_balance !== 0);
+    const expenses = trialBalance.filter((a) => a.account_type === 'expense' && a.net_balance !== 0);
+    const totalRevenue = Number(revenues.reduce((s, r) => s + r.net_balance, 0).toFixed(2));
+    const totalExpenses = Number(expenses.reduce((s, e) => s + e.net_balance, 0).toFixed(2));
+    const currentNetIncome = Number((totalRevenue - totalExpenses).toFixed(2));
+
+    const assets = trialBalance.filter((a) => a.account_type === 'asset' && a.net_balance !== 0);
+    const liabilities = trialBalance.filter((a) => a.account_type === 'liability' && a.net_balance !== 0);
+    const equity = trialBalance.filter((a) => a.account_type === 'equity' && a.net_balance !== 0);
+    const totalAssets = Number(assets.reduce((s, a) => s + a.net_balance, 0).toFixed(2));
+    const totalLiabilities = Number(liabilities.reduce((s, l) => s + l.net_balance, 0).toFixed(2));
+    const equityAccountsTotal = Number(equity.reduce((s, eq) => s + eq.net_balance, 0).toFixed(2));
+    const totalEquity = Number((equityAccountsTotal + currentNetIncome).toFixed(2));
+    const totalLiabilitiesAndEquity = Number((totalLiabilities + totalEquity).toFixed(2));
+
+    const itemsByRun = new Map<number, Record<string, unknown>[]>();
+    for (const pi of payrollItems) {
+      const k = Number(pi.payroll_run_id);
+      if (!itemsByRun.has(k)) itemsByRun.set(k, []);
+      itemsByRun.get(k)!.push(pi);
+    }
+    for (const run of payrollRuns) {
+      run.items = itemsByRun.get(Number(run.id)) || [];
+    }
+
+    const grnItemsRaw = await query<{ grn_id: number; name: string; quantity: number; batch_number: string; expiry_date: string; unit_cost: number }>(
+      `SELECT gi.grn_id, si.name, gi.quantity, gi.batch_number, gi.expiry_date, gi.unit_cost
+       FROM grn_items gi
+       INNER JOIN store_items si ON si.id = gi.item_id
+       ORDER BY gi.id ASC`
+    );
+    const itemsByGrn = new Map<number, string[]>();
+    for (const gi of grnItemsRaw) {
+      const gid = Number(gi.grn_id);
+      if (!itemsByGrn.has(gid)) itemsByGrn.set(gid, []);
+      itemsByGrn.get(gid)!.push(`${gi.name} (${gi.quantity} × $${Number(gi.unit_cost).toFixed(2)})`);
+    }
+    for (const g of grvs as Array<Record<string, unknown>>) {
+      g.items_summary = (itemsByGrn.get(Number(g.id)) || []).join(', ');
+    }
+
+    const nowMs = Date.now();
+    for (const clm of insuranceClaims) {
+      const subMs = new Date(String(clm.submitted_at)).getTime();
+      const ageDays = Math.max(0, Math.floor((nowMs - subMs) / 86400000));
+      clm.age_days = ageDays;
+      clm.age_bucket = ageDays <= 30 ? '0-30d' : ageDays <= 60 ? '31-60d' : ageDays <= 90 ? '61-90d' : '90+d';
+    }
+
+    res.json({
+      accounts: enrichedAccounts,
+      journals,
+      trialBalance,
+      incomeStatement: {
+        revenues,
+        expenses,
+        totalRevenue,
+        totalExpenses,
+        netIncome: currentNetIncome,
+      },
+      balanceSheet: {
+        assets,
+        liabilities,
+        equity,
+        currentNetIncome,
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        totalLiabilitiesAndEquity,
+        balanced: Math.abs(totalAssets - totalLiabilitiesAndEquity) < 0.05,
+      },
+      supplierBills,
+      expenseVouchers,
+      insuranceClaims,
+      unclaimedCreditInvoices: creditInvoices,
+      periods,
+      expenseAutoPostLimit: settings.expenseAutoPostLimit,
+      payrollComponents,
+      cashBankAccounts,
+      cashBankTransfers,
+      financePayments,
+      financeReceipts,
+      grvs,
+      approvedHrSubmissions,
+      payrollRuns,
+      hrEmployees,
+      storeItems,
+    });
+  }
+);
+
+router.post('/accounting/accounts', requireAuth, requirePermission('finance.coa.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const { code, name, account_type, normal_balance, parent_id, description } = req.body || {};
+  const cleanCode = String(code || '').trim();
+  const cleanName = String(name || '').trim();
+  if (!cleanCode || !cleanName || !['asset', 'liability', 'equity', 'revenue', 'expense'].includes(String(account_type))) {
+    return res.status(400).json({ error: 'Valid account code, name, and category (asset/liability/equity/revenue/expense) are required.' });
+  }
+  const dup = await queryOne('SELECT id FROM chart_of_accounts WHERE code = ?', [cleanCode]);
+  if (dup) return res.status(409).json({ error: `Account code ${cleanCode} already exists.` });
+  const normal =
+    normal_balance && ['debit', 'credit'].includes(String(normal_balance))
+      ? String(normal_balance)
+      : ['asset', 'expense'].includes(String(account_type))
+        ? 'debit'
+        : 'credit';
+
+  const ins = await execute(
+    'INSERT INTO chart_of_accounts (code, name, account_type, normal_balance, parent_id, description, active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+    [cleanCode, cleanName, account_type, normal, parent_id ? Number(parent_id) : null, description?.trim() || null]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.coa.create',
+    entityType: 'chart_of_account',
+    entityId: ins.insertId,
+    after: { code: cleanCode, name: cleanName, account_type, normal_balance: normal, parent_id: parent_id || null },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId, code: cleanCode });
+});
+
+router.put('/accounting/accounts/:id', requireAuth, requirePermission('finance.coa.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const acct = await queryOne<{ id: number; code: string; name: string }>('SELECT id, code, name FROM chart_of_accounts WHERE id = ?', [id]);
+  if (!acct) return res.status(404).json({ error: 'Account not found.' });
+  const { name, account_type, normal_balance, parent_id, description, active } = req.body || {};
+  if (parent_id && Number(parent_id) === id) {
+    return res.status(400).json({ error: 'Account cannot be its own parent.' });
+  }
+  await execute(
+    `UPDATE chart_of_accounts
+     SET name = COALESCE(?, name),
+         account_type = COALESCE(?, account_type),
+         normal_balance = COALESCE(?, normal_balance),
+         parent_id = ?,
+         description = COALESCE(?, description),
+         active = COALESCE(?, active)
+     WHERE id = ?`,
+    [
+      name?.trim() || null,
+      account_type || null,
+      normal_balance || null,
+      parent_id !== undefined ? (parent_id ? Number(parent_id) : null) : null,
+      description !== undefined ? (description?.trim() || null) : null,
+      active !== undefined ? (active ? 1 : 0) : null,
+      id,
+    ]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.coa.update',
+    entityType: 'chart_of_account',
+    entityId: id,
+    after: { name, account_type, normal_balance, parent_id, active },
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.patch('/accounting/accounts/:id/toggle', requireAuth, requirePermission('finance.coa.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const acct = await queryOne<{ id: number; code: string; active: number }>('SELECT id, code, active FROM chart_of_accounts WHERE id = ?', [id]);
+  if (!acct) return res.status(404).json({ error: 'Account not found.' });
+  const nextActive = acct.active ? 0 : 1;
+  await execute('UPDATE chart_of_accounts SET active = ? WHERE id = ?', [nextActive, id]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.coa.toggle',
+    entityType: 'chart_of_account',
+    entityId: id,
+    after: { code: acct.code, active: nextActive },
+    req,
+  });
+  res.json({ ok: true, active: nextActive });
+});
+
+router.delete('/accounting/accounts/:id', requireAuth, requirePermission('finance.coa.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const acct = await queryOne<{ id: number; code: string; name: string }>('SELECT id, code, name FROM chart_of_accounts WHERE id = ?', [id]);
+  if (!acct) return res.status(404).json({ error: 'Account not found.' });
+
+  const [jlCnt, evCnt, childCnt, cbCnt] = await Promise.all([
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM journal_lines WHERE account_id = ?', [id]),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM expense_vouchers WHERE account_id = ?', [id]),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM chart_of_accounts WHERE parent_id = ?', [id]),
+    queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM finance_cash_bank_accounts WHERE coa_code = ?', [acct.code]),
   ]);
-
-  const linesByEntry = new Map<number, typeof journalLines>();
-  const totalsByAccount = new Map<number, { debit: number; credit: number }>();
-  for (const ln of journalLines) {
-    if (!linesByEntry.has(ln.entry_id)) linesByEntry.set(ln.entry_id, []);
-    linesByEntry.get(ln.entry_id)!.push(ln);
-
-    if (!totalsByAccount.has(ln.account_id)) totalsByAccount.set(ln.account_id, { debit: 0, credit: 0 });
-    const t = totalsByAccount.get(ln.account_id)!;
-    t.debit = Number((t.debit + Number(ln.debit || 0)).toFixed(2));
-    t.credit = Number((t.credit + Number(ln.credit || 0)).toFixed(2));
-  }
-  for (const je of journals) {
-    je.lines = linesByEntry.get(Number(je.id)) || [];
+  if (Number(jlCnt?.cnt || 0) > 0 || Number(evCnt?.cnt || 0) > 0 || Number(childCnt?.cnt || 0) > 0 || Number(cbCnt?.cnt || 0) > 0) {
+    return res.status(409).json({
+      error: `Cannot delete account ${acct.code}: it is referenced by posted journals, expenses, cash/bank accounts, or child accounts. Deactivate it instead.`,
+    });
   }
 
-  const trialBalance = accounts.map((a) => {
-    const t = totalsByAccount.get(a.id) || { debit: 0, credit: 0 };
-    const net = a.normal_balance === 'debit' ? Number((t.debit - t.credit).toFixed(2)) : Number((t.credit - t.debit).toFixed(2));
-    return {
-      ...a,
-      debit_total: t.debit,
-      credit_total: t.credit,
-      net_balance: net,
-    };
+  await execute('DELETE FROM chart_of_accounts WHERE id = ?', [id]);
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.coa.delete',
+    entityType: 'chart_of_account',
+    entityId: id,
+    before: acct,
+    req,
   });
+  res.json({ ok: true });
+});
 
-  const revenues = trialBalance.filter((a) => a.account_type === 'revenue' && a.net_balance !== 0);
-  const expenses = trialBalance.filter((a) => a.account_type === 'expense' && a.net_balance !== 0);
-  const totalRevenue = Number(revenues.reduce((s, r) => s + r.net_balance, 0).toFixed(2));
-  const totalExpenses = Number(expenses.reduce((s, e) => s + e.net_balance, 0).toFixed(2));
-
-  const nowMs = Date.now();
-  for (const clm of insuranceClaims) {
-    const subMs = new Date(String(clm.submitted_at)).getTime();
-    const ageDays = Math.max(0, Math.floor((nowMs - subMs) / 86400000));
-    clm.age_days = ageDays;
-    clm.age_bucket = ageDays <= 30 ? '0-30d' : ageDays <= 60 ? '31-60d' : ageDays <= 90 ? '61-90d' : '90+d';
+router.post('/accounting/payroll-components', requireAuth, requirePermission('finance.payroll.generate', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const { code, name, component_type, calc_method = 'fixed', default_value = 0, account_code = '5100', is_recurring = true, is_taxable = true, is_pensionable = false } = req.body || {};
+  const cleanCode = String(code || '').trim().toUpperCase();
+  const cleanName = String(name || '').trim();
+  if (!cleanCode || !cleanName || !['earning', 'deduction'].includes(String(component_type))) {
+    return res.status(400).json({ error: 'Code, name, and component_type (earning/deduction) are required.' });
   }
+  const existing = await queryOne('SELECT id FROM payroll_components WHERE code = ?', [cleanCode]);
+  if (existing) return res.status(409).json({ error: `Payroll component ${cleanCode} already exists.` });
 
-  res.json({
-    accounts,
-    journals,
-    trialBalance,
-    incomeStatement: {
-      revenues,
-      expenses,
-      totalRevenue,
-      totalExpenses,
-      netIncome: Number((totalRevenue - totalExpenses).toFixed(2)),
-    },
-    supplierBills,
-    expenseVouchers,
-    insuranceClaims,
-    unclaimedCreditInvoices: creditInvoices,
-    periods,
-    expenseAutoPostLimit: settings.expenseAutoPostLimit,
+  const ins = await execute(
+    `INSERT INTO payroll_components (code, name, component_type, calc_method, default_value, account_code, is_recurring, is_taxable, is_pensionable, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    [cleanCode, cleanName, component_type, calc_method, Number(default_value || 0), account_code, is_recurring ? 1 : 0, is_taxable ? 1 : 0, is_pensionable ? 1 : 0]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.payroll_component.create',
+    entityType: 'payroll_component',
+    entityId: ins.insertId,
+    after: { code: cleanCode, name: cleanName, component_type, account_code },
+    req,
   });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.put('/accounting/payroll-components/:id', requireAuth, requirePermission('finance.payroll.generate', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { name, calc_method, default_value, account_code, is_recurring, is_taxable, is_pensionable, active } = req.body || {};
+  await execute(
+    `UPDATE payroll_components
+     SET name = COALESCE(?, name),
+         calc_method = COALESCE(?, calc_method),
+         default_value = COALESCE(?, default_value),
+         account_code = COALESCE(?, account_code),
+         is_recurring = COALESCE(?, is_recurring),
+         is_taxable = COALESCE(?, is_taxable),
+         is_pensionable = COALESCE(?, is_pensionable),
+         active = COALESCE(?, active)
+     WHERE id = ?`,
+    [
+      name?.trim() || null,
+      calc_method || null,
+      default_value !== undefined ? Number(default_value) : null,
+      account_code || null,
+      is_recurring !== undefined ? (is_recurring ? 1 : 0) : null,
+      is_taxable !== undefined ? (is_taxable ? 1 : 0) : null,
+      is_pensionable !== undefined ? (is_pensionable ? 1 : 0) : null,
+      active !== undefined ? (active ? 1 : 0) : null,
+      id,
+    ]
+  );
+  res.json({ ok: true });
 });
 
 router.post('/accounting/periods/close', requireAuth, requirePermission('accounting.period.manage'), async (req: AuthRequest, res: Response) => {
@@ -7150,9 +10256,11 @@ router.post('/accounting/journal', requireAuth, requirePermission('accounting.le
       });
       return je;
     });
+    broadcastClinicEvent('finance:updated', { type: 'journal', entryNumber: posted.entryNumber });
     res.status(201).json(posted);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    const status = (err as Error & { status?: number }).status || 400;
+    res.status(status).json({ error: (err as Error).message });
   }
 });
 
@@ -7218,6 +10326,7 @@ router.post('/accounting/journals/:id/reverse', requireAuth, requirePermission('
   });
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'journal_reversal', entryId: result.entryId });
   res.status(201).json(result);
 });
 
@@ -7386,6 +10495,9 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
     amount,
     payment_method = 'bank_transfer',
     description,
+    reference_number,
+    attachment_ref,
+    cash_bank_account_id,
     auto_post = true,
   } = req.body || {};
   const amt = Number(Number(amount || 0).toFixed(2));
@@ -7405,6 +10517,26 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
 
   const settings = await getClinicSettings();
   const voucherDate = expense_date ? String(expense_date).slice(0, 10) : await getClinicToday();
+  try {
+    await assertOpenAccountingPeriod(voucherDate);
+  } catch (err) {
+    return res.status((err as Error & { status?: number }).status || 409).json({ error: (err as Error).message });
+  }
+
+  let cbAcct: { id: number; coa_code: string; account_name: string } | null = null;
+  if (cash_bank_account_id) {
+    cbAcct = await queryOne<{ id: number; coa_code: string; account_name: string }>(
+      'SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE id = ? AND active = 1',
+      [Number(cash_bank_account_id)]
+    );
+  } else {
+    const targetCoa = payment_method === 'cash' ? '1010' : '1020';
+    cbAcct = await queryOne<{ id: number; coa_code: string; account_name: string }>(
+      'SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE coa_code = ? AND active = 1 ORDER BY id ASC LIMIT 1',
+      [targetCoa]
+    );
+  }
+
   const canApproveOwnUnderLimit = amt <= settings.expenseAutoPostLimit && hasPermission(req.user!, 'accounting.ledger.manage');
   const hasExplicitApprove = hasPermission(req.user!, 'accounting.expense.approve');
   const shouldAutoPost = auto_post !== false && (canApproveOwnUnderLimit || (hasExplicitApprove && amt <= settings.expenseAutoPostLimit));
@@ -7413,8 +10545,8 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
     const voucherNumber = await nextSequence('EXP');
     const status = shouldAutoPost ? 'paid' : 'pending';
     const inserted = await execute(
-      `INSERT INTO expense_vouchers (voucher_number, expense_date, category, account_id, payee_name, amount, payment_method, description, status, requested_by, approved_by, paid_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO expense_vouchers (voucher_number, expense_date, category, account_id, payee_name, amount, paid_amount, payment_method, cash_bank_account_id, reference_number, attachment_ref, description, status, requested_by, approved_by, paid_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         voucherNumber,
         voucherDate,
@@ -7422,7 +10554,11 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
         acct.id,
         payee_name.trim(),
         amt,
+        shouldAutoPost ? amt : 0,
         payment_method,
+        cbAcct?.id || null,
+        reference_number?.trim() || null,
+        attachment_ref?.trim() || null,
         description.trim(),
         status,
         req.user!.id,
@@ -7434,6 +10570,7 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
     let entryNumber: string | null = null;
     let journalEntryId: number | null = null;
     if (shouldAutoPost) {
+      const creditCode = cbAcct?.coa_code || (payment_method === 'cash' ? '1010' : '1020');
       const je = await postJournalEntry({
         entryDate: voucherDate,
         sourceType: 'expense',
@@ -7443,14 +10580,24 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
         lines: [
           { accountCode: acct.code, debit: amt, memo: description.trim() },
           {
-            accountCode: payment_method === 'cash' ? '1010' : '1020',
+            accountCode: creditCode,
             credit: amt,
-            memo: `${voucherNumber} · ${payment_method === 'cash' ? 'Petty Cash' : 'Operating Bank'}`,
+            memo: `${voucherNumber} · ${cbAcct?.account_name || (payment_method === 'cash' ? 'Petty Cash' : 'Operating Bank')}`,
           },
         ],
       });
       entryNumber = je.entryNumber;
       journalEntryId = je.entryId;
+
+      if (cbAcct) {
+        await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [amt, cbAcct.id]);
+        const fpNum = await nextSequence('FPV');
+        await execute(
+          `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, attachment_ref, linked_type, linked_id, notes, journal_entry_id, created_by)
+           VALUES (?, ?, 'expense', ?, ?, ?, ?, ?, ?, 'expense', ?, ?, ?, ?)`,
+          [fpNum, voucherDate, payee_name.trim(), cbAcct.id, payment_method, amt, reference_number?.trim() || voucherNumber, attachment_ref?.trim() || null, inserted.insertId, description.trim(), je.entryId, req.user!.id]
+        );
+      }
     } else {
       await createNotification({
         targetRole: 'MGR',
@@ -7483,23 +10630,28 @@ router.post('/accounting/expenses', requireAuth, requirePermission('accounting.l
     return { id: inserted.insertId, voucherNumber, status, entryNumber, journalEntryId };
   });
 
+  broadcastClinicEvent('finance:updated', { type: 'expense', voucherNumber: created.voucherNumber });
   res.status(201).json(created);
 });
 
 router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('accounting.expense.approve', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
   const id = Number(req.params.id);
-  const { decision } = req.body || {};
-  if (!['paid', 'rejected'].includes(decision)) {
-    return res.status(400).json({ error: 'Decision must be paid (approve & post) or rejected.' });
+  const { decision, cash_bank_account_id } = req.body || {};
+  if (!['approved', 'paid', 'rejected'].includes(decision)) {
+    return res.status(400).json({ error: 'Decision must be approved, paid (approve & pay immediately), or rejected.' });
   }
 
   const result = await withTransaction(async () => {
     const ev = await queryOne<{
       id: number;
       voucher_number: string;
+      expense_date: string;
       payee_name: string;
       amount: number;
       payment_method: string;
+      cash_bank_account_id: number | null;
+      reference_number: string | null;
+      attachment_ref: string | null;
       description: string;
       status: string;
       requested_by: number;
@@ -7515,26 +10667,65 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
     if (ev.status !== 'pending') return { ok: false as const, error: 'Expense voucher already processed.', httpStatus: 409 };
     assertDifferentUser(req.user!.id, ev.requested_by, 'approve or reject an expense voucher you created');
 
-    await execute('UPDATE expense_vouchers SET status = ?, approved_by = ?, paid_at = ? WHERE id = ?', [
-      decision,
-      req.user!.id,
-      nowSql(),
-      id,
-    ]);
+    await assertOpenAccountingPeriod(ev.expense_date || (await getClinicToday()));
 
     let entryNumber: string | null = null;
-    if (decision === 'paid') {
+    if (decision === 'rejected') {
+      await execute("UPDATE expense_vouchers SET status = 'rejected', approved_by = ? WHERE id = ?", [req.user!.id, id]);
+    } else if (decision === 'approved') {
       const je = await postJournalEntry({
+        entryDate: ev.expense_date,
+        sourceType: 'expense',
+        sourceId: id,
+        description: `Approved Expense Payable ${ev.voucher_number}: ${ev.payee_name}`,
+        postedBy: req.user!.id,
+        lines: [
+          { accountCode: ev.account_code, debit: Number(ev.amount), memo: ev.description },
+          { accountCode: '2100', credit: Number(ev.amount), memo: `${ev.voucher_number} payable` },
+        ],
+      });
+      entryNumber = je.entryNumber;
+      await execute("UPDATE expense_vouchers SET status = 'approved', approved_by = ? WHERE id = ?", [req.user!.id, id]);
+    } else {
+      const cbId = cash_bank_account_id ? Number(cash_bank_account_id) : ev.cash_bank_account_id;
+      let cbAcct = cbId
+        ? await queryOne<{ id: number; coa_code: string; account_name: string }>('SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE id = ? AND active = 1', [cbId])
+        : null;
+      if (!cbAcct) {
+        cbAcct = await queryOne<{ id: number; coa_code: string; account_name: string }>(
+          'SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE coa_code = ? AND active = 1 ORDER BY id ASC LIMIT 1',
+          [ev.payment_method === 'cash' ? '1010' : '1020']
+        );
+      }
+      const creditCode = cbAcct?.coa_code || (ev.payment_method === 'cash' ? '1010' : '1020');
+      const je = await postJournalEntry({
+        entryDate: ev.expense_date,
         sourceType: 'expense',
         sourceId: id,
         description: `Expense ${ev.voucher_number}: ${ev.payee_name}`,
         postedBy: req.user!.id,
         lines: [
           { accountCode: ev.account_code, debit: Number(ev.amount), memo: ev.description },
-          { accountCode: ev.payment_method === 'cash' ? '1010' : '1020', credit: Number(ev.amount), memo: ev.voucher_number },
+          { accountCode: creditCode, credit: Number(ev.amount), memo: ev.voucher_number },
         ],
       });
       entryNumber = je.entryNumber;
+      await execute("UPDATE expense_vouchers SET status = 'paid', paid_amount = ?, cash_bank_account_id = ?, approved_by = ?, paid_at = ? WHERE id = ?", [
+        Number(ev.amount),
+        cbAcct?.id || null,
+        req.user!.id,
+        nowSql(),
+        id,
+      ]);
+      if (cbAcct) {
+        await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [Number(ev.amount), cbAcct.id]);
+        const fpNum = await nextSequence('FPV');
+        await execute(
+          `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, attachment_ref, linked_type, linked_id, notes, journal_entry_id, created_by)
+           VALUES (?, ?, 'expense', ?, ?, ?, ?, ?, ?, 'expense', ?, ?, ?, ?)`,
+          [fpNum, ev.expense_date, ev.payee_name, cbAcct.id, ev.payment_method, Number(ev.amount), ev.reference_number || ev.voucher_number, ev.attachment_ref, id, ev.description, je.entryId, req.user!.id]
+        );
+      }
     }
 
     await writeAuditLog({
@@ -7549,7 +10740,608 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
   });
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'expense_decide', id });
   res.json(result);
+});
+
+router.post('/accounting/expenses/:id/pay', requireAuth, requirePermission('finance.payment.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { amount, cash_bank_account_id, payment_method = 'bank_transfer', payment_date, reference_no, notes } = req.body || {};
+  const payAmt = Number(Number(amount || 0).toFixed(2));
+  if (payAmt <= 0) return res.status(400).json({ error: 'Positive payment amount is required.' });
+  const payDate = payment_date ? String(payment_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(payDate);
+    const ev = await queryOne<{
+      id: number;
+      voucher_number: string;
+      payee_name: string;
+      amount: number;
+      paid_amount: number;
+      status: string;
+      description: string;
+    }>('SELECT * FROM expense_vouchers WHERE id = ?', [id]);
+    if (!ev) return { ok: false as const, error: 'Expense voucher not found.', httpStatus: 404 };
+    if (!['approved', 'partial'].includes(ev.status)) {
+      return { ok: false as const, error: `Expense voucher must be approved before disbursement (current: ${ev.status}).`, httpStatus: 409 };
+    }
+    const remaining = Number((Number(ev.amount) - Number(ev.paid_amount || 0)).toFixed(2));
+    if (remaining <= 0) return { ok: false as const, error: 'Expense voucher is already fully paid.', httpStatus: 409 };
+    const actualPay = Math.min(payAmt, remaining);
+
+    let cbAcct = cash_bank_account_id
+      ? await queryOne<{ id: number; coa_code: string; account_name: string }>('SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE id = ? AND active = 1', [Number(cash_bank_account_id)])
+      : null;
+    if (!cbAcct) {
+      cbAcct = await queryOne<{ id: number; coa_code: string; account_name: string }>(
+        'SELECT id, coa_code, account_name FROM finance_cash_bank_accounts WHERE coa_code = ? AND active = 1 ORDER BY id ASC LIMIT 1',
+        [payment_method === 'cash' ? '1010' : '1020']
+      );
+    }
+    if (!cbAcct) return { ok: false as const, error: 'Active Cash/Bank account not found.', httpStatus: 400 };
+
+    const nextPaid = Number((Number(ev.paid_amount || 0) + actualPay).toFixed(2));
+    const nextStatus = nextPaid >= Number(ev.amount) - 0.01 ? 'paid' : 'partial';
+
+    const je = await postJournalEntry({
+      entryDate: payDate,
+      sourceType: 'expense_payment',
+      sourceId: id,
+      description: `Expense Disbursement ${ev.voucher_number} (${ev.payee_name})`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: '2100', debit: actualPay, memo: `Settle ${ev.voucher_number}` },
+        { accountCode: cbAcct.coa_code, credit: actualPay, memo: cbAcct.account_name },
+      ],
+    });
+
+    await execute('UPDATE expense_vouchers SET paid_amount = ?, status = ?, cash_bank_account_id = ?, paid_at = ? WHERE id = ?', [
+      nextPaid,
+      nextStatus,
+      cbAcct.id,
+      nowSql(),
+      id,
+    ]);
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [actualPay, cbAcct.id]);
+
+    const fpNum = await nextSequence('FPV');
+    await execute(
+      `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, linked_type, linked_id, notes, journal_entry_id, created_by)
+       VALUES (?, ?, 'expense', ?, ?, ?, ?, ?, 'expense', ?, ?, ?, ?)`,
+      [fpNum, payDate, ev.payee_name, cbAcct.id, payment_method, actualPay, reference_no?.trim() || ev.voucher_number, id, notes?.trim() || ev.description, je.entryId, req.user!.id]
+    );
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'accounting.expense.pay',
+      entityType: 'expense_voucher',
+      entityId: id,
+      after: { voucherNumber: ev.voucher_number, paid: actualPay, status: nextStatus, paymentNumber: fpNum, entryNumber: je.entryNumber },
+      req,
+    });
+    return { ok: true as const, paid: actualPay, status: nextStatus, paymentNumber: fpNum, entryNumber: je.entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'expense_pay', id });
+  res.json(result);
+});
+
+router.post('/accounting/grvs', requireAuth, requirePermission('finance.grv.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const {
+    supplier_name,
+    invoice_ref,
+    delivery_date,
+    received_date,
+    department_name = 'Main Store',
+    attachment_ref,
+    notes,
+    approve_immediately = true,
+    item_id,
+    new_item_name,
+    new_item_category = 'consumable',
+    batch_number,
+    expiry_date,
+    quantity,
+    unit_cost,
+  } = req.body || {};
+
+  const qty = Number(quantity || 0);
+  const cost = Number(unit_cost || 0);
+  if (!supplier_name?.trim() || (!item_id && !new_item_name?.trim()) || !batch_number?.trim() || !expiry_date || qty <= 0 || cost < 0) {
+    return res.status(400).json({ error: 'Supplier, item, batch number, expiry date, positive quantity, and valid unit cost are required.' });
+  }
+  const recDate = received_date ? String(received_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(recDate);
+
+    if (invoice_ref?.trim()) {
+      const dup = await queryOne<{ grn_number: string }>(
+        'SELECT grn_number FROM goods_receipts WHERE LOWER(supplier_name) = LOWER(?) AND LOWER(invoice_ref) = LOWER(?) LIMIT 1',
+        [supplier_name.trim(), invoice_ref.trim()]
+      );
+      if (dup) {
+        return {
+          ok: false as const,
+          error: `Duplicate supplier invoice reference '${invoice_ref.trim()}' for ${supplier_name.trim()} (already in ${dup.grn_number}).`,
+          httpStatus: 409,
+        };
+      }
+    }
+
+    let targetItem: { id: number; code: string; name: string } | null = null;
+    if (item_id) {
+      targetItem = await queryOne<{ id: number; code: string; name: string }>('SELECT id, code, name FROM store_items WHERE id = ?', [Number(item_id)]);
+      if (!targetItem) return { ok: false as const, error: 'Store item not found.', httpStatus: 404 };
+    } else {
+      const genCode = `GRV-${Date.now().toString().slice(-5)}`;
+      const itemIns = await execute(
+        'INSERT INTO store_items (code, name, category, unit, reorder_level, unit_cost, selling_price) VALUES (?, ?, ?, ?, 10, ?, ?)',
+        [genCode, new_item_name.trim(), ['medicine', 'reagent', 'consumable'].includes(new_item_category) ? new_item_category : 'consumable', 'Unit', cost, Number((cost * 1.3).toFixed(2))]
+      );
+      targetItem = { id: itemIns.insertId, code: genCode, name: new_item_name.trim() };
+    }
+
+    const grnNumber = await nextSequence('GRN');
+    const totalCost = Number((qty * cost).toFixed(2));
+    const appStatus = approve_immediately ? 'approved' : 'pending';
+
+    const grnRes = await execute(
+      `INSERT INTO goods_receipts (grn_number, supplier_name, invoice_ref, delivery_date, received_date, department_name, attachment_ref, approval_status, approved_by, approved_at, total_cost, notes, received_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        grnNumber,
+        supplier_name.trim(),
+        invoice_ref?.trim() || null,
+        delivery_date || recDate,
+        recDate,
+        department_name.trim(),
+        attachment_ref?.trim() || null,
+        appStatus,
+        approve_immediately ? req.user!.id : null,
+        approve_immediately ? nowSql() : null,
+        totalCost,
+        notes?.trim() || null,
+        req.user!.id,
+      ]
+    );
+
+    await execute(
+      'INSERT INTO grn_items (grn_id, item_id, batch_number, expiry_date, quantity, unit_cost) VALUES (?, ?, ?, ?, ?, ?)',
+      [grnRes.insertId, targetItem.id, batch_number.trim(), expiry_date, qty, cost]
+    );
+
+    let billNumber: string | null = null;
+    let entryNumber: string | null = null;
+    if (approve_immediately) {
+      const batchRes = await execute(
+        "INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, 'main_store', ?, ?, ?, ?, 'active')",
+        [targetItem.id, batch_number.trim(), expiry_date, qty, cost]
+      );
+      let jeId: number | null = null;
+      if (totalCost > 0) {
+        billNumber = await nextSequence('AP');
+        const dueStr = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+        await execute(
+          `INSERT INTO supplier_bills (bill_number, grn_id, supplier_name, invoice_ref, bill_date, due_date, total_amount, paid_amount, status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)`,
+          [billNumber, grnRes.insertId, supplier_name.trim(), invoice_ref?.trim() || null, recDate, dueStr, totalCost, `Posted from GRV ${grnNumber}`]
+        );
+        const je = await postJournalEntry({
+          entryDate: recDate,
+          sourceType: 'grn',
+          sourceId: grnRes.insertId,
+          description: `Finance GRV ${grnNumber} (${supplier_name.trim()})`,
+          postedBy: req.user!.id,
+          lines: [
+            { accountCode: '1200', debit: totalCost, memo: `${targetItem.code} x ${qty}` },
+            { accountCode: '2100', credit: totalCost, memo: `${billNumber} payable to ${supplier_name.trim()}` },
+          ],
+        });
+        jeId = je.entryId;
+        entryNumber = je.entryNumber;
+      }
+      await execute(
+        `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, journal_entry_id, created_by)
+         VALUES (?, ?, 'main_store', 'grn_receive', ?, ?, ?, 'goods_receipt', ?, ?, ?)`,
+        [targetItem.id, batchRes.insertId, qty, cost, totalCost, grnRes.insertId, jeId, req.user!.id]
+      );
+    }
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'finance.grv.create',
+      entityType: 'goods_receipt',
+      entityId: grnRes.insertId,
+      after: { grnNumber, supplier_name, invoice_ref, approval_status: appStatus, totalCost, billNumber, entryNumber },
+      req,
+    });
+
+    return { ok: true as const, id: grnRes.insertId, grnNumber, approval_status: appStatus, billNumber, entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.status(201).json(result);
+});
+
+router.post('/accounting/grvs/:id/decide', requireAuth, requirePermission('finance.grv.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { decision, reason } = req.body || {};
+  if (!['approved', 'rejected'].includes(decision)) {
+    return res.status(400).json({ error: 'Decision must be approved or rejected.' });
+  }
+
+  const result = await withTransaction(async () => {
+    const grn = await queryOne<{
+      id: number;
+      grn_number: string;
+      supplier_name: string;
+      invoice_ref: string | null;
+      received_date: string | null;
+      total_cost: number;
+      approval_status: string;
+    }>('SELECT * FROM goods_receipts WHERE id = ?', [id]);
+    if (!grn) return { ok: false as const, error: 'GRV not found.', httpStatus: 404 };
+    if (grn.approval_status !== 'pending') {
+      return { ok: false as const, error: `GRV is already ${grn.approval_status}.`, httpStatus: 409 };
+    }
+
+    if (decision === 'rejected') {
+      await execute("UPDATE goods_receipts SET approval_status = 'rejected', approved_by = ?, approved_at = ?, rejected_reason = ? WHERE id = ?", [
+        req.user!.id,
+        nowSql(),
+        reason?.trim() || 'Rejected by Finance',
+        id,
+      ]);
+      await writeAuditLog({ user: req.user, action: 'finance.grv.reject', entityType: 'goods_receipt', entityId: id, reason: reason || null, req });
+      return { ok: true as const, status: 'rejected' };
+    }
+
+    const recDate = grn.received_date || (await getClinicToday());
+    await assertOpenAccountingPeriod(recDate);
+    const items = await query<{ item_id: number; code: string; batch_number: string; expiry_date: string; quantity: number; unit_cost: number }>(
+      'SELECT gi.*, si.code FROM grn_items gi INNER JOIN store_items si ON si.id = gi.item_id WHERE gi.grn_id = ?',
+      [id]
+    );
+    const totalCost = Number(grn.total_cost || 0);
+    let billNumber: string | null = null;
+    let entryNumber: string | null = null;
+    let jeId: number | null = null;
+
+    if (totalCost > 0) {
+      billNumber = await nextSequence('AP');
+      const dueStr = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+      await execute(
+        `INSERT INTO supplier_bills (bill_number, grn_id, supplier_name, invoice_ref, bill_date, due_date, total_amount, paid_amount, status, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)`,
+        [billNumber, id, grn.supplier_name, grn.invoice_ref || null, recDate, dueStr, totalCost, `Approved GRV ${grn.grn_number}`]
+      );
+      const je = await postJournalEntry({
+        entryDate: recDate,
+        sourceType: 'grn',
+        sourceId: id,
+        description: `Approved GRV ${grn.grn_number} (${grn.supplier_name})`,
+        postedBy: req.user!.id,
+        lines: [
+          { accountCode: '1200', debit: totalCost, memo: `Approved GRV ${grn.grn_number}` },
+          { accountCode: '2100', credit: totalCost, memo: `${billNumber} payable to ${grn.supplier_name}` },
+        ],
+      });
+      jeId = je.entryId;
+      entryNumber = je.entryNumber;
+    }
+
+    for (const ln of items) {
+      const bRes = await execute(
+        "INSERT INTO stock_batches (item_id, location, batch_number, expiry_date, qty_on_hand, unit_cost, status) VALUES (?, 'main_store', ?, ?, ?, ?, 'active')",
+        [ln.item_id, ln.batch_number, ln.expiry_date, ln.quantity, ln.unit_cost]
+      );
+      await execute(
+        `INSERT INTO stock_movements (item_id, batch_id, location, movement_type, quantity_change, unit_cost, total_cost, reference_type, reference_id, journal_entry_id, created_by)
+         VALUES (?, ?, 'main_store', 'grn_receive', ?, ?, ?, 'goods_receipt', ?, ?, ?)`,
+        [ln.item_id, bRes.insertId, ln.quantity, ln.unit_cost, Number((ln.quantity * ln.unit_cost).toFixed(2)), id, jeId, req.user!.id]
+      );
+    }
+
+    await execute("UPDATE goods_receipts SET approval_status = 'approved', approved_by = ?, approved_at = ? WHERE id = ?", [req.user!.id, nowSql(), id]);
+    await writeAuditLog({
+      user: req.user,
+      action: 'finance.grv.approve',
+      entityType: 'goods_receipt',
+      entityId: id,
+      after: { grnNumber: grn.grn_number, billNumber, entryNumber },
+      req,
+    });
+    return { ok: true as const, status: 'approved', billNumber, entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.json(result);
+});
+
+router.post('/accounting/payments', requireAuth, requirePermission('finance.payment.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const {
+    payment_date,
+    payment_category,
+    payee_name,
+    cash_bank_account_id,
+    payment_method = 'bank_transfer',
+    amount,
+    debit_account_code = '5200',
+    reference_no,
+    attachment_ref,
+    linked_type,
+    linked_id,
+    notes,
+  } = req.body || {};
+
+  const payAmt = Number(Number(amount || 0).toFixed(2));
+  if (!payment_category?.trim() || !payee_name?.trim() || !cash_bank_account_id || payAmt <= 0) {
+    return res.status(400).json({ error: 'Category, payee, cash/bank account, and positive amount are required.' });
+  }
+  const payDate = payment_date ? String(payment_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(payDate);
+    const cbAcct = await queryOne<{ id: number; account_name: string; coa_code: string }>(
+      'SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE id = ? AND active = 1',
+      [Number(cash_bank_account_id)]
+    );
+    if (!cbAcct) return { ok: false as const, error: 'Active Cash/Bank account not found.', httpStatus: 404 };
+
+    let effectiveDebitCode = String(debit_account_code || '5200');
+    let actualPay = payAmt;
+
+    if (linked_type === 'supplier_bill' && linked_id) {
+      const bill = await queryOne<{ id: number; bill_number: string; total_amount: number; paid_amount: number }>('SELECT * FROM supplier_bills WHERE id = ?', [Number(linked_id)]);
+      if (!bill) return { ok: false as const, error: 'Linked supplier bill not found.', httpStatus: 404 };
+      const rem = Number((Number(bill.total_amount) - Number(bill.paid_amount)).toFixed(2));
+      if (rem <= 0) return { ok: false as const, error: 'Supplier bill is already fully paid.', httpStatus: 409 };
+      if (payAmt > rem + 0.01) return { ok: false as const, error: `Amount exceeds remaining bill balance ($${rem.toFixed(2)}).`, httpStatus: 409 };
+      actualPay = Math.min(payAmt, rem);
+      const nextPaid = Number((Number(bill.paid_amount) + actualPay).toFixed(2));
+      const nextStatus = nextPaid >= Number(bill.total_amount) - 0.01 ? 'paid' : 'partial';
+      await execute('UPDATE supplier_bills SET paid_amount = ?, status = ? WHERE id = ?', [nextPaid, nextStatus, bill.id]);
+      effectiveDebitCode = '2100';
+    } else if (linked_type === 'expense' && linked_id) {
+      const ev = await queryOne<{ id: number; voucher_number: string; amount: number; paid_amount: number; status: string }>('SELECT * FROM expense_vouchers WHERE id = ?', [Number(linked_id)]);
+      if (!ev) return { ok: false as const, error: 'Linked expense voucher not found.', httpStatus: 404 };
+      if (!['approved', 'partial'].includes(ev.status)) {
+        return { ok: false as const, error: 'Linked expense voucher must be in approved/partial state.', httpStatus: 409 };
+      }
+      const rem = Number((Number(ev.amount) - Number(ev.paid_amount || 0)).toFixed(2));
+      if (rem <= 0) return { ok: false as const, error: 'Expense voucher is already fully paid.', httpStatus: 409 };
+      if (payAmt > rem + 0.01) return { ok: false as const, error: `Amount exceeds remaining expense balance ($${rem.toFixed(2)}).`, httpStatus: 409 };
+      actualPay = Math.min(payAmt, rem);
+      const nextPaid = Number((Number(ev.paid_amount || 0) + actualPay).toFixed(2));
+      const nextStatus = nextPaid >= Number(ev.amount) - 0.01 ? 'paid' : 'partial';
+      await execute('UPDATE expense_vouchers SET paid_amount = ?, status = ?, cash_bank_account_id = ?, paid_at = ? WHERE id = ?', [
+        nextPaid,
+        nextStatus,
+        cbAcct.id,
+        nowSql(),
+        ev.id,
+      ]);
+      effectiveDebitCode = '2100';
+    } else {
+      const drAcct = await queryOne<{ id: number }>('SELECT id FROM chart_of_accounts WHERE code = ? AND active = 1', [effectiveDebitCode]);
+      if (!drAcct) return { ok: false as const, error: `Active debit COA account ${effectiveDebitCode} not found.`, httpStatus: 400 };
+    }
+
+    const fpNum = await nextSequence('FPV');
+    const je = await postJournalEntry({
+      entryDate: payDate,
+      sourceType: 'finance_payment',
+      description: `Payment ${fpNum} (${payment_category.trim()}): ${payee_name.trim()}`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: effectiveDebitCode, debit: actualPay, memo: notes?.trim() || `${fpNum} · ${payment_category.trim()}` },
+        { accountCode: cbAcct.coa_code, credit: actualPay, memo: `${fpNum} · ${cbAcct.account_name}` },
+      ],
+    });
+
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [actualPay, cbAcct.id]);
+    const ins = await execute(
+      `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, attachment_ref, linked_type, linked_id, notes, journal_entry_id, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        fpNum,
+        payDate,
+        payment_category.trim(),
+        payee_name.trim(),
+        cbAcct.id,
+        payment_method,
+        actualPay,
+        reference_no?.trim() || null,
+        attachment_ref?.trim() || null,
+        linked_type || null,
+        linked_id ? Number(linked_id) : null,
+        notes?.trim() || null,
+        je.entryId,
+        req.user!.id,
+      ]
+    );
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'finance.payment.create',
+      entityType: 'finance_payment',
+      entityId: ins.insertId,
+      after: { paymentNumber: fpNum, payee_name, amount: actualPay, debit_account_code: effectiveDebitCode, entryNumber: je.entryNumber },
+      req,
+    });
+    return { ok: true as const, id: ins.insertId, paymentNumber: fpNum, entryNumber: je.entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'payment', paymentNumber: result.paymentNumber });
+  res.status(201).json(result);
+});
+
+router.post('/accounting/receipts', requireAuth, requirePermission('finance.receipt.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const {
+    receipt_date,
+    income_category,
+    payer_name,
+    cash_bank_account_id,
+    payment_method = 'bank_transfer',
+    amount,
+    credit_account_code = '4050',
+    reference_no,
+    attachment_ref,
+    notes,
+  } = req.body || {};
+
+  const recAmt = Number(Number(amount || 0).toFixed(2));
+  if (!income_category?.trim() || !payer_name?.trim() || !cash_bank_account_id || recAmt <= 0) {
+    return res.status(400).json({ error: 'Income category, payer, cash/bank account, and positive amount are required.' });
+  }
+  const recDate = receipt_date ? String(receipt_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(recDate);
+    const cbAcct = await queryOne<{ id: number; account_name: string; coa_code: string }>(
+      'SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE id = ? AND active = 1',
+      [Number(cash_bank_account_id)]
+    );
+    if (!cbAcct) return { ok: false as const, error: 'Active Cash/Bank account not found.', httpStatus: 404 };
+
+    const crAcct = await queryOne<{ id: number; code: string }>('SELECT id, code FROM chart_of_accounts WHERE code = ? AND active = 1', [
+      String(credit_account_code || '4050'),
+    ]);
+    if (!crAcct) return { ok: false as const, error: `Active credit GL account ${credit_account_code} not found.`, httpStatus: 400 };
+
+    const frNum = await nextSequence('FRV');
+    const je = await postJournalEntry({
+      entryDate: recDate,
+      sourceType: 'finance_receipt',
+      description: `General Receipt ${frNum} (${income_category.trim()}): ${payer_name.trim()}`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: cbAcct.coa_code, debit: recAmt, memo: `${frNum} · ${cbAcct.account_name}` },
+        { accountCode: crAcct.code, credit: recAmt, memo: notes?.trim() || `${frNum} · ${income_category.trim()}` },
+      ],
+    });
+
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance + ?, 2) WHERE id = ?', [recAmt, cbAcct.id]);
+    const ins = await execute(
+      `INSERT INTO finance_receipts (receipt_number, receipt_date, income_category, payer_name, cash_bank_account_id, payment_method, amount, reference_no, attachment_ref, notes, journal_entry_id, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        frNum,
+        recDate,
+        income_category.trim(),
+        payer_name.trim(),
+        cbAcct.id,
+        payment_method,
+        recAmt,
+        reference_no?.trim() || null,
+        attachment_ref?.trim() || null,
+        notes?.trim() || null,
+        je.entryId,
+        req.user!.id,
+      ]
+    );
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'finance.receipt.create',
+      entityType: 'finance_receipt',
+      entityId: ins.insertId,
+      after: { receiptNumber: frNum, payer_name, amount: recAmt, credit_account_code: crAcct.code, entryNumber: je.entryNumber },
+      req,
+    });
+    return { ok: true as const, id: ins.insertId, receiptNumber: frNum, entryNumber: je.entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'receipt', receiptNumber: result.receiptNumber });
+  res.status(201).json(result);
+});
+
+router.post('/accounting/cash-bank/accounts', requireAuth, requirePermission('finance.bank.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const { account_name, account_type = 'bank', account_number, bank_name, coa_code, opening_balance = 0 } = req.body || {};
+  if (!account_name?.trim() || !['cash', 'bank'].includes(String(account_type))) {
+    return res.status(400).json({ error: 'Account name and type (cash/bank) are required.' });
+  }
+  const targetCoa = coa_code?.trim() || (account_type === 'cash' ? '1010' : '1020');
+  const coa = await queryOne('SELECT id FROM chart_of_accounts WHERE code = ? AND active = 1', [targetCoa]);
+  if (!coa) return res.status(400).json({ error: `COA code ${targetCoa} not found.` });
+
+  const openBal = Number(Number(opening_balance || 0).toFixed(2));
+  const ins = await execute(
+    `INSERT INTO finance_cash_bank_accounts (account_name, account_type, account_number, bank_name, coa_code, opening_balance, current_balance, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+    [account_name.trim(), account_type, account_number?.trim() || null, bank_name?.trim() || null, targetCoa, openBal, openBal]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'finance.bank.account.create',
+    entityType: 'cash_bank_account',
+    entityId: ins.insertId,
+    after: { account_name, account_type, coa_code: targetCoa, opening_balance: openBal },
+    req,
+  });
+  broadcastClinicEvent('finance:updated', { type: 'cash_bank_account', id: ins.insertId });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.post('/accounting/cash-bank/transfer', requireAuth, requirePermission('finance.bank.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const { from_account_id, to_account_id, amount, transfer_date, reference_no, notes } = req.body || {};
+  const amt = Number(Number(amount || 0).toFixed(2));
+  if (!from_account_id || !to_account_id || Number(from_account_id) === Number(to_account_id) || amt <= 0) {
+    return res.status(400).json({ error: 'Distinct source and destination accounts and positive transfer amount are required.' });
+  }
+  const trDate = transfer_date ? String(transfer_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(trDate);
+    const fromAcc = await queryOne<{ id: number; account_name: string; coa_code: string; current_balance: number }>(
+      'SELECT * FROM finance_cash_bank_accounts WHERE id = ? AND active = 1',
+      [Number(from_account_id)]
+    );
+    const toAcc = await queryOne<{ id: number; account_name: string; coa_code: string; current_balance: number }>(
+      'SELECT * FROM finance_cash_bank_accounts WHERE id = ? AND active = 1',
+      [Number(to_account_id)]
+    );
+    if (!fromAcc || !toAcc) return { ok: false as const, error: 'Source or destination account not found.', httpStatus: 404 };
+
+    const trNum = await nextSequence('TRF');
+    const je = await postJournalEntry({
+      entryDate: trDate,
+      sourceType: 'cash_bank_transfer',
+      description: `Fund Transfer ${trNum}: ${fromAcc.account_name} -> ${toAcc.account_name}`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: toAcc.coa_code, debit: amt, memo: `Transfer into ${toAcc.account_name}` },
+        { accountCode: fromAcc.coa_code, credit: amt, memo: `Transfer from ${fromAcc.account_name}` },
+      ],
+    });
+
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [amt, fromAcc.id]);
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance + ?, 2) WHERE id = ?', [amt, toAcc.id]);
+    const ins = await execute(
+      `INSERT INTO finance_cash_bank_transfers (transfer_number, transfer_date, from_account_id, to_account_id, amount, reference_no, notes, journal_entry_id, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [trNum, trDate, fromAcc.id, toAcc.id, amt, reference_no?.trim() || null, notes?.trim() || null, je.entryId, req.user!.id]
+    );
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'finance.bank.transfer',
+      entityType: 'cash_bank_transfer',
+      entityId: ins.insertId,
+      after: { transferNumber: trNum, from: fromAcc.account_name, to: toAcc.account_name, amount: amt, entryNumber: je.entryNumber },
+      req,
+    });
+    return { ok: true as const, id: ins.insertId, transferNumber: trNum, entryNumber: je.entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  broadcastClinicEvent('finance:updated', { type: 'cash_bank_transfer', transferNumber: result.transferNumber });
+  res.status(201).json(result);
 });
 
 // ---------------------------------------------------------------------------
@@ -7557,15 +11349,31 @@ router.post('/accounting/expenses/:id/decide', requireAuth, requirePermission('a
 // ---------------------------------------------------------------------------
 router.get('/reports/:type', requireAuth, async (req: AuthRequest, res: Response) => {
   const type = req.params.type;
-  const fromDate = req.query.from ? String(req.query.from).slice(0, 10) : '2020-01-01';
-  const toDate = req.query.to ? String(req.query.to).slice(0, 10) : '2099-12-31';
+  const fromRaw = req.query.from ? String(req.query.from).slice(0, 10) : '2020-01-01';
+  const toRaw = req.query.to ? String(req.query.to).slice(0, 10) : '2099-12-31';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromRaw) || !/^\d{4}-\d{2}-\d{2}$/.test(toRaw)) {
+    return res.status(400).json({ error: 'Invalid date range format (expected YYYY-MM-DD).' });
+  }
+  const fromDate = fromRaw;
+  const toDate = toRaw;
 
   const allowedByType: Record<string, string[]> = {
-    'daily-cash': ['finance.report.view', 'audit.read'],
+    'daily-cash': ['finance.report.view', 'billing.report.own', 'audit.read'],
     'ar-ageing': ['finance.report.view', 'audit.read', 'accounting.ledger.manage'],
     'opd-diagnoses': ['finance.report.view', 'audit.read', 'visit.read'],
+    'my-clinical-reports': ['visit.read', 'finance.report.view', 'audit.read'],
     'lab-turnaround': ['finance.report.view', 'audit.read', 'lab.order.read'],
     'stock-valuation': ['finance.report.view', 'audit.read', 'store.item.read'],
+    'payroll-summary': ['finance.report.view', 'accounting.ledger.manage', 'finance.payroll.generate', 'audit.read'],
+    'payroll-payments': ['finance.report.view', 'accounting.ledger.manage', 'finance.payroll.generate', 'hr.payroll.pay', 'audit.read'],
+    'expense-report': ['finance.report.view', 'accounting.ledger.manage', 'accounting.expense.create', 'audit.read'],
+    'grv-report': ['finance.report.view', 'accounting.ledger.manage', 'finance.grv.manage', 'audit.read'],
+    'payments-report': ['finance.report.view', 'accounting.ledger.manage', 'finance.payment.manage', 'audit.read'],
+    'receipts-report': ['finance.report.view', 'accounting.ledger.manage', 'finance.receipt.manage', 'audit.read'],
+    'cash-report': ['finance.report.view', 'accounting.ledger.manage', 'finance.bank.manage', 'audit.read'],
+    'bank-report': ['finance.report.view', 'accounting.ledger.manage', 'finance.bank.manage', 'audit.read'],
+    'trial-balance': ['finance.report.view', 'accounting.ledger.manage', 'audit.read'],
+    'balance-sheet': ['finance.report.view', 'accounting.ledger.manage', 'audit.read'],
   };
   const needed = allowedByType[type];
   if (!needed) return res.status(400).json({ error: 'Unknown report type.' });
@@ -7574,47 +11382,73 @@ router.get('/reports/:type', requireAuth, async (req: AuthRequest, res: Response
   }
 
   if (type === 'daily-cash') {
+    const canSeeAllCashiers = hasPermission(req.user!, 'finance.report.view') || hasPermission(req.user!, 'audit.read');
     const rows = await query(
       `SELECT substr(pay.created_at, 1, 10) AS payment_date, u.full_name AS cashier_name,
               pay.payment_method, COUNT(*) AS tx_count,
               ROUND(SUM(CASE WHEN pay.status = 'refunded' THEN -pay.amount ELSE pay.amount END), 2) AS total_amount
        FROM payments pay
        LEFT JOIN users u ON u.id = pay.created_by
-       WHERE pay.status IN ('completed', 'refunded') AND substr(pay.created_at, 1, 10) BETWEEN ? AND ?
+       WHERE pay.status IN ('completed', 'refunded') AND substr(pay.created_at, 1, 10) BETWEEN ? AND ?${canSeeAllCashiers ? '' : ' AND pay.created_by = ?'}
        GROUP BY substr(pay.created_at, 1, 10), u.full_name, pay.payment_method
        ORDER BY payment_date DESC, cashier_name ASC`,
-      [fromDate, toDate]
+      canSeeAllCashiers ? [fromDate, toDate] : [fromDate, toDate, req.user!.id]
     );
-    return res.json({ reportType: type, fromDate, toDate, rows });
+    return res.json({ reportType: type, fromDate, toDate, ownOnly: !canSeeAllCashiers, rows });
   }
 
   if (type === 'opd-diagnoses') {
+    const doctorScoped = isDoctorOnly(req.user!);
     const rows = await query(
       `SELECT COALESCE(v.diagnosis_code, 'UNSPEC') AS diagnosis_code,
               COALESCE(v.diagnosis_text, v.chief_complaint, 'Pending Assessment') AS diagnosis_text,
               COUNT(*) AS visit_count,
               SUM(CASE WHEN v.triage_priority = 'emergency' THEN 1 ELSE 0 END) AS emergency_count
        FROM visits v
-       WHERE substr(v.created_at, 1, 10) BETWEEN ? AND ?
+       WHERE substr(v.created_at, 1, 10) BETWEEN ? AND ?${doctorScoped ? ' AND v.doctor_id = ?' : ''}
        GROUP BY COALESCE(v.diagnosis_code, 'UNSPEC'), COALESCE(v.diagnosis_text, v.chief_complaint, 'Pending Assessment')
        ORDER BY visit_count DESC LIMIT 40`,
-      [fromDate, toDate]
+      doctorScoped ? [fromDate, toDate, req.user!.id] : [fromDate, toDate]
     );
-    return res.json({ reportType: type, fromDate, toDate, rows });
+    return res.json({ reportType: type, fromDate, toDate, isDoctorScoped: doctorScoped, rows });
+  }
+
+  if (type === 'my-clinical-reports') {
+    const doctorScoped = isDoctorOnly(req.user!);
+    const rows = await query(
+      `SELECT v.id, v.visit_number, substr(v.created_at, 1, 10) AS visit_date,
+              p.mrn, p.first_name || ' ' || p.last_name AS patient_name,
+              COALESCE(v.diagnosis_code, '-') AS diagnosis_code,
+              COALESCE(v.diagnosis_text, v.chief_complaint, 'Pending Assessment') AS diagnosis_text,
+              v.treatment_plan, v.status, v.workflow_stage, v.triage_priority,
+              COALESCE(u.full_name, 'Unassigned') AS doctor_name,
+              (SELECT COUNT(*) FROM lab_orders lo WHERE lo.visit_id = v.id) AS lab_count,
+              (SELECT COUNT(*) FROM imaging_orders io WHERE io.visit_id = v.id) AS imaging_count,
+              (SELECT COUNT(*) FROM prescriptions pr WHERE pr.visit_id = v.id) AS rx_count
+       FROM visits v
+       INNER JOIN patients p ON p.id = v.patient_id
+       LEFT JOIN users u ON u.id = v.doctor_id
+       WHERE substr(v.created_at, 1, 10) BETWEEN ? AND ?${doctorScoped ? ' AND v.doctor_id = ?' : ''}
+       ORDER BY v.id DESC LIMIT 100`,
+      doctorScoped ? [fromDate, toDate, req.user!.id] : [fromDate, toDate]
+    );
+    return res.json({ reportType: type, fromDate, toDate, isDoctorScoped: doctorScoped, rows });
   }
 
   if (type === 'lab-turnaround') {
+    const doctorScoped = isDoctorOnly(req.user!);
     const rows = await query(
       `SELECT lo.id, lt.code AS test_code, lt.name AS test_name, p.mrn, p.first_name, p.last_name,
               lo.status, lo.abnormal_flag, lo.created_at, lo.verified_at
        FROM lab_orders lo
        INNER JOIN lab_tests lt ON lt.id = lo.test_id
        INNER JOIN patients p ON p.id = lo.patient_id
-       WHERE substr(lo.created_at, 1, 10) BETWEEN ? AND ?
+       ${doctorScoped ? 'INNER JOIN visits v ON v.id = lo.visit_id' : ''}
+       WHERE substr(lo.created_at, 1, 10) BETWEEN ? AND ?${doctorScoped ? " AND (v.doctor_id = ? OR EXISTS (SELECT 1 FROM doctor_assignments da WHERE da.visit_id = v.id AND da.doctor_id = ? AND da.status = 'active'))" : ''}
        ORDER BY lo.id DESC LIMIT 60`,
-      [fromDate, toDate]
+      doctorScoped ? [fromDate, toDate, req.user!.id, req.user!.id] : [fromDate, toDate]
     );
-    return res.json({ reportType: type, fromDate, toDate, rows });
+    return res.json({ reportType: type, fromDate, toDate, isDoctorScoped: doctorScoped, rows });
   }
 
   if (type === 'stock-valuation') {
@@ -7626,6 +11460,117 @@ router.get('/reports/:type', requireAuth, async (req: AuthRequest, res: Response
        INNER JOIN store_items si ON si.id = sb.item_id
        WHERE sb.qty_on_hand > 0 OR sb.status = 'blocked_expired'
        ORDER BY sb.expiry_date ASC`
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'payroll-summary') {
+    const rows = await query(
+      `SELECT pr.run_number, pr.pay_month, pr.status,
+              COUNT(pi.id) AS headcount,
+              pr.total_gross, pr.total_deductions, pr.total_net,
+              ROUND(COALESCE(SUM(pi.paid_amount), 0), 2) AS total_paid_to_staff
+       FROM payroll_runs pr
+       LEFT JOIN payroll_items pi ON pi.payroll_run_id = pr.id
+       GROUP BY pr.id
+       ORDER BY pr.pay_month DESC, pr.id DESC`
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'payroll-payments') {
+    const rows = await query(
+      `SELECT pr.run_number, pr.pay_month, pi.staff_name, pi.role_code,
+              pi.base_salary, pi.allowances, pi.overtime_pay, pi.bonus_earnings,
+              pi.paye_tax, pi.pension_employee, pi.other_deductions,
+              pi.net_pay, pi.paid_amount, ROUND(pi.net_pay - pi.paid_amount, 2) AS balance_due,
+              pi.payment_status, pi.payment_method, pi.payment_ref
+       FROM payroll_items pi
+       INNER JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
+       ORDER BY pr.pay_month DESC, pi.staff_name ASC`
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'expense-report') {
+    const rows = await query(
+      `SELECT ev.voucher_number, ev.expense_date, ev.category, coa.code AS gl_code, coa.name AS gl_account,
+              ev.payee_name, ev.amount, ev.paid_amount, ev.status, ev.payment_method, ev.reference_number
+       FROM expense_vouchers ev
+       INNER JOIN chart_of_accounts coa ON coa.id = ev.account_id
+       WHERE ev.expense_date BETWEEN ? AND ?
+       ORDER BY ev.expense_date DESC, ev.id DESC`,
+      [fromDate, toDate]
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'grv-report') {
+    const rows = await query(
+      `SELECT gr.grn_number, COALESCE(gr.received_date, substr(gr.received_at,1,10)) AS received_date,
+              gr.supplier_name, gr.invoice_ref, gr.department_name, gr.approval_status,
+              gr.total_cost, sb.bill_number, sb.status AS bill_status, sb.paid_amount
+       FROM goods_receipts gr
+       LEFT JOIN supplier_bills sb ON sb.grn_id = gr.id
+       WHERE COALESCE(gr.received_date, substr(gr.received_at,1,10)) BETWEEN ? AND ?
+       ORDER BY gr.id DESC`,
+      [fromDate, toDate]
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'payments-report') {
+    const rows = await query(
+      `SELECT fp.payment_number, fp.payment_date, fp.payment_category, fp.payee_name,
+              cba.account_name, fp.payment_method, fp.amount, fp.reference_no, fp.linked_type
+       FROM finance_payments fp
+       INNER JOIN finance_cash_bank_accounts cba ON cba.id = fp.cash_bank_account_id
+       WHERE fp.payment_date BETWEEN ? AND ?
+       ORDER BY fp.payment_date DESC, fp.id DESC`,
+      [fromDate, toDate]
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'receipts-report') {
+    const rows = await query(
+      `SELECT fr.receipt_number, fr.receipt_date, fr.income_category, fr.payer_name,
+              cba.account_name, fr.payment_method, fr.amount, fr.reference_no
+       FROM finance_receipts fr
+       INNER JOIN finance_cash_bank_accounts cba ON cba.id = fr.cash_bank_account_id
+       WHERE fr.receipt_date BETWEEN ? AND ?
+       ORDER BY fr.receipt_date DESC, fr.id DESC`,
+      [fromDate, toDate]
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'cash-report' || type === 'bank-report') {
+    const acctType = type === 'cash-report' ? 'cash' : 'bank';
+    const rows = await query(
+      `SELECT cba.account_name, cba.account_type, cba.account_number, cba.bank_name, cba.coa_code,
+              cba.opening_balance, cba.current_balance,
+              ROUND(COALESCE((SELECT SUM(fr.amount) FROM finance_receipts fr WHERE fr.cash_bank_account_id = cba.id AND fr.receipt_date BETWEEN ? AND ?), 0), 2) AS total_receipts,
+              ROUND(COALESCE((SELECT SUM(fp.amount) FROM finance_payments fp WHERE fp.cash_bank_account_id = cba.id AND fp.payment_date BETWEEN ? AND ?), 0), 2) AS total_payments
+       FROM finance_cash_bank_accounts cba
+       WHERE cba.account_type = ?
+       ORDER BY cba.id ASC`,
+      [fromDate, toDate, fromDate, toDate, acctType]
+    );
+    return res.json({ reportType: type, fromDate, toDate, rows });
+  }
+
+  if (type === 'trial-balance' || type === 'balance-sheet') {
+    const rows = await query(
+      `SELECT coa.code, coa.name, coa.account_type, coa.normal_balance,
+              ROUND(COALESCE(SUM(jl.debit), 0), 2) AS total_debit,
+              ROUND(COALESCE(SUM(jl.credit), 0), 2) AS total_credit,
+              ROUND(CASE WHEN coa.normal_balance = 'debit' THEN COALESCE(SUM(jl.debit - jl.credit), 0) ELSE COALESCE(SUM(jl.credit - jl.debit), 0) END, 2) AS net_balance
+       FROM chart_of_accounts coa
+       LEFT JOIN journal_lines jl ON jl.account_id = coa.id
+       ${type === 'balance-sheet' ? "WHERE coa.account_type IN ('asset','liability','equity')" : ''}
+       GROUP BY coa.id
+       ORDER BY coa.code ASC`
     );
     return res.json({ reportType: type, fromDate, toDate, rows });
   }
@@ -7676,121 +11621,701 @@ async function computeProgressivePaye(taxableIncome: number): Promise<number> {
   return Number(tax.toFixed(2));
 }
 
-router.get('/hr/overview', requireAuth, requirePermission('hr.manage', 'hr.leave.request', 'hr.payroll.verify', 'hr.payroll.approve', 'hr.payroll.post', 'hr.payroll.pay'), async (req: AuthRequest, res: Response) => {
-  const isHrManager = hasPermission(req.user!, 'hr.manage');
-  const canViewPayroll =
-    isHrManager ||
-    hasPermission(req.user!, 'hr.payroll.verify', 'hr.payroll.approve', 'hr.payroll.post', 'hr.payroll.pay');
-
-  const leaveRequests = isHrManager
-    ? await query(
-        `SELECT lr.*, u1.full_name AS staff_name,
-                (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u1.id) AS role_code,
-                u2.full_name AS decided_by_name
-         FROM leave_requests lr
-         INNER JOIN users u1 ON u1.id = lr.user_id
-         LEFT JOIN users u2 ON u2.id = lr.decided_by
-         ORDER BY lr.id DESC LIMIT 60`
-      )
-    : await query(
-        `SELECT lr.*, u1.full_name AS staff_name,
-                (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u1.id) AS role_code,
-                u2.full_name AS decided_by_name
-         FROM leave_requests lr
-         INNER JOIN users u1 ON u1.id = lr.user_id
-         LEFT JOIN users u2 ON u2.id = lr.decided_by
-         WHERE lr.user_id = ?
-         ORDER BY lr.id DESC LIMIT 30`,
-        [req.user!.id]
-      );
-
-  if (!isHrManager && !canViewPayroll) {
-    return res.json({ isHrManager: false, canViewPayroll: false, contracts: [], leaveRequests, payrollRuns: [], staffUsers: [], taxBrackets: [] });
+function computeAttendanceMetrics(checkIn?: string | null, checkOut?: string | null) {
+  if (!checkIn || !checkOut || !/^\d{2}:\d{2}/.test(checkIn) || !/^\d{2}:\d{2}/.test(checkOut)) {
+    return { hoursWorked: 0, lateMinutes: 0, earlyLeaveMinutes: 0 };
   }
+  const [inH, inM] = checkIn.split(':').map(Number);
+  const [outH, outM] = checkOut.split(':').map(Number);
+  const inTotal = inH * 60 + inM;
+  const outTotal = outH * 60 + outM;
+  const diffMins = Math.max(0, outTotal - inTotal);
+  const hoursWorked = Number((diffMins / 60).toFixed(2));
+  const lateMinutes = Math.max(0, inTotal - (8 * 60 + 15));
+  const earlyLeaveMinutes = Math.max(0, 17 * 60 - outTotal);
+  return { hoursWorked, lateMinutes, earlyLeaveMinutes };
+}
 
-  const [contractsRaw, payrollRuns, payrollItems, staffUsers, taxBrackets] = await Promise.all([
-    isHrManager
-      ? query<Record<string, unknown>>(
-          `SELECT sc.*, u.full_name, u.email, u.specialty, u.active,
-                  (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
-                  (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
-           FROM staff_contracts sc
-           INNER JOIN users u ON u.id = sc.user_id
-           ORDER BY sc.employee_code ASC`
-        )
-      : Promise.resolve([]),
-    query<Record<string, unknown>>(
-      `SELECT pr.*, je.entry_number AS journal_entry_number, pje.entry_number AS payment_journal_entry_number,
-              u.full_name AS created_by_name, uv.full_name AS verified_by_name,
-              ua.full_name AS approved_by_name, up.full_name AS paid_by_name
-       FROM payroll_runs pr
-       LEFT JOIN journal_entries je ON je.id = pr.journal_entry_id
-       LEFT JOIN journal_entries pje ON pje.id = pr.payment_journal_entry_id
-       LEFT JOIN users u ON u.id = pr.created_by
-       LEFT JOIN users uv ON uv.id = pr.verified_by
-       LEFT JOIN users ua ON ua.id = pr.approved_by
-       LEFT JOIN users up ON up.id = pr.paid_by
-       ORDER BY pr.id DESC LIMIT 20`
-    ),
-    query<Record<string, unknown>>('SELECT * FROM payroll_items ORDER BY id ASC'),
-    isHrManager
-      ? query(
-          `SELECT u.id, u.full_name, u.email,
-                  (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
-                  (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
-           FROM users u
-           WHERE u.active = 1
-           ORDER BY u.full_name`
-        )
-      : Promise.resolve([]),
-    query('SELECT * FROM tax_brackets WHERE active = 1 ORDER BY lower_bound ASC'),
-  ]);
+router.get(
+  '/hr/overview',
+  requireAuth,
+  requirePermission(
+    'hr.manage',
+    'hr.attendance.manage',
+    'hr.overtime.manage',
+    'hr.payroll.submit',
+    'hr.leave.request',
+    'hr.payroll.verify',
+    'hr.payroll.approve',
+    'hr.payroll.post',
+    'hr.payroll.pay',
+    'finance.payroll.generate'
+  ),
+  async (req: AuthRequest, res: Response) => {
+    const isHrManager = hasPermission(req.user!, 'hr.manage', 'hr.attendance.manage', 'hr.overtime.manage', 'hr.payroll.submit');
+    const canViewPayroll =
+      isHrManager ||
+      hasPermission(req.user!, 'hr.payroll.verify', 'hr.payroll.approve', 'hr.payroll.post', 'hr.payroll.pay', 'finance.payroll.generate');
 
-  const nowMs = Date.now();
-  const contracts = contractsRaw.map((c) => {
-    let licenceDaysRemaining: number | null = null;
-    if (c.licence_expiry) {
-      licenceDaysRemaining = Math.ceil((new Date(String(c.licence_expiry)).getTime() - nowMs) / 86400000);
+    const leaveRequests = isHrManager
+      ? await query(
+          `SELECT lr.*,
+                  COALESCE(he.full_name, u1.full_name, 'Staff') AS staff_name,
+                  he.employee_number,
+                  he.department_name,
+                  COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = lr.user_id), 'EMP') AS role_code,
+                  u2.full_name AS decided_by_name
+           FROM leave_requests lr
+           LEFT JOIN hr_employees he ON (he.id = lr.employee_id OR (lr.employee_id IS NULL AND he.user_id = lr.user_id))
+           LEFT JOIN users u1 ON u1.id = lr.user_id
+           LEFT JOIN users u2 ON u2.id = lr.decided_by
+           ORDER BY lr.id DESC LIMIT 120`
+        )
+      : await query(
+          `SELECT lr.*,
+                  COALESCE(he.full_name, u1.full_name, 'Staff') AS staff_name,
+                  he.employee_number,
+                  he.department_name,
+                  COALESCE((SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = lr.user_id), 'EMP') AS role_code,
+                  u2.full_name AS decided_by_name
+           FROM leave_requests lr
+           LEFT JOIN hr_employees he ON (he.id = lr.employee_id OR (lr.employee_id IS NULL AND he.user_id = lr.user_id))
+           LEFT JOIN users u1 ON u1.id = lr.user_id
+           LEFT JOIN users u2 ON u2.id = lr.decided_by
+           WHERE lr.user_id = ?
+           ORDER BY lr.id DESC LIMIT 40`,
+          [req.user!.id]
+        );
+
+    const leaveTypes = await query<{ id: number; code: string; name: string; annual_allowance_days: number; paid: number; description: string | null; active: number }>(
+      'SELECT * FROM hr_leave_types WHERE active = 1 ORDER BY id ASC'
+    );
+
+    if (!isHrManager && !canViewPayroll) {
+      return res.json({
+        isHrManager: false,
+        canViewPayroll: false,
+        employees: [],
+        employeeDocuments: [],
+        attendance: [],
+        leaveTypes,
+        leaveBalances: [],
+        overtime: [],
+        adjustments: [],
+        monthlySubmissions: [],
+        contracts: [],
+        leaveRequests,
+        payrollRuns: [],
+        staffUsers: [],
+        taxBrackets: [],
+      });
     }
-    return {
-      ...c,
-      licence_days_remaining: licenceDaysRemaining,
-      licence_alert:
-        licenceDaysRemaining === null
-          ? 'none'
-          : licenceDaysRemaining <= 0
-            ? 'expired'
-            : licenceDaysRemaining <= 60
-              ? 'expiring_soon'
-              : 'valid',
+
+    const currentYear = String(new Date().getUTCFullYear());
+    const [
+      employeesRaw,
+      employeeDocuments,
+      attendance,
+      overtime,
+      adjustments,
+      monthlySubmissions,
+      contractsRaw,
+      payrollRuns,
+      payrollItems,
+      staffUsers,
+      taxBrackets,
+      yearLeaveUsage,
+    ] = await Promise.all([
+      isHrManager
+        ? query<Record<string, unknown>>(
+            `SELECT he.*, u.email AS user_email, u.active AS user_active,
+                    (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = he.user_id) AS role_code,
+                    (SELECT COUNT(*) FROM hr_employee_documents doc WHERE doc.employee_id = he.id) AS document_count
+             FROM hr_employees he
+             LEFT JOIN users u ON u.id = he.user_id
+             ORDER BY he.employee_number ASC`
+          )
+        : Promise.resolve([]),
+      isHrManager
+        ? query(
+            `SELECT doc.*, he.employee_number, he.full_name AS employee_name, u.full_name AS uploaded_by_name
+             FROM hr_employee_documents doc
+             INNER JOIN hr_employees he ON he.id = doc.employee_id
+             LEFT JOIN users u ON u.id = doc.uploaded_by
+             ORDER BY doc.id DESC LIMIT 120`
+          )
+        : Promise.resolve([]),
+      isHrManager
+        ? query(
+            `SELECT att.*, he.employee_number, he.full_name, he.department_name
+             FROM hr_attendance att
+             INNER JOIN hr_employees he ON he.id = att.employee_id
+             ORDER BY att.attendance_date DESC, he.full_name ASC LIMIT 250`
+          )
+        : Promise.resolve([]),
+      isHrManager
+        ? query(
+            `SELECT ot.*, he.employee_number, he.full_name, he.department_name, u.full_name AS decided_by_name
+             FROM hr_overtime ot
+             INNER JOIN hr_employees he ON he.id = ot.employee_id
+             LEFT JOIN users u ON u.id = ot.decided_by
+             ORDER BY ot.overtime_date DESC, ot.id DESC LIMIT 150`
+          )
+        : Promise.resolve([]),
+      isHrManager
+        ? query(
+            `SELECT adj.*, he.employee_number, he.full_name, he.department_name, u.full_name AS created_by_name
+             FROM hr_adjustments adj
+             INNER JOIN hr_employees he ON he.id = adj.employee_id
+             LEFT JOIN users u ON u.id = adj.created_by
+             ORDER BY adj.effective_month DESC, adj.id DESC LIMIT 150`
+          )
+        : Promise.resolve([]),
+      query(
+        `SELECT hms.*, u.full_name AS submitted_by_name
+         FROM hr_monthly_submissions hms
+         LEFT JOIN users u ON u.id = hms.submitted_by
+         ORDER BY hms.pay_month DESC LIMIT 24`
+      ),
+      isHrManager
+        ? query<Record<string, unknown>>(
+            `SELECT sc.*, u.full_name, u.email, u.specialty, u.active,
+                    (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
+                    (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
+             FROM staff_contracts sc
+             INNER JOIN users u ON u.id = sc.user_id
+             ORDER BY sc.employee_code ASC`
+          )
+        : Promise.resolve([]),
+      query<Record<string, unknown>>(
+        `SELECT pr.*, je.entry_number AS journal_entry_number, pje.entry_number AS payment_journal_entry_number,
+                u.full_name AS created_by_name, uv.full_name AS verified_by_name,
+                ua.full_name AS approved_by_name, up.full_name AS paid_by_name
+         FROM payroll_runs pr
+         LEFT JOIN journal_entries je ON je.id = pr.journal_entry_id
+         LEFT JOIN journal_entries pje ON pje.id = pr.payment_journal_entry_id
+         LEFT JOIN users u ON u.id = pr.created_by
+         LEFT JOIN users uv ON uv.id = pr.verified_by
+         LEFT JOIN users ua ON ua.id = pr.approved_by
+         LEFT JOIN users up ON up.id = pr.paid_by
+         ORDER BY pr.id DESC LIMIT 24`
+      ),
+      query<Record<string, unknown>>('SELECT * FROM payroll_items ORDER BY id ASC'),
+      isHrManager
+        ? query(
+            `SELECT u.id, u.full_name, u.email,
+                    (SELECT GROUP_CONCAT(r.code) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_code,
+                    (SELECT GROUP_CONCAT(r.name) FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id) AS role_name
+             FROM users u
+             WHERE u.active = 1
+             ORDER BY u.full_name`
+          )
+        : Promise.resolve([]),
+      query('SELECT * FROM tax_brackets WHERE active = 1 ORDER BY lower_bound ASC'),
+      query<{ employee_id: number | null; user_id: number | null; leave_type: string; status: string; days: number }>(
+        `SELECT employee_id, user_id, LOWER(leave_type) AS leave_type, status, COALESCE(SUM(days_count), 0) AS days
+         FROM leave_requests
+         WHERE substr(start_date, 1, 4) = ? AND status IN ('approved','pending')
+         GROUP BY employee_id, user_id, LOWER(leave_type), status`,
+        [currentYear]
+      ),
+    ]);
+
+    const nowMs = Date.now();
+    const decorateLicence = <T extends Record<string, unknown>>(row: T) => {
+      let licenceDaysRemaining: number | null = null;
+      if (row.licence_expiry) {
+        licenceDaysRemaining = Math.ceil((new Date(String(row.licence_expiry)).getTime() - nowMs) / 86400000);
+      }
+      return {
+        ...row,
+        licence_days_remaining: licenceDaysRemaining,
+        licence_alert:
+          licenceDaysRemaining === null
+            ? 'none'
+            : licenceDaysRemaining <= 0
+              ? 'expired'
+              : licenceDaysRemaining <= 60
+                ? 'expiring_soon'
+                : 'valid',
+      };
     };
-  });
 
-  const itemsByRun = new Map<number, Record<string, unknown>[]>();
-  for (const pi of payrollItems) {
-    const k = Number(pi.payroll_run_id);
-    if (!itemsByRun.has(k)) itemsByRun.set(k, []);
-    itemsByRun.get(k)!.push(pi);
-  }
-  for (const run of payrollRuns) {
-    run.items = itemsByRun.get(Number(run.id)) || [];
-  }
+    const employees = employeesRaw.map(decorateLicence);
+    const contracts = contractsRaw.map(decorateLicence);
 
-  res.json({ isHrManager, canViewPayroll, contracts, leaveRequests, payrollRuns, staffUsers, taxBrackets });
-});
+    const leaveBalances: Array<Record<string, unknown>> = [];
+    for (const emp of employeesRaw) {
+      if (emp.status !== 'active') continue;
+      for (const lt of leaveTypes) {
+        if (Number(lt.annual_allowance_days) <= 0) continue;
+        let usedDays = 0;
+        let pendingDays = 0;
+        for (const u of yearLeaveUsage) {
+          const matchesEmp = (u.employee_id && Number(u.employee_id) === Number(emp.id)) || (!u.employee_id && emp.user_id && Number(u.user_id) === Number(emp.user_id));
+          if (!matchesEmp) continue;
+          if (u.leave_type === lt.code.toLowerCase()) {
+            if (u.status === 'approved') usedDays += Number(u.days || 0);
+            if (u.status === 'pending') pendingDays += Number(u.days || 0);
+          }
+        }
+        leaveBalances.push({
+          employee_id: emp.id,
+          employee_number: emp.employee_number,
+          full_name: emp.full_name,
+          department_name: emp.department_name,
+          leave_type_code: lt.code,
+          leave_type_name: lt.name,
+          annual_allowance_days: lt.annual_allowance_days,
+          used_days: usedDays,
+          pending_days: pendingDays,
+          remaining_days: Math.max(0, Number(lt.annual_allowance_days) - usedDays),
+        });
+      }
+    }
+
+    const itemsByRun = new Map<number, Record<string, unknown>[]>();
+    for (const pi of payrollItems) {
+      const k = Number(pi.payroll_run_id);
+      if (!itemsByRun.has(k)) itemsByRun.set(k, []);
+      itemsByRun.get(k)!.push(pi);
+    }
+    for (const run of payrollRuns) {
+      run.items = itemsByRun.get(Number(run.id)) || [];
+    }
+
+    res.json({
+      isHrManager,
+      canViewPayroll,
+      employees,
+      employeeDocuments,
+      attendance,
+      leaveTypes,
+      leaveBalances,
+      overtime,
+      adjustments,
+      monthlySubmissions,
+      contracts,
+      leaveRequests,
+      payrollRuns,
+      staffUsers,
+      taxBrackets,
+    });
+  }
+);
 
 router.get('/hr/my-payslips', requireAuth, requirePermission('hr.payslip.own', 'hr.leave.request'), async (req: AuthRequest, res: Response) => {
   const payslips = await query(
     `SELECT pi.*, pr.run_number, pr.pay_month, pr.status AS run_status, pr.posted_at, pr.paid_at,
-            sc.employee_code, sc.department_name
+            COALESCE(he.employee_number, sc.employee_code) AS employee_code,
+            COALESCE(he.department_name, sc.department_name) AS department_name
      FROM payroll_items pi
      INNER JOIN payroll_runs pr ON pr.id = pi.payroll_run_id
+     LEFT JOIN hr_employees he ON (he.id = pi.employee_id OR he.user_id = pi.user_id)
      LEFT JOIN staff_contracts sc ON sc.user_id = pi.user_id
-     WHERE pi.user_id = ? AND pr.status IN ('approved','posted','paid')
+     WHERE pi.user_id = ? AND pr.status IN ('approved','posted','partially_paid','paid')
      ORDER BY pr.pay_month DESC, pr.id DESC LIMIT 24`,
     [req.user!.id]
   );
   res.json({ payslips });
+});
+
+router.post('/hr/employees', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const {
+    user_id,
+    employee_number,
+    full_name,
+    gender = 'unspecified',
+    phone,
+    email,
+    address,
+    emergency_contact_name,
+    emergency_contact_phone,
+    department_name,
+    job_position = 'Clinic Staff',
+    employment_type = 'full_time',
+    hire_date,
+    contract_start,
+    contract_end,
+    basic_salary,
+    housing_allowance = 0,
+    licence_number,
+    licence_expiry,
+  } = req.body || {};
+
+  if (!full_name?.trim() || !department_name?.trim() || Number(basic_salary) <= 0) {
+    return res.status(400).json({ error: 'Full name, department, and positive basic salary are required.' });
+  }
+
+  const todayStr = await getClinicToday();
+  const hDate = hire_date || contract_start || todayStr;
+  const cStart = contract_start || hire_date || todayStr;
+  const empNum = employee_number?.trim() ? employee_number.trim().toUpperCase() : await nextSequence('EMP');
+
+  const dupCode = await queryOne('SELECT id FROM hr_employees WHERE employee_number = ?', [empNum]);
+  if (dupCode) return res.status(409).json({ error: `Employee number ${empNum} already exists.` });
+  if (user_id) {
+    const dupUser = await queryOne('SELECT id FROM hr_employees WHERE user_id = ?', [Number(user_id)]);
+    if (dupUser) return res.status(409).json({ error: 'Selected system user is already linked to another employee profile.' });
+  }
+
+  const ins = await execute(
+    `INSERT INTO hr_employees (
+      employee_number, user_id, full_name, gender, phone, email, address,
+      emergency_contact_name, emergency_contact_phone, department_name, job_position,
+      employment_type, hire_date, contract_start, contract_end, basic_salary, housing_allowance,
+      licence_number, licence_expiry, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+    [
+      empNum,
+      user_id ? Number(user_id) : null,
+      full_name.trim(),
+      gender,
+      phone?.trim() || null,
+      email?.trim() || null,
+      address?.trim() || null,
+      emergency_contact_name?.trim() || null,
+      emergency_contact_phone?.trim() || null,
+      department_name.trim(),
+      job_position.trim(),
+      employment_type,
+      hDate,
+      cStart,
+      contract_end || null,
+      Number(basic_salary),
+      Number(housing_allowance || 0),
+      licence_number?.trim() || null,
+      licence_expiry || null,
+    ]
+  );
+
+  if (user_id) {
+    const sc = await queryOne<{ id: number }>('SELECT id FROM staff_contracts WHERE user_id = ?', [Number(user_id)]);
+    if (sc) {
+      await execute(
+        `UPDATE staff_contracts SET employee_code = ?, department_name = ?, contract_type = ?, base_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, contract_end = ?, status = 'active', updated_at = ? WHERE id = ?`,
+        [empNum, department_name.trim(), employment_type, Number(basic_salary), Number(housing_allowance || 0), licence_number?.trim() || null, licence_expiry || null, cStart, contract_end || null, nowSql(), sc.id]
+      );
+    } else {
+      await execute(
+        `INSERT INTO staff_contracts (user_id, employee_code, department_name, contract_type, base_salary, housing_allowance, licence_number, licence_expiry, contract_start, contract_end, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+        [Number(user_id), empNum, department_name.trim(), employment_type, Number(basic_salary), Number(housing_allowance || 0), licence_number?.trim() || null, licence_expiry || null, cStart, contract_end || null]
+      );
+    }
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.employee.create',
+    entityType: 'hr_employee',
+    entityId: ins.insertId,
+    after: { employee_number: empNum, full_name, department_name, job_position, basic_salary },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId, employee_number: empNum });
+});
+
+router.put('/hr/employees/:id', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const existing = await queryOne<{ id: number; user_id: number | null; employee_number: string }>('SELECT id, user_id, employee_number FROM hr_employees WHERE id = ?', [id]);
+  if (!existing) return res.status(404).json({ error: 'Employee not found.' });
+
+  const b = req.body || {};
+  await execute(
+    `UPDATE hr_employees SET
+       full_name = COALESCE(?, full_name),
+       gender = COALESCE(?, gender),
+       phone = COALESCE(?, phone),
+       email = COALESCE(?, email),
+       address = COALESCE(?, address),
+       emergency_contact_name = COALESCE(?, emergency_contact_name),
+       emergency_contact_phone = COALESCE(?, emergency_contact_phone),
+       department_name = COALESCE(?, department_name),
+       job_position = COALESCE(?, job_position),
+       employment_type = COALESCE(?, employment_type),
+       contract_start = COALESCE(?, contract_start),
+       contract_end = ?,
+       basic_salary = COALESCE(?, basic_salary),
+       housing_allowance = COALESCE(?, housing_allowance),
+       licence_number = ?,
+       licence_expiry = ?,
+       updated_at = ?
+     WHERE id = ?`,
+    [
+      b.full_name?.trim() || null,
+      b.gender || null,
+      b.phone !== undefined ? (b.phone?.trim() || null) : null,
+      b.email !== undefined ? (b.email?.trim() || null) : null,
+      b.address !== undefined ? (b.address?.trim() || null) : null,
+      b.emergency_contact_name !== undefined ? (b.emergency_contact_name?.trim() || null) : null,
+      b.emergency_contact_phone !== undefined ? (b.emergency_contact_phone?.trim() || null) : null,
+      b.department_name?.trim() || null,
+      b.job_position?.trim() || null,
+      b.employment_type || null,
+      b.contract_start || null,
+      b.contract_end !== undefined ? (b.contract_end || null) : null,
+      b.basic_salary !== undefined ? Number(b.basic_salary) : null,
+      b.housing_allowance !== undefined ? Number(b.housing_allowance) : null,
+      b.licence_number !== undefined ? (b.licence_number?.trim() || null) : null,
+      b.licence_expiry !== undefined ? (b.licence_expiry || null) : null,
+      nowSql(),
+      id,
+    ]
+  );
+
+  if (existing.user_id) {
+    await execute(
+      `UPDATE staff_contracts SET
+         department_name = COALESCE(?, department_name),
+         contract_type = COALESCE(?, contract_type),
+         base_salary = COALESCE(?, base_salary),
+         housing_allowance = COALESCE(?, housing_allowance),
+         licence_number = ?,
+         licence_expiry = ?,
+         contract_start = COALESCE(?, contract_start),
+         contract_end = ?,
+         updated_at = ?
+       WHERE user_id = ?`,
+      [
+        b.department_name?.trim() || null,
+        b.employment_type || null,
+        b.basic_salary !== undefined ? Number(b.basic_salary) : null,
+        b.housing_allowance !== undefined ? Number(b.housing_allowance) : null,
+        b.licence_number !== undefined ? (b.licence_number?.trim() || null) : null,
+        b.licence_expiry !== undefined ? (b.licence_expiry || null) : null,
+        b.contract_start || null,
+        b.contract_end !== undefined ? (b.contract_end || null) : null,
+        nowSql(),
+        existing.user_id,
+      ]
+    );
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.employee.update',
+    entityType: 'hr_employee',
+    entityId: id,
+    after: b,
+    req,
+  });
+  res.json({ ok: true });
+});
+
+router.patch('/hr/employees/:id/status', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { status, reason } = req.body || {};
+  const nextStatus = String(status || '').trim().toLowerCase();
+  if (!['active', 'inactive', 'resigned', 'terminated'].includes(nextStatus)) {
+    return res.status(400).json({ error: 'Status must be active, inactive, resigned, or terminated.' });
+  }
+  const emp = await queryOne<{ id: number; user_id: number | null; employee_number: string; full_name: string; status: string }>(
+    'SELECT id, user_id, employee_number, full_name, status FROM hr_employees WHERE id = ?',
+    [id]
+  );
+  if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+  if ((nextStatus === 'terminated' || nextStatus === 'resigned') && !reason?.trim()) {
+    return res.status(400).json({ error: `Formal reason is required when marking an employee as ${nextStatus}.` });
+  }
+
+  const isOffboarded = nextStatus === 'inactive' || nextStatus === 'resigned' || nextStatus === 'terminated';
+  const termDate = nextStatus === 'terminated' || nextStatus === 'resigned' ? await getClinicToday() : null;
+
+  // Non-destructive offboarding: find linked system accounts, revoke sessions, and deactivate on any offboarded status without deleting clinical/financial/audit history
+  const linkedUsers = await query<{ id: number; email: string }>(
+    'SELECT id, email FROM users WHERE employee_id = ? OR id = ?',
+    [id, emp.user_id || -1]
+  );
+
+  // Re-hire safeguard: keep access_review_required = 1 when transitioning back to 'active' if linked user accounts exist
+  const requiresAccessReview = isOffboarded ? 1 : linkedUsers.length > 0 && emp.status !== 'active' ? 1 : 0;
+
+  await execute(
+    'UPDATE hr_employees SET status = ?, terminated_at = ?, termination_reason = ?, access_review_required = ?, updated_at = ? WHERE id = ?',
+    [nextStatus, termDate, reason?.trim() || null, requiresAccessReview, nowSql(), id]
+  );
+
+  let totalRevokedSessions = 0;
+  for (const lu of linkedUsers) {
+    await execute('UPDATE staff_contracts SET status = ?, updated_at = ? WHERE user_id = ?', [
+      nextStatus === 'active' ? 'active' : 'terminated',
+      nowSql(),
+      lu.id,
+    ]);
+    if (isOffboarded) {
+      await execute("UPDATE users SET active = 0, status = 'inactive', updated_at = ? WHERE id = ?", [nowSql(), lu.id]);
+      totalRevokedSessions += await revokeAllUserSessions(lu.id, req.user!.id);
+    }
+    // Note: when nextStatus === 'active' (re-hire), linked user accounts remain inactive until explicitly reviewed & activated by System Administration.
+  }
+
+  if (isOffboarded && linkedUsers.length > 0) {
+    await createNotification({
+      targetRole: 'ADM',
+      title: 'Access Review Required: HR Offboarding',
+      message: `HR marked ${emp.employee_number} (${emp.full_name}) as ${nextStatus}. ${linkedUsers.length} linked account(s) deactivated and ${totalRevokedSessions} active session(s) revoked.`,
+      severity: 'warning',
+      entityType: 'hr_employee',
+      entityId: id,
+    });
+  } else if (nextStatus === 'active' && emp.status !== 'active' && linkedUsers.length > 0) {
+    await createNotification({
+      targetRole: 'ADM',
+      title: 'Re-Hired Staff Access Review Required',
+      message: `HR reactivated ${emp.employee_number} (${emp.full_name}). Linked user account(s) remain disabled pending explicit Administrator review and reactivation.`,
+      severity: 'warning',
+      entityType: 'hr_employee',
+      entityId: id,
+    });
+    await writeAuditLog({
+      user: req.user,
+      action: 'hr.employee.rehired_pending_admin_review',
+      entityType: 'hr_employee',
+      entityId: id,
+      before: { status: emp.status },
+      after: { status: nextStatus, linkedUsers: linkedUsers.map((u) => u.id), userAccountsKeptInactive: true },
+      reason: reason?.trim() || null,
+      req,
+    });
+  }
+
+  await writeAuditLog({
+    user: req.user,
+    action: `hr.employee.${nextStatus}`,
+    entityType: 'hr_employee',
+    entityId: id,
+    before: { status: emp.status },
+    after: {
+      status: nextStatus,
+      terminated_at: termDate,
+      access_review_required: Boolean(requiresAccessReview),
+      linkedUsers: linkedUsers.map((u) => u.id),
+      revokedSessions: totalRevokedSessions,
+    },
+    reason: reason?.trim() || null,
+    req,
+  });
+  res.json({ ok: true, status: nextStatus, accessReviewRequired: Boolean(requiresAccessReview), revokedSessions: totalRevokedSessions });
+});
+
+router.post('/hr/employees/:id/documents', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const empId = Number(req.params.id);
+  const { doc_type = 'contract', title, file_ref, expiry_date, notes } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Document title is required.' });
+  const emp = await queryOne('SELECT id FROM hr_employees WHERE id = ?', [empId]);
+  if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+
+  const ins = await execute(
+    'INSERT INTO hr_employee_documents (employee_id, doc_type, title, file_ref, expiry_date, notes, uploaded_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [empId, doc_type, title.trim(), file_ref?.trim() || null, expiry_date || null, notes?.trim() || null, req.user!.id]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.employee.document.add',
+    entityType: 'hr_employee_document',
+    entityId: ins.insertId,
+    after: { employee_id: empId, doc_type, title },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.delete('/hr/documents/:docId', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const docId = Number(req.params.docId);
+  const doc = await queryOne('SELECT * FROM hr_employee_documents WHERE id = ?', [docId]);
+  if (!doc) return res.status(404).json({ error: 'Document not found.' });
+  await execute('DELETE FROM hr_employee_documents WHERE id = ?', [docId]);
+  await writeAuditLog({ user: req.user, action: 'hr.employee.document.delete', entityType: 'hr_employee_document', entityId: docId, before: doc, req });
+  res.json({ ok: true });
+});
+
+router.post('/hr/attendance', requireAuth, requirePermission('hr.attendance.manage', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+  const { employee_id, attendance_date, check_in, check_out, status, hours_worked, notes } = req.body || {};
+  if (!employee_id || !attendance_date) {
+    return res.status(400).json({ error: 'Employee and attendance date are required.' });
+  }
+  const emp = await queryOne<{ id: number; user_id: number | null }>('SELECT id, user_id FROM hr_employees WHERE id = ?', [Number(employee_id)]);
+  if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+
+  const metrics = computeAttendanceMetrics(check_in, check_out);
+  const finalHours = hours_worked !== undefined && hours_worked !== '' ? Number(hours_worked) : metrics.hoursWorked;
+  const derivedStatus =
+    status && ['present', 'late', 'early_departure', 'absent', 'on_leave'].includes(status)
+      ? status
+      : metrics.lateMinutes > 0
+        ? 'late'
+        : metrics.earlyLeaveMinutes > 0
+          ? 'early_departure'
+          : 'present';
+
+  const existing = await queryOne<{ id: number }>('SELECT id FROM hr_attendance WHERE employee_id = ? AND attendance_date = ?', [emp.id, attendance_date]);
+  if (existing) {
+    await execute(
+      `UPDATE hr_attendance
+       SET check_in = ?, check_out = ?, hours_worked = ?, status = ?, late_minutes = ?, early_leave_minutes = ?, notes = ?, updated_by = ?, updated_at = ?
+       WHERE id = ?`,
+      [check_in || null, check_out || null, finalHours, derivedStatus, metrics.lateMinutes, metrics.earlyLeaveMinutes, notes?.trim() || null, req.user!.id, nowSql(), existing.id]
+    );
+    await writeAuditLog({
+      user: req.user,
+      action: 'hr.attendance.update',
+      entityType: 'hr_attendance',
+      entityId: existing.id,
+      after: { employee_id: emp.id, attendance_date, status: derivedStatus, hours_worked: finalHours },
+      req,
+    });
+    return res.json({ id: existing.id, updated: true, status: derivedStatus, hours_worked: finalHours });
+  }
+
+  const ins = await execute(
+    `INSERT INTO hr_attendance (employee_id, user_id, attendance_date, check_in, check_out, hours_worked, status, late_minutes, early_leave_minutes, notes, recorded_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [emp.id, emp.user_id, attendance_date, check_in || null, check_out || null, finalHours, derivedStatus, metrics.lateMinutes, metrics.earlyLeaveMinutes, notes?.trim() || null, req.user!.id]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.attendance.record',
+    entityType: 'hr_attendance',
+    entityId: ins.insertId,
+    after: { employee_id: emp.id, attendance_date, status: derivedStatus, hours_worked: finalHours },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId, status: derivedStatus, hours_worked: finalHours });
+});
+
+router.put('/hr/attendance/:id', requireAuth, requirePermission('hr.attendance.manage', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const prev = await queryOne('SELECT * FROM hr_attendance WHERE id = ?', [id]);
+  if (!prev) return res.status(404).json({ error: 'Attendance record not found.' });
+  const { check_in, check_out, status, hours_worked, notes } = req.body || {};
+  const metrics = computeAttendanceMetrics(check_in, check_out);
+  const finalHours = hours_worked !== undefined && hours_worked !== '' ? Number(hours_worked) : metrics.hoursWorked;
+  await execute(
+    `UPDATE hr_attendance SET check_in = ?, check_out = ?, hours_worked = ?, status = ?, late_minutes = ?, early_leave_minutes = ?, notes = ?, updated_by = ?, updated_at = ? WHERE id = ?`,
+    [check_in || null, check_out || null, finalHours, status || 'present', metrics.lateMinutes, metrics.earlyLeaveMinutes, notes?.trim() || null, req.user!.id, nowSql(), id]
+  );
+  await writeAuditLog({ user: req.user, action: 'hr.attendance.correct', entityType: 'hr_attendance', entityId: id, before: prev, after: { check_in, check_out, status, hours_worked: finalHours, notes }, req });
+  res.json({ ok: true });
+});
+
+router.post('/hr/leave-types', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+  const { code, name, annual_allowance_days = 0, paid = true, description } = req.body || {};
+  const cleanCode = String(code || '').trim().toLowerCase();
+  if (!cleanCode || !name?.trim()) return res.status(400).json({ error: 'Code and name are required.' });
+  const existing = await queryOne<{ id: number }>('SELECT id FROM hr_leave_types WHERE code = ?', [cleanCode]);
+  if (existing) {
+    await execute(
+      'UPDATE hr_leave_types SET name = ?, annual_allowance_days = ?, paid = ?, description = ?, active = 1 WHERE id = ?',
+      [name.trim(), Number(annual_allowance_days || 0), paid ? 1 : 0, description?.trim() || null, existing.id]
+    );
+    return res.json({ id: existing.id, updated: true });
+  }
+  const ins = await execute(
+    'INSERT INTO hr_leave_types (code, name, annual_allowance_days, paid, description, active) VALUES (?, ?, ?, ?, ?, 1)',
+    [cleanCode, name.trim(), Number(annual_allowance_days || 0), paid ? 1 : 0, description?.trim() || null]
+  );
+  res.status(201).json({ id: ins.insertId });
 });
 
 router.post('/hr/contracts', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
@@ -7804,6 +12329,10 @@ router.post('/hr/contracts', requireAuth, requirePermission('hr.manage'), async 
     await execute(
       `UPDATE staff_contracts SET employee_code = ?, department_name = ?, contract_type = ?, base_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, contract_end = ?, updated_at = ? WHERE id = ?`,
       [employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, contract_end || null, nowSql(), existing.id]
+    );
+    await execute(
+      `UPDATE hr_employees SET employee_number = ?, department_name = ?, employment_type = ?, basic_salary = ?, housing_allowance = ?, licence_number = ?, licence_expiry = ?, contract_start = ?, contract_end = ?, updated_at = ? WHERE user_id = ?`,
+      [employee_code.trim(), department_name.trim(), contract_type, Number(base_salary), Number(housing_allowance || 0), licence_number || null, licence_expiry || null, contract_start, contract_end || null, nowSql(), Number(user_id)]
     );
     await writeAuditLog({
       user: req.user,
@@ -7833,8 +12362,7 @@ router.post('/hr/contracts', requireAuth, requirePermission('hr.manage'), async 
 });
 
 router.post('/hr/leave', requireAuth, requirePermission('hr.leave.request', 'hr.manage'), async (req: AuthRequest, res: Response) => {
-  const { user_id, leave_type = 'annual', start_date, end_date, reason } = req.body || {};
-  const targetUserId = hasPermission(req.user!, 'hr.manage') && user_id ? Number(user_id) : req.user!.id;
+  const { user_id, employee_id, leave_type = 'annual', start_date, end_date, reason } = req.body || {};
   if (!start_date || !end_date || !reason?.trim()) {
     return res.status(400).json({ error: 'Start date, end date, and reason are required.' });
   }
@@ -7847,9 +12375,26 @@ router.post('/hr/leave', requireAuth, requirePermission('hr.leave.request', 'hr.
   if (daysCount > 90) {
     return res.status(400).json({ error: 'Single leave request cannot exceed 90 days.' });
   }
+
+  let resolvedEmpId: number | null = null;
+  let resolvedUserId: number | null = req.user!.id;
+  if (hasPermission(req.user!, 'hr.manage') && employee_id) {
+    const emp = await queryOne<{ id: number; user_id: number | null }>('SELECT id, user_id FROM hr_employees WHERE id = ?', [Number(employee_id)]);
+    if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+    resolvedEmpId = emp.id;
+    resolvedUserId = emp.user_id ?? null;
+  } else if (hasPermission(req.user!, 'hr.manage') && user_id) {
+    resolvedUserId = Number(user_id);
+    const emp = await queryOne<{ id: number }>('SELECT id FROM hr_employees WHERE user_id = ?', [resolvedUserId]);
+    resolvedEmpId = emp?.id ?? null;
+  } else {
+    const emp = await queryOne<{ id: number }>('SELECT id FROM hr_employees WHERE user_id = ?', [req.user!.id]);
+    resolvedEmpId = emp?.id ?? null;
+  }
+
   const inserted = await execute(
-    "INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, days_count, reason, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-    [targetUserId, leave_type, start_date, end_date, daysCount, reason.trim()]
+    "INSERT INTO leave_requests (user_id, employee_id, leave_type, start_date, end_date, days_count, reason, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+    [resolvedUserId, resolvedEmpId, String(leave_type).toLowerCase(), start_date, end_date, daysCount, reason.trim()]
   );
   await createNotification({
     targetRole: 'HRO',
@@ -7864,7 +12409,7 @@ router.post('/hr/leave', requireAuth, requirePermission('hr.leave.request', 'hr.
     action: 'hr.leave.request',
     entityType: 'leave_request',
     entityId: inserted.insertId,
-    after: { targetUserId, leave_type, start_date, end_date, daysCount },
+    after: { resolvedUserId, resolvedEmpId, leave_type, start_date, end_date, daysCount },
     req,
   });
   res.status(201).json({ id: inserted.insertId, daysCount });
@@ -7881,7 +12426,7 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
   }
 
   const result = await withTransaction(async () => {
-    const lr = await queryOne<{ id: number; user_id: number; start_date: string; end_date: string; leave_type: string; status: string }>(
+    const lr = await queryOne<{ id: number; user_id: number | null; employee_id: number | null; start_date: string; end_date: string; leave_type: string; status: string }>(
       'SELECT * FROM leave_requests WHERE id = ?',
       [id]
     );
@@ -7891,7 +12436,13 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
       if (!['pending', 'approved'].includes(lr.status)) {
         return { ok: false as const, error: 'Only pending or approved leave can be cancelled.', httpStatus: 409 };
       }
-      await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?', ['cancelled', req.user!.id, nowSql(), id]);
+      await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?', [
+        'cancelled',
+        req.user!.id,
+        nowSql(),
+        decision_note?.trim() || null,
+        id,
+      ]);
       await execute('DELETE FROM doctor_blocks WHERE source_leave_id = ?', [id]);
       await writeAuditLog({
         user: req.user,
@@ -7905,18 +12456,21 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
     }
 
     if (lr.status !== 'pending') return { ok: false as const, error: 'Leave request already decided.', httpStatus: 409 };
-    assertDifferentUser(req.user!.id, lr.user_id, 'approve or reject your own leave request');
+    if (lr.user_id) {
+      assertDifferentUser(req.user!.id, lr.user_id, 'approve or reject your own leave request');
+    }
 
-    await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?', [
+    await execute('UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?', [
       decision,
       req.user!.id,
       nowSql(),
+      decision_note?.trim() || null,
       id,
     ]);
 
     let blocksCreated = 0;
     let conflictingAppointments: Array<{ id: number; appointment_date: string; start_time: string }> = [];
-    if (decision === 'approved') {
+    if (decision === 'approved' && lr.user_id) {
       const isDoc = await queryOne<{ cnt: number }>(
         `SELECT COUNT(*) AS cnt FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ? AND r.code = 'DOC'`,
         [lr.user_id]
@@ -7966,7 +12520,303 @@ router.post('/hr/leave/:id/decide', requireAuth, requirePermission('hr.manage'),
   res.json(result);
 });
 
-router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/overtime', requireAuth, requirePermission('hr.overtime.manage', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+  const { employee_id, overtime_date, hours, day_type = 'regular', rate_multiplier, reason } = req.body || {};
+  const hrs = Number(hours || 0);
+  if (!employee_id || !overtime_date || hrs <= 0 || !reason?.trim()) {
+    return res.status(400).json({ error: 'Employee, overtime date, positive hours, and reason are required.' });
+  }
+  const emp = await queryOne<{ id: number; user_id: number | null; basic_salary: number }>('SELECT id, user_id, basic_salary FROM hr_employees WHERE id = ?', [Number(employee_id)]);
+  if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+
+  const defaultMult = day_type === 'holiday' ? 2.5 : day_type === 'weekend' ? 2.0 : 1.5;
+  const mult = Number(rate_multiplier || defaultMult);
+  const hourlyRate = Number((Number(emp.basic_salary) / 160).toFixed(2));
+  const amount = Number((hrs * hourlyRate * mult).toFixed(2));
+
+  const ins = await execute(
+    `INSERT INTO hr_overtime (employee_id, user_id, overtime_date, hours, day_type, rate_multiplier, hourly_rate_snapshot, computed_amount, reason, status, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    [emp.id, emp.user_id, overtime_date, hrs, day_type, mult, hourlyRate, amount, reason.trim(), req.user!.id]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.overtime.create',
+    entityType: 'hr_overtime',
+    entityId: ins.insertId,
+    after: { employee_id: emp.id, overtime_date, hours: hrs, day_type, mult, computed_amount: amount },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId, computed_amount: amount });
+});
+
+router.post('/hr/overtime/:id/decide', requireAuth, requirePermission('hr.overtime.manage', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { decision, decision_note } = req.body || {};
+  if (!['approved', 'rejected'].includes(decision)) {
+    return res.status(400).json({ error: 'Decision must be approved or rejected.' });
+  }
+  const ot = await queryOne<{ id: number; user_id: number | null; status: string }>('SELECT id, user_id, status FROM hr_overtime WHERE id = ?', [id]);
+  if (!ot) return res.status(404).json({ error: 'Overtime record not found.' });
+  if (ot.status !== 'pending') return res.status(409).json({ error: 'Overtime record already decided.' });
+  if (ot.user_id && ot.user_id === req.user!.id) {
+    return res.status(403).json({ error: 'Segregation of duties violation: cannot approve or reject your own overtime.' });
+  }
+
+  await execute('UPDATE hr_overtime SET status = ?, decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?', [
+    decision,
+    req.user!.id,
+    nowSql(),
+    decision_note?.trim() || null,
+    id,
+  ]);
+  await writeAuditLog({ user: req.user, action: `hr.overtime.${decision}`, entityType: 'hr_overtime', entityId: id, reason: decision_note || null, req });
+  res.json({ ok: true, status: decision });
+});
+
+router.post('/hr/adjustments', requireAuth, requirePermission('hr.manage', 'hr.payroll.submit'), async (req: AuthRequest, res: Response) => {
+  const { employee_id, adjustment_type, category, description, amount, effective_month, effective_date, recurring = false } = req.body || {};
+  const amt = Number(Number(amount || 0).toFixed(2));
+  if (!employee_id || !['earning', 'deduction'].includes(String(adjustment_type)) || !category?.trim() || !description?.trim() || amt <= 0) {
+    return res.status(400).json({ error: 'Employee, type (earning/deduction), category, description, and positive amount are required.' });
+  }
+  const emp = await queryOne<{ id: number; user_id: number | null }>('SELECT id, user_id FROM hr_employees WHERE id = ?', [Number(employee_id)]);
+  if (!emp) return res.status(404).json({ error: 'Employee not found.' });
+  const effDate = effective_date || (await getClinicToday());
+  const effMonth = effective_month || effDate.slice(0, 7);
+
+  const ins = await execute(
+    `INSERT INTO hr_adjustments (employee_id, user_id, adjustment_type, category, description, amount, effective_month, effective_date, recurring, status, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+    [emp.id, emp.user_id, adjustment_type, category.trim(), description.trim(), amt, effMonth, effDate, recurring ? 1 : 0, req.user!.id]
+  );
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.adjustment.create',
+    entityType: 'hr_adjustment',
+    entityId: ins.insertId,
+    after: { employee_id: emp.id, adjustment_type, category, amount: amt, effective_month: effMonth, recurring },
+    req,
+  });
+  res.status(201).json({ id: ins.insertId });
+});
+
+router.patch('/hr/adjustments/:id/cancel', requireAuth, requirePermission('hr.manage', 'hr.payroll.submit'), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  await execute("UPDATE hr_adjustments SET status = 'cancelled' WHERE id = ?", [id]);
+  await writeAuditLog({ user: req.user, action: 'hr.adjustment.cancel', entityType: 'hr_adjustment', entityId: id, req });
+  res.json({ ok: true });
+});
+
+router.post('/hr/payroll-inputs/submit', requireAuth, requirePermission('hr.payroll.submit', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+  const payMonth = String(req.body?.pay_month || new Date().toISOString().slice(0, 7));
+  const notes = req.body?.notes ? String(req.body.notes).trim() : null;
+  if (!/^\d{4}-\d{2}$/.test(payMonth)) {
+    return res.status(400).json({ error: 'pay_month must be formatted as YYYY-MM.' });
+  }
+  const monthStart = `${payMonth}-01`;
+  const [yr, mo] = payMonth.split('-').map(Number);
+  const monthEnd = new Date(Date.UTC(yr, mo, 0)).toISOString().slice(0, 10);
+
+  const [emps, attSum, otSum, adjEarn, adjDed] = await Promise.all([
+    queryOne<{ cnt: number }>(
+      "SELECT COUNT(*) AS cnt FROM hr_employees WHERE status = 'active' AND contract_start <= ? AND (contract_end IS NULL OR contract_end >= ?)",
+      [monthEnd, monthStart]
+    ),
+    queryOne<{ hrs: number }>(
+      'SELECT COALESCE(SUM(hours_worked), 0) AS hrs FROM hr_attendance WHERE substr(attendance_date, 1, 7) = ?',
+      [payMonth]
+    ),
+    queryOne<{ amt: number }>(
+      "SELECT COALESCE(SUM(computed_amount), 0) AS amt FROM hr_overtime WHERE status = 'approved' AND substr(overtime_date, 1, 7) = ?",
+      [payMonth]
+    ),
+    queryOne<{ amt: number }>(
+      "SELECT COALESCE(SUM(amount), 0) AS amt FROM hr_adjustments WHERE status = 'active' AND adjustment_type = 'earning' AND (effective_month = ? OR recurring = 1)",
+      [payMonth]
+    ),
+    queryOne<{ amt: number }>(
+      "SELECT COALESCE(SUM(amount), 0) AS amt FROM hr_adjustments WHERE status = 'active' AND adjustment_type = 'deduction' AND (effective_month = ? OR recurring = 1)",
+      [payMonth]
+    ),
+  ]);
+
+  const totalEmployees = Number(emps?.cnt || 0);
+  const totalAttendanceHours = Number(Number(attSum?.hrs || 0).toFixed(2));
+  const totalOvertimeAmount = Number(Number(otSum?.amt || 0).toFixed(2));
+  const totalExtraEarnings = Number(Number(adjEarn?.amt || 0).toFixed(2));
+  const totalExtraDeductions = Number(Number(adjDed?.amt || 0).toFixed(2));
+
+  const existing = await queryOne<{ id: number; status: string }>('SELECT id, status FROM hr_monthly_submissions WHERE pay_month = ?', [payMonth]);
+  if (existing) {
+    if (existing.status === 'processed') {
+      return res.status(409).json({ error: `Payroll inputs for ${payMonth} have already been processed into a payroll run.` });
+    }
+    await execute(
+      `UPDATE hr_monthly_submissions
+       SET status = 'submitted', total_employees = ?, total_attendance_hours = ?, total_overtime_amount = ?, total_extra_earnings = ?, total_extra_deductions = ?, notes = ?, submitted_by = ?, submitted_at = ?
+       WHERE id = ?`,
+      [totalEmployees, totalAttendanceHours, totalOvertimeAmount, totalExtraEarnings, totalExtraDeductions, notes, req.user!.id, nowSql(), existing.id]
+    );
+  } else {
+    await execute(
+      `INSERT INTO hr_monthly_submissions (pay_month, status, total_employees, total_attendance_hours, total_overtime_amount, total_extra_earnings, total_extra_deductions, notes, submitted_by)
+       VALUES (?, 'submitted', ?, ?, ?, ?, ?, ?, ?)`,
+      [payMonth, totalEmployees, totalAttendanceHours, totalOvertimeAmount, totalExtraEarnings, totalExtraDeductions, notes, req.user!.id]
+    );
+  }
+
+  await createNotification({
+    targetRole: 'ACC',
+    title: 'HR Monthly Payroll Inputs Ready',
+    message: `HR submitted ${payMonth} payroll inputs (${totalEmployees} active employees, $${totalOvertimeAmount.toFixed(2)} approved OT) for Finance payroll generation.`,
+    severity: 'info',
+    entityType: 'hr_monthly_submission',
+  });
+  await writeAuditLog({
+    user: req.user,
+    action: 'hr.payroll_inputs.submit',
+    entityType: 'hr_monthly_submission',
+    entityId: payMonth,
+    after: { payMonth, totalEmployees, totalAttendanceHours, totalOvertimeAmount, totalExtraEarnings, totalExtraDeductions },
+    req,
+  });
+
+  res.json({
+    ok: true,
+    payMonth,
+    totalEmployees,
+    totalAttendanceHours,
+    totalOvertimeAmount,
+    totalExtraEarnings,
+    totalExtraDeductions,
+  });
+});
+
+router.get(
+  '/hr/reports/:type',
+  requireAuth,
+  requirePermission('hr.manage', 'hr.attendance.manage', 'hr.overtime.manage', 'hr.payroll.submit', 'finance.report.view', 'audit.read'),
+  async (req: AuthRequest, res: Response) => {
+    const type = req.params.type;
+    const month = req.query.month ? String(req.query.month).slice(0, 7) : new Date().toISOString().slice(0, 7);
+
+    if (type === 'employees') {
+      const rows = await query(
+        `SELECT employee_number, full_name, gender, department_name, job_position, employment_type,
+                hire_date, contract_start, contract_end, basic_salary, housing_allowance, status
+         FROM hr_employees
+         ORDER BY department_name ASC, full_name ASC`
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'attendance') {
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name,
+                COUNT(att.id) AS days_logged,
+                SUM(CASE WHEN att.status IN ('present','late','early_departure') THEN 1 ELSE 0 END) AS days_present,
+                SUM(CASE WHEN att.status = 'absent' THEN 1 ELSE 0 END) AS days_absent,
+                SUM(CASE WHEN att.status = 'late' THEN 1 ELSE 0 END) AS late_days,
+                ROUND(COALESCE(SUM(att.hours_worked), 0), 2) AS total_hours
+         FROM hr_employees he
+         LEFT JOIN hr_attendance att ON att.employee_id = he.id AND substr(att.attendance_date, 1, 7) = ?
+         GROUP BY he.id
+         ORDER BY he.department_name, he.full_name`,
+        [month]
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'absenteeism') {
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name, att.attendance_date, att.status, att.notes
+         FROM hr_attendance att
+         INNER JOIN hr_employees he ON he.id = att.employee_id
+         WHERE substr(att.attendance_date, 1, 7) = ? AND att.status = 'absent'
+         ORDER BY att.attendance_date DESC`,
+        [month]
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'late') {
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name, att.attendance_date,
+                att.check_in, att.check_out, att.late_minutes, att.early_leave_minutes, att.status
+         FROM hr_attendance att
+         INNER JOIN hr_employees he ON he.id = att.employee_id
+         WHERE substr(att.attendance_date, 1, 7) = ? AND (att.late_minutes > 0 OR att.early_leave_minutes > 0 OR att.status IN ('late','early_departure'))
+         ORDER BY att.attendance_date DESC`,
+        [month]
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'leave-balances') {
+      const yr = month.slice(0, 4);
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name, lt.name AS leave_type, lt.annual_allowance_days,
+                COALESCE((SELECT SUM(lr.days_count) FROM leave_requests lr WHERE (lr.employee_id = he.id OR (lr.employee_id IS NULL AND lr.user_id = he.user_id)) AND LOWER(lr.leave_type) = lt.code AND lr.status = 'approved' AND substr(lr.start_date, 1, 4) = ?), 0) AS used_days
+         FROM hr_employees he
+         CROSS JOIN hr_leave_types lt
+         WHERE he.status = 'active' AND lt.active = 1 AND lt.annual_allowance_days > 0
+         ORDER BY he.full_name, lt.id`,
+        [yr]
+      );
+      return res.json({
+        reportType: type,
+        month,
+        rows: rows.map((r) => ({ ...r, remaining_days: Math.max(0, Number(r.annual_allowance_days) - Number(r.used_days)) })),
+      });
+    }
+    if (type === 'leave-utilization') {
+      const rows = await query(
+        `SELECT COALESCE(he.employee_number, 'USR') AS employee_number,
+                COALESCE(he.full_name, u.full_name) AS staff_name,
+                he.department_name, lr.leave_type, lr.start_date, lr.end_date, lr.days_count, lr.status, lr.reason
+         FROM leave_requests lr
+         LEFT JOIN hr_employees he ON (he.id = lr.employee_id OR (lr.employee_id IS NULL AND he.user_id = lr.user_id))
+         LEFT JOIN users u ON u.id = lr.user_id
+         ORDER BY lr.start_date DESC LIMIT 100`
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'overtime') {
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name, ot.overtime_date,
+                ot.day_type, ot.hours, ot.rate_multiplier, ot.computed_amount, ot.status, ot.reason
+         FROM hr_overtime ot
+         INNER JOIN hr_employees he ON he.id = ot.employee_id
+         WHERE substr(ot.overtime_date, 1, 7) = ?
+         ORDER BY ot.overtime_date DESC`,
+        [month]
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'earnings-deductions') {
+      const rows = await query(
+        `SELECT he.employee_number, he.full_name, he.department_name, adj.adjustment_type,
+                adj.category, adj.description, adj.amount, adj.effective_month, adj.recurring, adj.status
+         FROM hr_adjustments adj
+         INNER JOIN hr_employees he ON he.id = adj.employee_id
+         WHERE adj.effective_month = ? OR adj.recurring = 1
+         ORDER BY adj.adjustment_type, he.full_name`,
+        [month]
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    if (type === 'turnover') {
+      const rows = await query(
+        `SELECT employee_number, full_name, department_name, job_position, employment_type,
+                hire_date, status, terminated_at, termination_reason
+         FROM hr_employees
+         WHERE status IN ('inactive', 'terminated')
+         ORDER BY terminated_at DESC, id DESC`
+      );
+      return res.json({ reportType: type, month, rows });
+    }
+    return res.status(400).json({ error: 'Unknown HR report type.' });
+  }
+);
+
+async function generatePayrollRunHandler(req: AuthRequest, res: Response) {
   const payMonth = String(req.body?.pay_month || new Date().toISOString().slice(0, 7));
   if (!/^\d{4}-\d{2}$/.test(payMonth)) {
     return res.status(400).json({ error: 'pay_month must be YYYY-MM.' });
@@ -7976,31 +12826,79 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
   const monthEnd = new Date(Date.UTC(yr, mo, 0)).toISOString().slice(0, 10);
 
   const result = await withTransaction(async () => {
-    const existing = await queryOne<{ id: number; run_number: string }>('SELECT id, run_number FROM payroll_runs WHERE pay_month = ?', [payMonth]);
+    const existing = await queryOne<{ id: number; run_number: string }>(
+      "SELECT id, run_number FROM payroll_runs WHERE pay_month = ? AND status != 'rejected'",
+      [payMonth]
+    );
     if (existing) {
       return { ok: false as const, error: `Payroll run for ${payMonth} already exists (${existing.run_number}).`, httpStatus: 409 };
     }
 
-    const contracts = await query<{
-      user_id: number;
+    const employees = await query<{
+      id: number;
+      user_id: number | null;
       full_name: string;
       role_code: string;
-      base_salary: number;
+      basic_salary: number;
       housing_allowance: number;
     }>(
-      `SELECT sc.user_id, u.full_name,
-              COALESCE((SELECT r.code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id ORDER BY ur.role_id ASC LIMIT 1), 'STF') AS role_code,
-              sc.base_salary, sc.housing_allowance
-       FROM staff_contracts sc
-       INNER JOIN users u ON u.id = sc.user_id
-       WHERE sc.status = 'active' AND u.active = 1
-         AND sc.contract_start <= ?
-         AND (sc.contract_end IS NULL OR sc.contract_end >= ?)`,
+      `SELECT he.id, he.user_id, he.full_name,
+              COALESCE((SELECT r.code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = he.user_id ORDER BY ur.role_id ASC LIMIT 1), 'EMP') AS role_code,
+              he.basic_salary, he.housing_allowance
+       FROM hr_employees he
+       WHERE he.status = 'active'
+         AND he.contract_start <= ?
+         AND (he.contract_end IS NULL OR he.contract_end >= ?)`,
       [monthEnd, monthStart]
     );
-    if (contracts.length === 0) {
-      return { ok: false as const, error: 'No active staff contracts eligible for this pay period.', httpStatus: 400 };
+
+    if (employees.length === 0) {
+      return { ok: false as const, error: 'No active employees eligible for this pay period.', httpStatus: 400 };
     }
+
+    const [approvedOts, activeAdjs, unpaidLeaves, absentDays] = await Promise.all([
+      query<{ id: number; employee_id: number; computed_amount: number }>(
+        "SELECT id, employee_id, computed_amount FROM hr_overtime WHERE status = 'approved' AND payroll_run_id IS NULL AND substr(overtime_date, 1, 7) = ?",
+        [payMonth]
+      ),
+      query<{ employee_id: number; adjustment_type: string; category: string; amount: number }>(
+        "SELECT employee_id, adjustment_type, category, amount FROM hr_adjustments WHERE status = 'active' AND (effective_month = ? OR recurring = 1)",
+        [payMonth]
+      ),
+      query<{ employee_id: number | null; user_id: number | null; days_count: number }>(
+        "SELECT employee_id, user_id, days_count FROM leave_requests WHERE status = 'approved' AND LOWER(leave_type) = 'unpaid' AND substr(start_date, 1, 7) = ?",
+        [payMonth]
+      ),
+      query<{ employee_id: number; cnt: number }>(
+        "SELECT employee_id, COUNT(*) AS cnt FROM hr_attendance WHERE status = 'absent' AND substr(attendance_date, 1, 7) = ? GROUP BY employee_id",
+        [payMonth]
+      ),
+    ]);
+
+    const otByEmp = new Map<number, number>();
+    const consumedOtIds: number[] = [];
+    for (const o of approvedOts) {
+      otByEmp.set(Number(o.employee_id), Number(((otByEmp.get(Number(o.employee_id)) || 0) + Number(o.computed_amount || 0)).toFixed(2)));
+      consumedOtIds.push(o.id);
+    }
+
+    const allowAdjByEmp = new Map<number, number>();
+    const bonusByEmp = new Map<number, number>();
+    const dedByEmp = new Map<number, number>();
+    for (const a of activeAdjs) {
+      const eid = Number(a.employee_id);
+      if (a.adjustment_type === 'earning') {
+        if (['Bonus', 'Incentive', 'Overtime'].includes(a.category)) {
+          bonusByEmp.set(eid, Number(((bonusByEmp.get(eid) || 0) + Number(a.amount)).toFixed(2)));
+        } else {
+          allowAdjByEmp.set(eid, Number(((allowAdjByEmp.get(eid) || 0) + Number(a.amount)).toFixed(2)));
+        }
+      } else {
+        dedByEmp.set(eid, Number(((dedByEmp.get(eid) || 0) + Number(a.amount)).toFixed(2)));
+      }
+    }
+
+    const absentByEmp = new Map<number, number>(absentDays.map((a) => [Number(a.employee_id), Number(a.cnt || 0)]));
 
     const runNumber = await nextSequence('PAY');
     let totalGross = 0;
@@ -8008,29 +12906,46 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
     let totalNet = 0;
 
     const computedLines = [];
-    for (const c of contracts) {
-      const base = Number(c.base_salary);
-      const allow = Number(c.housing_allowance || 0);
-      const gross = Number((base + allow).toFixed(2));
+    for (const emp of employees) {
+      const base = Number(emp.basic_salary);
+      const allow = Number((Number(emp.housing_allowance || 0) + (allowAdjByEmp.get(emp.id) || 0)).toFixed(2));
+      const otPay = otByEmp.get(emp.id) || 0;
+      const bonus = bonusByEmp.get(emp.id) || 0;
+
+      let unpaidLeaveDays = absentByEmp.get(emp.id) || 0;
+      for (const ul of unpaidLeaves) {
+        if ((ul.employee_id && Number(ul.employee_id) === emp.id) || (!ul.employee_id && emp.user_id && Number(ul.user_id) === emp.user_id)) {
+          unpaidLeaveDays += Number(ul.days_count || 0);
+        }
+      }
+      const unpaidDeduction = Number(((unpaidLeaveDays * base) / 22).toFixed(2));
+      const otherDed = Number(((dedByEmp.get(emp.id) || 0) + unpaidDeduction).toFixed(2));
+
+      const gross = Number((base + allow + otPay + bonus).toFixed(2));
       const pensionEe = Number((base * 0.07).toFixed(2));
       const pensionEr = Number((base * 0.11).toFixed(2));
       const taxableIncome = Math.max(0, gross - pensionEe);
       const paye = await computeProgressivePaye(taxableIncome);
-      const totalEmpDed = Number((paye + pensionEe).toFixed(2));
-      const net = Number((gross - totalEmpDed).toFixed(2));
+      const totalEmpDed = Number((paye + pensionEe + otherDed).toFixed(2));
+      const net = Math.max(0, Number((gross - totalEmpDed).toFixed(2)));
+
       totalGross += gross;
       totalDed += totalEmpDed;
       totalNet += net;
       computedLines.push({
-        user_id: c.user_id,
-        staff_name: c.full_name,
-        role_code: c.role_code,
+        employee_id: emp.id,
+        user_id: emp.user_id,
+        staff_name: emp.full_name,
+        role_code: emp.role_code,
         base_salary: base,
         allowances: allow,
         taxable_allowances: allow,
+        overtime_pay: otPay,
+        bonus_earnings: bonus,
         pension_employee: pensionEe,
         pension_employer: pensionEr,
         paye_tax: paye,
+        other_deductions: otherDed,
         tax_deduction: totalEmpDed,
         net_pay: net,
       });
@@ -8043,24 +12958,35 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
 
     for (const ln of computedLines) {
       await execute(
-        `INSERT INTO payroll_items (payroll_run_id, user_id, staff_name, role_code, base_salary, allowances, taxable_allowances, pension_employee, pension_employer, paye_tax, tax_deduction, net_pay)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO payroll_items (
+          payroll_run_id, user_id, employee_id, staff_name, role_code, base_salary, allowances, taxable_allowances,
+          overtime_pay, bonus_earnings, pension_employee, pension_employer, paye_tax, other_deductions, tax_deduction, net_pay, paid_amount, payment_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'unpaid')`,
         [
           runRes.insertId,
           ln.user_id,
+          ln.employee_id,
           ln.staff_name,
           ln.role_code,
           ln.base_salary,
           ln.allowances,
           ln.taxable_allowances,
+          ln.overtime_pay,
+          ln.bonus_earnings,
           ln.pension_employee,
           ln.pension_employer,
           ln.paye_tax,
+          ln.other_deductions,
           ln.tax_deduction,
           ln.net_pay,
         ]
       );
     }
+
+    for (const otId of consumedOtIds) {
+      await execute('UPDATE hr_overtime SET payroll_run_id = ? WHERE id = ?', [runRes.insertId, otId]);
+    }
+    await execute("UPDATE hr_monthly_submissions SET status = 'processed' WHERE pay_month = ?", [payMonth]);
 
     await writeAuditLog({
       user: req.user,
@@ -8076,9 +13002,84 @@ router.post('/hr/payroll/generate', requireAuth, requirePermission('hr.manage'),
 
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
   res.status(201).json(result);
+}
+
+router.post('/hr/payroll/generate', requireAuth, requirePermission('finance.payroll.generate', 'accounting.ledger.manage'), generatePayrollRunHandler);
+router.post('/accounting/payroll/generate', requireAuth, requirePermission('finance.payroll.generate', 'accounting.ledger.manage'), generatePayrollRunHandler);
+
+router.put('/hr/payroll/items/:itemId', requireAuth, requirePermission('finance.payroll.generate', 'hr.payroll.verify', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const itemId = Number(req.params.itemId);
+  const { allowances, overtime_pay, bonus_earnings, other_deductions } = req.body || {};
+
+  const result = await withTransaction(async () => {
+    const item = await queryOne<{
+      id: number;
+      payroll_run_id: number;
+      base_salary: number;
+      allowances: number;
+      overtime_pay: number;
+      bonus_earnings: number;
+      other_deductions: number;
+      run_status: string;
+    }>(
+      `SELECT pi.*, pr.status AS run_status FROM payroll_items pi INNER JOIN payroll_runs pr ON pr.id = pi.payroll_run_id WHERE pi.id = ?`,
+      [itemId]
+    );
+    if (!item) return { ok: false as const, error: 'Payroll line item not found.', httpStatus: 404 };
+    if (!['draft', 'verified'].includes(item.run_status)) {
+      return { ok: false as const, error: 'Can only edit payroll items while run is in draft or verified status.', httpStatus: 409 };
+    }
+
+    const base = Number(item.base_salary);
+    const nextAllow = allowances !== undefined ? Number(allowances) : Number(item.allowances || 0);
+    const nextOt = overtime_pay !== undefined ? Number(overtime_pay) : Number(item.overtime_pay || 0);
+    const nextBonus = bonus_earnings !== undefined ? Number(bonus_earnings) : Number(item.bonus_earnings || 0);
+    const nextOtherDed = other_deductions !== undefined ? Number(other_deductions) : Number(item.other_deductions || 0);
+
+    const gross = Number((base + nextAllow + nextOt + nextBonus).toFixed(2));
+    const pensionEe = Number((base * 0.07).toFixed(2));
+    const taxableIncome = Math.max(0, gross - pensionEe);
+    const paye = await computeProgressivePaye(taxableIncome);
+    const totalEmpDed = Number((paye + pensionEe + nextOtherDed).toFixed(2));
+    const net = Math.max(0, Number((gross - totalEmpDed).toFixed(2)));
+
+    await execute(
+      `UPDATE payroll_items
+       SET allowances = ?, taxable_allowances = ?, overtime_pay = ?, bonus_earnings = ?, other_deductions = ?, paye_tax = ?, tax_deduction = ?, net_pay = ?
+       WHERE id = ?`,
+      [nextAllow, nextAllow, nextOt, nextBonus, nextOtherDed, paye, totalEmpDed, net, itemId]
+    );
+
+    const allItems = await query<{ base_salary: number; allowances: number; overtime_pay: number; bonus_earnings: number; tax_deduction: number; net_pay: number }>(
+      'SELECT base_salary, allowances, overtime_pay, bonus_earnings, tax_deduction, net_pay FROM payroll_items WHERE payroll_run_id = ?',
+      [item.payroll_run_id]
+    );
+    const runGross = Number(allItems.reduce((s, r) => s + Number(r.base_salary) + Number(r.allowances) + Number(r.overtime_pay || 0) + Number(r.bonus_earnings || 0), 0).toFixed(2));
+    const runDed = Number(allItems.reduce((s, r) => s + Number(r.tax_deduction), 0).toFixed(2));
+    const runNet = Number(allItems.reduce((s, r) => s + Number(r.net_pay), 0).toFixed(2));
+    await execute('UPDATE payroll_runs SET total_gross = ?, total_deductions = ?, total_net = ? WHERE id = ?', [
+      runGross,
+      runDed,
+      runNet,
+      item.payroll_run_id,
+    ]);
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'hr.payroll.item.adjust',
+      entityType: 'payroll_item',
+      entityId: itemId,
+      after: { allowances: nextAllow, overtime_pay: nextOt, bonus_earnings: nextBonus, other_deductions: nextOtherDed, net_pay: net },
+      req,
+    });
+    return { ok: true as const, net_pay: net };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.json(result);
 });
 
-router.post('/hr/payroll/:id/verify', requireAuth, requirePermission('hr.payroll.verify'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/payroll/:id/verify', requireAuth, requirePermission('hr.payroll.verify', 'finance.payroll.generate'), async (req: AuthRequest, res: Response) => {
   const runId = Number(req.params.id);
   const run = await queryOne<{ id: number; run_number: string; status: string; created_by: number }>('SELECT * FROM payroll_runs WHERE id = ?', [runId]);
   if (!run) return res.status(404).json({ error: 'Payroll run not found' });
@@ -8097,14 +13098,14 @@ router.post('/hr/payroll/:id/verify', requireAuth, requirePermission('hr.payroll
   res.json({ ok: true });
 });
 
-router.post('/hr/payroll/:id/approve', requireAuth, requirePermission('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/payroll/:id/approve', requireAuth, requirePermission('hr.payroll.approve', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
   const runId = Number(req.params.id);
   const run = await queryOne<{ id: number; run_number: string; status: string; created_by: number; verified_by: number | null }>(
     'SELECT * FROM payroll_runs WHERE id = ?',
     [runId]
   );
   if (!run) return res.status(404).json({ error: 'Payroll run not found' });
-  if (run.status !== 'verified') return res.status(409).json({ error: 'Payroll run must be verified by Finance before approval.' });
+  if (!['draft', 'verified'].includes(run.status)) return res.status(409).json({ error: 'Payroll run must be in draft or verified state for approval.' });
   assertDifferentUser(req.user!.id, run.created_by, 'approve a payroll run you drafted');
 
   await execute("UPDATE payroll_runs SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ?", [req.user!.id, nowSql(), runId]);
@@ -8119,27 +13120,46 @@ router.post('/hr/payroll/:id/approve', requireAuth, requirePermission('hr.payrol
   res.json({ ok: true });
 });
 
-router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.payroll.post', 'hr.manage'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/payroll/:id/reject', requireAuth, requirePermission('hr.payroll.approve', 'hr.payroll.verify', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const runId = Number(req.params.id);
+  const reason = String(req.body?.reason || '').trim();
+  const run = await queryOne<{ id: number; run_number: string; pay_month: string; status: string }>('SELECT * FROM payroll_runs WHERE id = ?', [runId]);
+  if (!run) return res.status(404).json({ error: 'Payroll run not found.' });
+  if (!['draft', 'verified'].includes(run.status)) {
+    return res.status(409).json({ error: `Cannot reject payroll in '${run.status}' status.` });
+  }
+  await execute("UPDATE payroll_runs SET status = 'rejected' WHERE id = ?", [runId]);
+  await execute('UPDATE hr_overtime SET payroll_run_id = NULL WHERE payroll_run_id = ?', [runId]);
+  await execute("UPDATE hr_monthly_submissions SET status = 'submitted' WHERE pay_month = ?", [run.pay_month]);
+  await writeAuditLog({ user: req.user, action: 'hr.payroll.reject', entityType: 'payroll_run', entityId: runId, reason: reason || 'Rejected by Finance/Manager', req });
+  res.json({ ok: true });
+});
+
+router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.payroll.post', 'finance.payroll.generate', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
   const runId = Number(req.params.id);
   const result = await withTransaction(async () => {
-    const run = await queryOne<{ id: number; run_number: string; pay_month: string; total_gross: number; total_deductions: number; total_net: number; status: string }>(
+    const run = await queryOne<{ id: number; run_number: string; pay_month: string; total_gross: number; total_deductions: number; total_net: number; status: string; journal_entry_id: number | null }>(
       'SELECT * FROM payroll_runs WHERE id = ?',
       [runId]
     );
     if (!run) return { ok: false as const, error: 'Payroll run not found', httpStatus: 404 };
+    if (run.journal_entry_id) {
+      return { ok: false as const, error: 'Payroll run has already been posted to General Ledger.', httpStatus: 409 };
+    }
     if (run.status !== 'approved') {
-      return { ok: false as const, error: `Payroll must be verified & manager-approved before GL posting (current: '${run.status}').`, httpStatus: 409 };
+      return { ok: false as const, error: `Payroll must be approved before GL posting (current: '${run.status}').`, httpStatus: 409 };
     }
 
-    const items = await query<{ paye_tax: number; pension_employee: number; pension_employer: number; net_pay: number }>(
-      'SELECT paye_tax, pension_employee, pension_employer, net_pay FROM payroll_items WHERE payroll_run_id = ?',
+    const items = await query<{ paye_tax: number; pension_employee: number; pension_employer: number; other_deductions: number; net_pay: number }>(
+      'SELECT paye_tax, pension_employee, pension_employer, other_deductions, net_pay FROM payroll_items WHERE payroll_run_id = ?',
       [runId]
     );
     const totalPaye = Number(items.reduce((s, i) => s + Number(i.paye_tax || 0), 0).toFixed(2));
     const totalPensionEe = Number(items.reduce((s, i) => s + Number(i.pension_employee || 0), 0).toFixed(2));
     const totalPensionEr = Number(items.reduce((s, i) => s + Number(i.pension_employer || 0), 0).toFixed(2));
+    const totalOtherDed = Number(items.reduce((s, i) => s + Number(i.other_deductions || 0), 0).toFixed(2));
     const totalNet = Number(items.reduce((s, i) => s + Number(i.net_pay || 0), 0).toFixed(2));
-    const totalExpense = Number((Number(run.total_gross) + totalPensionEr).toFixed(2));
+    const totalExpense = Number((Number(run.total_gross) + totalPensionEr - totalOtherDed).toFixed(2));
     const totalPension = Number((totalPensionEe + totalPensionEr).toFixed(2));
 
     const lines: Array<{ accountCode: string; debit?: number; credit?: number; memo?: string }> = [
@@ -8179,28 +13199,158 @@ router.post('/hr/payroll/:id/post', requireAuth, requirePermission('hr.payroll.p
   res.json(result);
 });
 
-router.post('/hr/payroll/:id/pay', requireAuth, requirePermission('hr.payroll.pay'), async (req: AuthRequest, res: Response) => {
+router.post('/hr/payroll/:id/items/:itemId/pay', requireAuth, requirePermission('hr.payroll.pay', 'finance.payment.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
   const runId = Number(req.params.id);
+  const itemId = Number(req.params.itemId);
+  const { amount, cash_bank_account_id, payment_method = 'bank_transfer', payment_date, reference_no, notes } = req.body || {};
+  const payAmt = Number(Number(amount || 0).toFixed(2));
+  if (payAmt <= 0) return res.status(400).json({ error: 'Positive disbursement amount is required.' });
+  const payDate = payment_date ? String(payment_date).slice(0, 10) : await getClinicToday();
+
   const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(payDate);
+    const run = await queryOne<{ id: number; run_number: string; pay_month: string; status: string }>('SELECT * FROM payroll_runs WHERE id = ?', [runId]);
+    if (!run) return { ok: false as const, error: 'Payroll run not found.', httpStatus: 404 };
+    if (!['posted', 'partially_paid'].includes(run.status)) {
+      return { ok: false as const, error: 'Payroll run must be posted to General Ledger before employee disbursement.', httpStatus: 409 };
+    }
+    const item = await queryOne<{ id: number; payroll_run_id: number; staff_name: string; net_pay: number; paid_amount: number }>(
+      'SELECT * FROM payroll_items WHERE id = ? AND payroll_run_id = ?',
+      [itemId, runId]
+    );
+    if (!item) return { ok: false as const, error: 'Payroll item not found.', httpStatus: 404 };
+    const remaining = Number((Number(item.net_pay) - Number(item.paid_amount || 0)).toFixed(2));
+    if (remaining <= 0) return { ok: false as const, error: `${item.staff_name} has already been paid in full.`, httpStatus: 409 };
+    const actualPay = Math.min(payAmt, remaining);
+
+    let cbAcct = cash_bank_account_id
+      ? await queryOne<{ id: number; account_name: string; coa_code: string }>('SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE id = ? AND active = 1', [Number(cash_bank_account_id)])
+      : null;
+    if (!cbAcct) {
+      cbAcct = await queryOne<{ id: number; account_name: string; coa_code: string }>(
+        'SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE coa_code = ? AND active = 1 ORDER BY id ASC LIMIT 1',
+        [payment_method === 'cash' ? '1010' : '1020']
+      );
+    }
+    if (!cbAcct) return { ok: false as const, error: 'Active Cash/Bank account not found.', httpStatus: 400 };
+
+    const fpNum = await nextSequence('FPV');
+    const je = await postJournalEntry({
+      entryDate: payDate,
+      sourceType: 'payroll_payment',
+      sourceId: runId,
+      description: `Salary Payment ${fpNum}: ${item.staff_name} (${run.pay_month})`,
+      postedBy: req.user!.id,
+      lines: [
+        { accountCode: '2200', debit: actualPay, memo: `${run.run_number} · ${item.staff_name}` },
+        { accountCode: cbAcct.coa_code, credit: actualPay, memo: `${fpNum} · ${cbAcct.account_name}` },
+      ],
+    });
+
+    const nextPaid = Number((Number(item.paid_amount || 0) + actualPay).toFixed(2));
+    const itemStatus = nextPaid >= Number(item.net_pay) - 0.01 ? 'paid' : 'partial';
+    await execute(
+      'UPDATE payroll_items SET paid_amount = ?, payment_status = ?, payment_method = ?, payment_ref = ?, paid_at = ? WHERE id = ?',
+      [nextPaid, itemStatus, payment_method, reference_no?.trim() || fpNum, nowSql(), itemId]
+    );
+    await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [actualPay, cbAcct.id]);
+    await execute(
+      `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, linked_type, linked_id, notes, journal_entry_id, created_by)
+       VALUES (?, ?, 'salary', ?, ?, ?, ?, ?, 'payroll_item', ?, ?, ?, ?)`,
+      [fpNum, payDate, item.staff_name, cbAcct.id, payment_method, actualPay, reference_no?.trim() || fpNum, itemId, notes?.trim() || `Payroll ${run.run_number} (${run.pay_month})`, je.entryId, req.user!.id]
+    );
+
+    const unpaidCount = await queryOne<{ cnt: number }>(
+      "SELECT COUNT(*) AS cnt FROM payroll_items WHERE payroll_run_id = ? AND payment_status != 'paid'",
+      [runId]
+    );
+    const nextRunStatus = Number(unpaidCount?.cnt || 0) === 0 ? 'paid' : 'partially_paid';
+    await execute('UPDATE payroll_runs SET status = ?, paid_by = ?, paid_at = ? WHERE id = ?', [
+      nextRunStatus,
+      req.user!.id,
+      nowSql(),
+      runId,
+    ]);
+
+    await writeAuditLog({
+      user: req.user,
+      action: 'hr.payroll.item.pay',
+      entityType: 'payroll_item',
+      entityId: itemId,
+      after: { runNumber: run.run_number, staff_name: item.staff_name, paid: actualPay, itemStatus, paymentNumber: fpNum, entryNumber: je.entryNumber },
+      req,
+    });
+    return { ok: true as const, paid: actualPay, itemStatus, runStatus: nextRunStatus, paymentNumber: fpNum, entryNumber: je.entryNumber };
+  });
+
+  if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
+  res.json(result);
+});
+
+router.post('/hr/payroll/:id/pay', requireAuth, requirePermission('hr.payroll.pay', 'finance.payment.manage', 'accounting.ledger.manage'), async (req: AuthRequest, res: Response) => {
+  const runId = Number(req.params.id);
+  const { cash_bank_account_id, payment_method = 'bank_transfer', payment_date, reference_no } = req.body || {};
+  const payDate = payment_date ? String(payment_date).slice(0, 10) : await getClinicToday();
+
+  const result = await withTransaction(async () => {
+    await assertOpenAccountingPeriod(payDate);
     const run = await queryOne<{ id: number; run_number: string; pay_month: string; total_net: number; status: string }>(
       'SELECT * FROM payroll_runs WHERE id = ?',
       [runId]
     );
     if (!run) return { ok: false as const, error: 'Payroll run not found', httpStatus: 404 };
-    if (run.status !== 'posted') {
+    if (!['posted', 'partially_paid'].includes(run.status)) {
       return { ok: false as const, error: 'Payroll run must be posted to General Ledger before bank disbursement.', httpStatus: 409 };
     }
-    const netAmt = Number(run.total_net);
+
+    const unpaidItems = await query<{ id: number; staff_name: string; net_pay: number; paid_amount: number }>(
+      "SELECT id, staff_name, net_pay, paid_amount FROM payroll_items WHERE payroll_run_id = ? AND payment_status != 'paid'",
+      [runId]
+    );
+    const remainingTotal = Number(unpaidItems.reduce((s, it) => s + Math.max(0, Number(it.net_pay) - Number(it.paid_amount || 0)), 0).toFixed(2));
+    if (remainingTotal <= 0) {
+      return { ok: false as const, error: 'All employees in this payroll run are already paid.', httpStatus: 409 };
+    }
+
+    let cbAcct = cash_bank_account_id
+      ? await queryOne<{ id: number; account_name: string; coa_code: string }>('SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE id = ? AND active = 1', [Number(cash_bank_account_id)])
+      : null;
+    if (!cbAcct) {
+      cbAcct = await queryOne<{ id: number; account_name: string; coa_code: string }>(
+        'SELECT id, account_name, coa_code FROM finance_cash_bank_accounts WHERE coa_code = ? AND active = 1 ORDER BY id ASC LIMIT 1',
+        [payment_method === 'cash' ? '1010' : '1020']
+      );
+    }
+    const creditCode = cbAcct?.coa_code || (payment_method === 'cash' ? '1010' : '1020');
+
+    const fpNum = await nextSequence('FPV');
     const je = await postJournalEntry({
+      entryDate: payDate,
       sourceType: 'payroll_payment',
       sourceId: runId,
-      description: `Payroll Bank Disbursement ${run.pay_month} (${run.run_number})`,
+      description: `Payroll Batch Disbursement ${run.pay_month} (${run.run_number})`,
       postedBy: req.user!.id,
       lines: [
-        { accountCode: '2200', debit: netAmt, memo: `Clear net salaries payable ${run.run_number}` },
-        { accountCode: '1020', credit: netAmt, memo: `Bank payroll transfer ${run.pay_month}` },
+        { accountCode: '2200', debit: remainingTotal, memo: `Clear net salaries payable ${run.run_number}` },
+        { accountCode: creditCode, credit: remainingTotal, memo: `${fpNum} · ${cbAcct?.account_name || 'Bank payroll transfer'}` },
       ],
     });
+
+    for (const it of unpaidItems) {
+      await execute(
+        "UPDATE payroll_items SET paid_amount = net_pay, payment_status = 'paid', payment_method = ?, payment_ref = ?, paid_at = ? WHERE id = ?",
+        [payment_method, reference_no?.trim() || fpNum, nowSql(), it.id]
+      );
+    }
+    if (cbAcct) {
+      await execute('UPDATE finance_cash_bank_accounts SET current_balance = ROUND(current_balance - ?, 2) WHERE id = ?', [remainingTotal, cbAcct.id]);
+      await execute(
+        `INSERT INTO finance_payments (payment_number, payment_date, payment_category, payee_name, cash_bank_account_id, payment_method, amount, reference_no, linked_type, linked_id, notes, journal_entry_id, created_by)
+         VALUES (?, ?, 'salary', ?, ?, ?, ?, ?, 'payroll_run', ?, ?, ?, ?)`,
+        [fpNum, payDate, `All Remaining Staff (${unpaidItems.length})`, cbAcct.id, payment_method, remainingTotal, reference_no?.trim() || run.run_number, runId, `Full batch payroll settlement ${run.pay_month}`, je.entryId, req.user!.id]
+      );
+    }
+
     await execute("UPDATE payroll_runs SET status = 'paid', payment_journal_entry_id = ?, paid_by = ?, paid_at = ? WHERE id = ?", [
       je.entryId,
       req.user!.id,
@@ -8212,10 +13362,10 @@ router.post('/hr/payroll/:id/pay', requireAuth, requirePermission('hr.payroll.pa
       action: 'hr.payroll.pay',
       entityType: 'payroll_run',
       entityId: runId,
-      after: { runNumber: run.run_number, entryNumber: je.entryNumber, netPaid: netAmt },
+      after: { runNumber: run.run_number, entryNumber: je.entryNumber, netPaid: remainingTotal, paymentNumber: fpNum },
       req,
     });
-    return { ok: true as const, entryNumber: je.entryNumber };
+    return { ok: true as const, entryNumber: je.entryNumber, paymentNumber: fpNum, netPaid: remainingTotal };
   });
   if (!result.ok) return res.status(result.httpStatus).json({ error: result.error });
   res.json(result);

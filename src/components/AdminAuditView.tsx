@@ -1,36 +1,51 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  Bell,
   BookOpen,
+  Building2,
   CheckCircle2,
+  CreditCard,
   Database,
   Download,
   Edit3,
+  FileText,
+  Lock,
   Plus,
   Search,
-  Settings,
   Shield,
   ShieldCheck,
-  Unlock,
-  UserPlus,
+  Stethoscope,
+  Users,
   X,
 } from 'lucide-react';
 import { apiFetch, getAuthToken } from '../lib/api';
-import type { AuditLog, ClinicSettings, UserContext } from '../types';
+import type {
+  AuditLog,
+  ClinicRoomConfig,
+  ClinicSettings,
+  DepartmentConfig,
+  DoctorProfileConfig,
+  SpecialtyConfig,
+  StaffUserRow,
+  UserContext,
+} from '../types';
+import { UserManagementPanel } from './admin/UserManagementPanel';
+import { ClinicConfigPanel } from './admin/ClinicConfigPanel';
+import { SystemConfigPanel } from './admin/SystemConfigPanel';
 
-interface StaffUserRow {
-  id: number;
-  full_name: string;
-  email: string;
-  specialty: string | null;
-  active: number;
-  must_change_password?: number;
-  two_fa_enabled?: number;
-  failed_attempts?: number;
-  locked_until?: string | null;
-  last_login_at: string | null;
-  role_code: string;
-  role_name: string;
-}
+export type AdminTab =
+  | 'audit'
+  | 'exceptions'
+  | 'users'
+  | 'roles'
+  | 'clinic_config'
+  | 'clinical_config'
+  | 'catalog'
+  | 'billing_config'
+  | 'notifications_config'
+  | 'documents_config'
+  | 'security_config'
+  | 'backup';
 
 interface DeploymentStatus {
   dialect: 'sqlite' | 'mysql';
@@ -50,6 +65,7 @@ interface RoleRow {
   code: string;
   name: string;
   description: string;
+  system_role?: number;
   permission_count: number;
 }
 
@@ -71,26 +87,55 @@ type CatalogEntity = 'services' | 'lab_tests' | 'imaging_catalog' | 'medicines' 
 
 interface AdminAuditViewProps {
   user: UserContext;
-  initialTab?: 'audit' | 'users' | 'roles';
+  initialTab?: AdminTab;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
 }
 
-export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab = 'audit', onNotify }) => {
+export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab, onNotify }) => {
   const canAudit = user.permissions.includes('audit.read');
   const canManageUsers = user.permissions.includes('admin.user.manage');
   const canRoles = user.permissions.includes('admin.role.manage');
+  const canConfig = user.permissions.includes('admin.config.manage') || canManageUsers;
+  const canBackup = user.permissions.includes('admin.backup.manage') || canManageUsers;
   const canEditCatalog = user.permissions.includes('catalog.manage');
-  const canViewCatalog = canEditCatalog || canManageUsers;
-  const canViewSettings = canManageUsers || canEditCatalog;
+  const canViewCatalog = canEditCatalog || canManageUsers || canConfig;
 
-  const [tab, setTab] = useState<'audit' | 'exceptions' | 'users' | 'roles' | 'settings' | 'catalog'>(() => {
-    if (initialTab === 'users' && (canManageUsers || canAudit)) return 'users';
-    if (initialTab === 'roles' && (canRoles || canManageUsers || canAudit)) return 'roles';
-    if (canAudit) return 'audit';
-    if (canManageUsers) return 'users';
-    if (canEditCatalog) return 'catalog';
-    return 'roles';
-  });
+  const resolveDefaultTab = useCallback(
+    (requested?: AdminTab): AdminTab => {
+      if (requested) {
+        if ((requested === 'audit' || requested === 'exceptions') && canAudit) return requested;
+        if (requested === 'users' && (canManageUsers || canAudit)) return 'users';
+        if (requested === 'roles' && (canRoles || canManageUsers || canAudit)) return 'roles';
+        if (requested === 'catalog' && canViewCatalog) return 'catalog';
+        if (requested === 'backup' && (canBackup || canAudit)) return 'backup';
+        if (
+          (requested === 'clinic_config' ||
+            requested === 'clinical_config' ||
+            requested === 'billing_config' ||
+            requested === 'notifications_config' ||
+            requested === 'documents_config' ||
+            requested === 'security_config') &&
+          (canConfig || canViewCatalog)
+        ) {
+          return requested;
+        }
+      }
+      if (canManageUsers) return 'users';
+      if (canAudit) return 'audit';
+      if (canConfig) return 'clinic_config';
+      if (canEditCatalog) return 'catalog';
+      return 'roles';
+    },
+    [canAudit, canManageUsers, canRoles, canConfig, canBackup, canEditCatalog, canViewCatalog]
+  );
+
+  const [tab, setTab] = useState<AdminTab>(() => resolveDefaultTab(initialTab));
+
+  useEffect(() => {
+    if (initialTab) {
+      setTab(resolveDefaultTab(initialTab));
+    }
+  }, [initialTab, resolveDefaultTab]);
 
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [exceptions, setExceptions] = useState<AuditLog[]>([]);
@@ -109,20 +154,15 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
   const [rolePerms, setRolePerms] = useState<RolePermRow[]>([]);
   const [allPermissions, setAllPermissions] = useState<PermissionDef[]>([]);
   const [deployStatus, setDeployStatus] = useState<DeploymentStatus | null>(null);
+  const [departments, setDepartments] = useState<DepartmentConfig[]>([]);
+  const [specialties, setSpecialties] = useState<SpecialtyConfig[]>([]);
+  const [clinicRooms, setClinicRooms] = useState<ClinicRoomConfig[]>([]);
+  const [doctors, setDoctors] = useState<DoctorProfileConfig[]>([]);
 
-  // Create User Modal
-  const [showCreateUser, setShowCreateUser] = useState(false);
-  const [newUserForm, setNewUserForm] = useState({
-    full_name: '',
-    email: '',
-    password: 'Clinic360!',
-    role_codes: ['REC'] as string[],
-    specialty: '',
-  });
-
-  // Edit User Roles Modal
-  const [editRolesTarget, setEditRolesTarget] = useState<StaffUserRow | null>(null);
-  const [editRoleCodes, setEditRoleCodes] = useState<string[]>([]);
+  // Custom Role Create / Edit Modal
+  const [roleModalOpen, setRoleModalOpen] = useState(false);
+  const [editingRoleMeta, setEditingRoleMeta] = useState<RoleRow | null>(null);
+  const [roleMetaForm, setRoleMetaForm] = useState({ code: '', name: '', description: '' });
 
   // Edit Role Permissions Modal
   const [editPermsRole, setEditPermsRole] = useState<RoleRow | null>(null);
@@ -179,7 +219,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
           apiFetch<{ users: StaffUserRow[] }>('/api/admin/users'),
           apiFetch<DeploymentStatus>('/api/admin/deployment-status'),
         ]);
-        setUsers(uRes.users);
+        setUsers(uRes.users || []);
         setDeployStatus(dRes);
       }
       if (canRoles || canManageUsers || canAudit) {
@@ -188,18 +228,30 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
           rolePerms?: RolePermRow[];
           allPermissions?: PermissionDef[];
         }>('/api/admin/roles');
-        setRoles(rRes.roles);
+        setRoles(rRes.roles || []);
         setRolePerms(rRes.rolePerms || []);
         setAllPermissions(rRes.allPermissions || []);
       }
-      if (canViewSettings) {
+      if (canConfig || canViewCatalog || canAudit) {
+        const [deptRes, specRes, roomRes, docRes] = await Promise.all([
+          apiFetch<{ departments: DepartmentConfig[] }>('/api/admin/departments').catch(() => ({ departments: [] })),
+          apiFetch<{ specialties: SpecialtyConfig[] }>('/api/admin/specialties').catch(() => ({ specialties: [] })),
+          apiFetch<{ rooms: ClinicRoomConfig[] }>('/api/admin/clinic-rooms').catch(() => ({ rooms: [] })),
+          apiFetch<{ doctors: DoctorProfileConfig[] }>('/api/admin/doctors').catch(() => ({ doctors: [] })),
+        ]);
+        setDepartments(deptRes.departments || []);
+        setSpecialties(specRes.specialties || []);
+        setClinicRooms(roomRes.rooms || []);
+        setDoctors(docRes.doctors || []);
+      }
+      if (canConfig || canViewCatalog) {
         const sRes = await apiFetch<{ settings: ClinicSettings }>('/api/admin/settings');
         if (sRes.settings) setSettingsForm(sRes.settings);
       }
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
-  }, [canAudit, canManageUsers, canRoles, canViewSettings, logFilter, auditFrom, auditTo, auditOffset, onNotify]);
+  }, [canAudit, canManageUsers, canRoles, canConfig, canViewCatalog, logFilter, auditFrom, auditTo, auditOffset, onNotify]);
 
   useEffect(() => {
     loadData();
@@ -218,6 +270,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
       if (auditFrom) qs.set('from', auditFrom);
       if (auditTo) qs.set('to', auditTo);
       const res = await fetch(`/api/audit-logs/export?${qs.toString()}`, {
+        credentials: 'include',
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!res.ok) {
@@ -268,66 +321,39 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
     }
   }
 
-  async function handleCreateUser(e: React.FormEvent) {
+  function openRoleModal(role?: RoleRow) {
+    if (role) {
+      setEditingRoleMeta(role);
+      setRoleMetaForm({ code: role.code, name: role.name, description: role.description || '' });
+    } else {
+      setEditingRoleMeta(null);
+      setRoleMetaForm({ code: '', name: '', description: '' });
+    }
+    setRoleModalOpen(true);
+  }
+
+  async function handleSaveRoleMeta(e: React.FormEvent) {
     e.preventDefault();
-    if (newUserForm.role_codes.length === 0) {
-      onNotify('Select at least one role.', 'error');
-      return;
-    }
     try {
-      await apiFetch('/api/admin/users', {
-        method: 'POST',
-        body: JSON.stringify(newUserForm),
-      });
-      onNotify(`Created staff login for ${newUserForm.email} (${newUserForm.role_codes.join(', ')})`, 'success');
-      setShowCreateUser(false);
-      setNewUserForm({ full_name: '', email: '', password: 'Clinic360!', role_codes: ['REC'], specialty: '' });
-      loadData();
-    } catch (err) {
-      onNotify((err as Error).message, 'error');
-    }
-  }
-
-  async function handleToggleUser(id: number) {
-    try {
-      const res = await apiFetch<{ active: boolean }>(`/api/admin/users/${id}/toggle`, { method: 'PATCH' });
-      onNotify(`User account ${res.active ? 'activated' : 'deactivated'}`, 'success');
-      loadData();
-    } catch (err) {
-      onNotify((err as Error).message, 'error');
-    }
-  }
-
-  async function handleUnlockUser(u: StaffUserRow) {
-    try {
-      await apiFetch(`/api/admin/users/${u.id}/unlock`, { method: 'POST' });
-      onNotify(`Unlocked account and reset failed attempts for ${u.email}`, 'success');
-      loadData();
-    } catch (err) {
-      onNotify((err as Error).message, 'error');
-    }
-  }
-
-  function openEditRoles(u: StaffUserRow) {
-    setEditRolesTarget(u);
-    setEditRoleCodes(
-      u.role_code
-        .split(',')
-        .map((c) => c.trim())
-        .filter(Boolean)
-    );
-  }
-
-  async function handleSaveUserRoles(e: React.FormEvent) {
-    e.preventDefault();
-    if (!editRolesTarget) return;
-    try {
-      await apiFetch(`/api/admin/users/${editRolesTarget.id}/roles`, {
-        method: 'PUT',
-        body: JSON.stringify({ role_codes: editRoleCodes }),
-      });
-      onNotify(`Updated roles for ${editRolesTarget.full_name}`, 'success');
-      setEditRolesTarget(null);
+      if (editingRoleMeta) {
+        await apiFetch(`/api/admin/roles/${editingRoleMeta.code}`, {
+          method: 'PUT',
+          body: JSON.stringify({ name: roleMetaForm.name, description: roleMetaForm.description }),
+        });
+        onNotify(`Updated role ${editingRoleMeta.code}`, 'success');
+      } else {
+        await apiFetch('/api/admin/roles', {
+          method: 'POST',
+          body: JSON.stringify({
+            code: roleMetaForm.code,
+            name: roleMetaForm.name,
+            description: roleMetaForm.description,
+            permission_codes: [],
+          }),
+        });
+        onNotify(`Created custom role ${roleMetaForm.code.toUpperCase()}. Configure its permissions next.`, 'success');
+      }
+      setRoleModalOpen(false);
       loadData();
     } catch (err) {
       onNotify((err as Error).message, 'error');
@@ -351,20 +377,6 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
       onNotify(`Saved ${selectedPermCodes.length} permissions for ${editPermsRole.code}`, 'success');
       setEditPermsRole(null);
       loadData();
-    } catch (err) {
-      onNotify((err as Error).message, 'error');
-    }
-  }
-
-  async function handleSaveSettings(e: React.FormEvent) {
-    e.preventDefault();
-    try {
-      const res = await apiFetch<{ settings: ClinicSettings }>('/api/admin/settings', {
-        method: 'PUT',
-        body: JSON.stringify(settingsForm),
-      });
-      if (res.settings) setSettingsForm(res.settings);
-      onNotify('Clinic governance settings saved', 'success');
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -432,77 +444,55 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
     return acc;
   }, {});
 
+  const tabItems: Array<{
+    key: AdminTab;
+    label: string;
+    visible: boolean;
+    icon: React.ComponentType<{ className?: string }>;
+  }> = [
+    { key: 'users', label: `Staff Users (${users.length})`, visible: canManageUsers || canAudit, icon: Users },
+    { key: 'roles', label: `Roles & RBAC (${roles.length})`, visible: canRoles || canManageUsers || canAudit, icon: Shield },
+    { key: 'clinic_config', label: 'Clinic & Depts', visible: canConfig, icon: Building2 },
+    { key: 'clinical_config', label: 'Clinical', visible: canConfig, icon: Stethoscope },
+    { key: 'catalog', label: 'Services & Catalog', visible: canViewCatalog, icon: BookOpen },
+    { key: 'billing_config', label: 'Billing & GL', visible: canConfig, icon: CreditCard },
+    { key: 'notifications_config', label: 'Notifications', visible: canConfig, icon: Bell },
+    { key: 'documents_config', label: 'Print Headers', visible: canConfig, icon: FileText },
+    { key: 'security_config', label: 'Security', visible: canConfig, icon: Lock },
+    { key: 'audit', label: `Audit Log (${logs.length})`, visible: canAudit, icon: ShieldCheck },
+    { key: 'exceptions', label: `Exceptions (${exceptions.length})`, visible: canAudit, icon: Search },
+    { key: 'backup', label: 'Backup & DB', visible: canBackup || canAudit, icon: Database },
+  ];
+
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-4">
+      {/* Admin Sub-navigation Bar + Context Actions */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
-          {canAudit && (
-            <>
-              <button
-                onClick={() => setTab('audit')}
-                className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                  tab === 'audit' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Audit Log ({logs.length})
-              </button>
-              <button
-                onClick={() => setTab('exceptions')}
-                className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                  tab === 'exceptions' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Exceptions &amp; Trace ({exceptions.length})
-              </button>
-            </>
-          )}
-          {(canManageUsers || canAudit) && (
-            <button
-              onClick={() => setTab('users')}
-              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                tab === 'users' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Staff Users ({users.length})
-            </button>
-          )}
-          {(canRoles || canManageUsers || canAudit) && (
-            <button
-              onClick={() => setTab('roles')}
-              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                tab === 'roles' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              14-Role RBAC Matrix
-            </button>
-          )}
-          {canViewSettings && (
-            <button
-              onClick={() => setTab('settings')}
-              className={`inline-flex items-center gap-1 px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                tab === 'settings' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <Settings className="w-3.5 h-3.5" />
-              <span>Clinic Settings</span>
-            </button>
-          )}
-          {canViewCatalog && (
-            <button
-              onClick={() => setTab('catalog')}
-              className={`inline-flex items-center gap-1 px-3.5 py-1.5 text-xs font-medium rounded-md ${
-                tab === 'catalog' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              <span>Master Catalog</span>
-            </button>
-          )}
+          {tabItems
+            .filter((t) => t.visible)
+            .map((t) => {
+              const Icon = t.icon;
+              return (
+                <button
+                  key={t.key}
+                  type="button"
+                  onClick={() => setTab(t.key)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                    tab === t.key ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{t.label}</span>
+                </button>
+              );
+            })}
         </div>
 
         {tab === 'audit' && canAudit && (
           <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={handleExportAuditCsv}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md whitespace-nowrap"
             >
@@ -510,6 +500,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
               <span>Export CSV</span>
             </button>
             <button
+              type="button"
               onClick={handleVerifyChain}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-md whitespace-nowrap"
             >
@@ -519,18 +510,20 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
           </div>
         )}
 
-        {tab === 'users' && canManageUsers && (
+        {tab === 'roles' && canRoles && (
           <button
-            onClick={() => setShowCreateUser(true)}
+            type="button"
+            onClick={() => openRoleModal()}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
           >
-            <UserPlus className="w-3.5 h-3.5" />
-            <span>Create Staff User</span>
+            <Plus className="w-3.5 h-3.5" />
+            <span>Create Custom Role</span>
           </button>
         )}
 
         {tab === 'catalog' && canEditCatalog && (
           <button
+            type="button"
             onClick={() => openCatalogModal()}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md whitespace-nowrap"
           >
@@ -541,7 +534,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
       </div>
 
       {deployStatus && (
-        <div className="bg-white border border-slate-200 rounded-lg px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 text-xs">
+        <div className="bg-white border border-slate-200 rounded-lg px-5 py-3 flex flex-wrap items-center justify-between gap-4 text-xs">
           <div className="flex items-center gap-2.5">
             <Database className="w-4 h-4 text-teal-700 shrink-0" />
             <div>
@@ -552,8 +545,8 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
               <span className="text-slate-600">
                 Mode: <span className="font-mono">{deployStatus.dbClientMode}</span>
                 {' · '}
-                MySQL 8 Configured: <span className="font-mono">{deployStatus.mysqlConfigured ? 'Yes' : 'Fallback SQLite'}</span>
-                {deployStatus.mysqlConfigured && ` · TLS/SSL: ${deployStatus.mysqlSsl ? 'Enabled' : 'Disabled'}`}
+                MySQL 8: <span className="font-mono">{deployStatus.mysqlConfigured ? 'Configured' : 'Fallback SQLite'}</span>
+                {deployStatus.mysqlConfigured && ` · TLS: ${deployStatus.mysqlSsl ? 'Enabled' : 'Disabled'}`}
               </span>
             </div>
           </div>
@@ -563,6 +556,49 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
             </div>
           )}
         </div>
+      )}
+
+      {tab === 'users' && (canManageUsers || canAudit) && (
+        <UserManagementPanel
+          currentUser={user}
+          users={users}
+          roles={roles}
+          departments={departments}
+          clinicRooms={clinicRooms}
+          canManageUsers={canManageUsers}
+          onRefresh={loadData}
+          onNotify={onNotify}
+        />
+      )}
+
+      {tab === 'clinic_config' && canConfig && (
+        <ClinicConfigPanel
+          settings={settingsForm}
+          departments={departments}
+          specialties={specialties}
+          clinicRooms={clinicRooms}
+          doctors={doctors}
+          canManageConfig={canConfig}
+          onSettingsSaved={setSettingsForm}
+          onRefresh={loadData}
+          onNotify={onNotify}
+        />
+      )}
+
+      {(tab === 'clinical_config' ||
+        tab === 'billing_config' ||
+        tab === 'notifications_config' ||
+        tab === 'documents_config' ||
+        tab === 'security_config' ||
+        tab === 'backup') && (
+        <SystemConfigPanel
+          section={tab}
+          settings={settingsForm}
+          canManageConfig={canConfig}
+          canManageBackup={canBackup}
+          onSettingsSaved={setSettingsForm}
+          onNotify={onNotify}
+        />
       )}
 
       {tab === 'audit' && canAudit && (
@@ -650,7 +686,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
             </table>
           </div>
           <div className="px-4 py-2.5 border-t border-slate-200 bg-slate-50/70 flex items-center justify-between text-xs text-slate-600">
-            <span className="font-mono">
+            <span className="font-mono tabular-nums">
               Showing offset {auditOffset}–{auditOffset + logs.length}
             </span>
             <div className="flex items-center gap-2">
@@ -684,7 +720,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
                   Flagged Governance &amp; Security Exceptions
                 </h3>
                 <div className="text-xs text-slate-500">
-                  Emergency bypasses, segregation blocks, result amendments, reprints, merges, and failed logins
+                  Emergency bypasses, segregation blocks, result amendments, reprints, offboarding alerts, and failed logins
                 </div>
               </div>
               <span className="font-mono text-xs text-slate-600 tabular-nums">{exceptions.length} events</span>
@@ -779,191 +815,65 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
         </div>
       )}
 
-      {tab === 'users' && (
+      {tab === 'roles' && (
         <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3 border-b border-slate-200 bg-slate-50/70 flex items-center justify-between text-xs">
+            <div>
+              <span className="font-semibold text-slate-900">Dynamic Role &amp; Permission Matrix</span>
+              <span className="text-slate-500 ml-2">
+                ({roles.length} roles · {allPermissions.length} granular permissions)
+              </span>
+            </div>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
-                  <th className="py-2.5 px-4">Staff Member</th>
-                  <th className="py-2.5 px-4">Email</th>
-                  <th className="py-2.5 px-4">Roles</th>
-                  <th className="py-2.5 px-4">Security &amp; Status</th>
-                  {canManageUsers && <th className="py-2.5 px-4 text-right">Account Control</th>}
+                  <th className="py-2.5 px-4">Code</th>
+                  <th className="py-2.5 px-4">Role Title</th>
+                  <th className="py-2.5 px-4">Duties &amp; Separation Boundary</th>
+                  <th className="py-2.5 px-4">Origin</th>
+                  <th className="py-2.5 px-4 text-right">Permissions</th>
+                  {canRoles && <th className="py-2.5 px-4 text-right">Actions</th>}
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 text-sm">
-                {users.map((u) => {
-                  const isLocked = Boolean(u.locked_until) || Number(u.failed_attempts || 0) >= 5;
-                  return (
-                    <tr key={u.id} className="hover:bg-slate-50/70">
-                      <td className="py-2.5 px-4">
-                        <div className="font-medium text-slate-900">{u.full_name}</div>
-                        {u.specialty && <div className="text-xs text-slate-500">{u.specialty}</div>}
+              <tbody className="divide-y divide-slate-100 text-xs">
+                {roles.map((r) => (
+                  <tr key={r.id} className="hover:bg-slate-50/70">
+                    <td className="py-2.5 px-4 font-mono font-semibold text-teal-800">{r.code}</td>
+                    <td className="py-2.5 px-4 font-medium text-slate-900">{r.name}</td>
+                    <td className="py-2.5 px-4 text-slate-600">{r.description}</td>
+                    <td className="py-2.5 px-4 font-mono text-slate-500">
+                      {r.system_role === 0 ? 'Custom' : 'Core'}
+                    </td>
+                    <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-800">
+                      {r.permission_count}
+                    </td>
+                    {canRoles && (
+                      <td className="py-2.5 px-4 text-right whitespace-nowrap space-x-1.5">
+                        <button
+                          type="button"
+                          onClick={() => openRoleModal(r)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          <span>Rename</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openEditRolePerms(r)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+                        >
+                          <Shield className="w-3 h-3" />
+                          <span>Permissions</span>
+                        </button>
                       </td>
-                      <td className="py-2.5 px-4 font-mono text-xs text-slate-600">{u.email}</td>
-                      <td className="py-2.5 px-4 text-xs">
-                        <span className="font-mono font-semibold text-teal-800">{u.role_code}</span>
-                        <span className="text-slate-500"> · {u.role_name}</span>
-                      </td>
-                      <td className="py-2.5 px-4 text-xs">
-                        <span className={u.active ? 'text-emerald-700 font-medium' : 'text-red-700'}>
-                          {u.active ? 'Active' : 'Deactivated'}
-                        </span>
-                        {u.two_fa_enabled === 1 && <span className="text-teal-800 font-mono"> · 2FA</span>}
-                        {u.must_change_password === 1 && <span className="text-amber-700 font-mono"> · Pwd Reset Pending</span>}
-                        {isLocked && <span className="text-red-700 font-mono font-semibold"> · LOCKED ({u.failed_attempts} fails)</span>}
-                      </td>
-                      {canManageUsers && (
-                        <td className="py-2.5 px-4 text-right whitespace-nowrap space-x-1.5">
-                          {isLocked && (
-                            <button
-                              onClick={() => handleUnlockUser(u)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-800 border border-amber-300 hover:bg-amber-50 rounded"
-                            >
-                              <Unlock className="w-3 h-3" />
-                              <span>Unlock</span>
-                            </button>
-                          )}
-                          <button
-                            onClick={() => openEditRoles(u)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
-                          >
-                            <Shield className="w-3 h-3" />
-                            <span>Roles</span>
-                          </button>
-                          <button
-                            onClick={() => handleToggleUser(u.id)}
-                            disabled={u.id === user.id}
-                            className="px-2.5 py-1 text-xs font-medium border border-slate-200 rounded hover:bg-slate-50 disabled:opacity-40"
-                          >
-                            {u.id === user.id ? 'Current Session' : u.active ? 'Deactivate' : 'Activate'}
-                          </button>
-                        </td>
-                      )}
-                    </tr>
-                  );
-                })}
+                    )}
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
-        </div>
-      )}
-
-      {tab === 'roles' && (
-        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
-                <th className="py-2.5 px-4">Code</th>
-                <th className="py-2.5 px-4">Role Title</th>
-                <th className="py-2.5 px-4">Duties &amp; Separation Boundary</th>
-                <th className="py-2.5 px-4 text-right">Permissions</th>
-                {canRoles && <th className="py-2.5 px-4 text-right">RBAC Matrix</th>}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 text-xs">
-              {roles.map((r) => (
-                <tr key={r.id} className="hover:bg-slate-50/70">
-                  <td className="py-2.5 px-4 font-mono font-semibold text-teal-800">{r.code}</td>
-                  <td className="py-2.5 px-4 font-medium text-slate-900">{r.name}</td>
-                  <td className="py-2.5 px-4 text-slate-600">{r.description}</td>
-                  <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-800">
-                    {r.permission_count}
-                  </td>
-                  {canRoles && (
-                    <td className="py-2.5 px-4 text-right">
-                      <button
-                        onClick={() => openEditRolePerms(r)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
-                      >
-                        <Edit3 className="w-3 h-3" />
-                        <span>Configure</span>
-                      </button>
-                    </td>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {tab === 'settings' && canViewSettings && (
-        <div className="bg-white border border-slate-200 rounded-lg max-w-2xl">
-          <div className="px-6 py-4 border-b border-slate-200">
-            <h3 className="font-display text-sm font-semibold text-slate-900">Clinic Governance &amp; Financial Thresholds</h3>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Changes take effect across receipts, clinical timestamps, and General Ledger approval gates.
-            </p>
-          </div>
-          <form onSubmit={handleSaveSettings} className="p-6 space-y-4 text-xs">
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">Facility Display Name</label>
-              <input
-                required
-                disabled={!canManageUsers}
-                value={settingsForm.clinicName}
-                onChange={(e) => setSettingsForm({ ...settingsForm, clinicName: e.target.value })}
-                className="w-full px-3 py-2 border border-slate-300 rounded-md disabled:bg-slate-50"
-              />
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Currency Code</label>
-                <input
-                  required
-                  disabled={!canManageUsers}
-                  value={settingsForm.currencyCode}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, currencyCode: e.target.value.toUpperCase() })}
-                  className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md disabled:bg-slate-50"
-                />
-              </div>
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Currency Symbol</label>
-                <input
-                  required
-                  disabled={!canManageUsers}
-                  value={settingsForm.currencySymbol}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, currencySymbol: e.target.value })}
-                  className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md disabled:bg-slate-50"
-                />
-              </div>
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">IANA Timezone</label>
-                <input
-                  required
-                  disabled={!canManageUsers}
-                  value={settingsForm.timezone}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, timezone: e.target.value })}
-                  placeholder="UTC or Africa/Nairobi"
-                  className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md disabled:bg-slate-50"
-                />
-              </div>
-            </div>
-            <div>
-              <label className="block font-medium text-slate-700 mb-1">Expense Voucher Auto-Post Threshold ($)</label>
-              <input
-                type="number"
-                min={0}
-                step="1"
-                disabled={!canManageUsers}
-                value={settingsForm.expenseAutoPostLimit ?? 500}
-                onChange={(e) => setSettingsForm({ ...settingsForm, expenseAutoPostLimit: Number(e.target.value) })}
-                className="w-48 px-3 py-2 font-mono border border-slate-300 rounded-md disabled:bg-slate-50"
-              />
-              <div className="text-[11px] text-slate-500 mt-1">
-                Vouchers strictly above this amount require separate Manager/Finance approval before posting to GL.
-              </div>
-            </div>
-            {canManageUsers && (
-              <div className="pt-3 border-t border-slate-200 flex justify-end">
-                <button type="submit" className="px-4 py-2 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
-                  Save Settings
-                </button>
-              </div>
-            )}
-          </form>
         </div>
       )}
 
@@ -981,6 +891,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
             ).map(([key, label]) => (
               <button
                 key={key}
+                type="button"
                 onClick={() => setCatalogEntity(key)}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md border ${
                   catalogEntity === key
@@ -1025,10 +936,14 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
                         <td className="py-2.5 px-4 font-mono font-semibold text-teal-800">{String(row.code || '')}</td>
                         <td className="py-2.5 px-4 font-medium text-slate-900">{name}</td>
                         <td className="py-2.5 px-4 text-slate-600">{detail}</td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums">${price.toFixed(2)}</td>
+                        <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                          {settingsForm.currencySymbol || '$'}
+                          {price.toFixed(2)}
+                        </td>
                         {canEditCatalog && (
                           <td className="py-2.5 px-4 text-right">
                             <button
+                              type="button"
                               onClick={() => openCatalogModal(row)}
                               className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
                             >
@@ -1047,134 +962,58 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
         </div>
       )}
 
-      {/* Create User Modal */}
-      {showCreateUser && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full max-h-[90vh] overflow-y-auto">
-            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-              <h3 className="font-display text-base font-semibold text-slate-900">Create Staff Account</h3>
-              <button onClick={() => setShowCreateUser(false)} className="text-slate-400 hover:text-slate-700">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <form onSubmit={handleCreateUser} className="p-6 space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Full Name *</label>
-                <input
-                  required
-                  value={newUserForm.full_name}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, full_name: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Work Email *</label>
-                <input
-                  type="email"
-                  required
-                  value={newUserForm.email}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, email: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Assigned Roles *</label>
-                <div className="grid grid-cols-2 gap-1.5 max-h-36 overflow-y-auto p-2 border border-slate-200 rounded-md text-xs">
-                  {roles.map((r) => {
-                    const checked = newUserForm.role_codes.includes(r.code);
-                    return (
-                      <label key={r.code} className="inline-flex items-center gap-1.5 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(e) =>
-                            setNewUserForm((prev) => ({
-                              ...prev,
-                              role_codes: e.target.checked
-                                ? [...prev.role_codes, r.code]
-                                : prev.role_codes.filter((c) => c !== r.code),
-                            }))
-                          }
-                        />
-                        <span className="font-mono font-semibold">{r.code}</span>
-                        <span className="text-slate-500 truncate">{r.name}</span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Specialty / Department (Opt)</label>
-                <input
-                  value={newUserForm.specialty}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, specialty: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">Temporary Password *</label>
-                <input
-                  required
-                  value={newUserForm.password}
-                  onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })}
-                  className="w-full px-3 py-2 text-sm font-mono border border-slate-300 rounded-md"
-                />
-              </div>
-              <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
-                <button type="button" onClick={() => setShowCreateUser(false)} className="px-4 py-2 text-xs border border-slate-300 rounded-md">
-                  Cancel
-                </button>
-                <button type="submit" className="px-4 py-2 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
-                  Create Account
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Edit User Multi-Role Modal */}
-      {editRolesTarget && (
+      {/* Create / Edit Role Metadata Modal */}
+      {roleModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
           <div className="bg-white border border-slate-200 rounded-lg max-w-md w-full">
             <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
               <h3 className="font-display text-base font-semibold text-slate-900">
-                Assign Roles · {editRolesTarget.full_name}
+                {editingRoleMeta ? `Edit Role · ${editingRoleMeta.code}` : 'Create Custom RBAC Role'}
               </h3>
-              <button onClick={() => setEditRolesTarget(null)} className="text-slate-400 hover:text-slate-700">
+              <button type="button" onClick={() => setRoleModalOpen(false)} className="text-slate-400 hover:text-slate-700">
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <form onSubmit={handleSaveUserRoles} className="p-6 space-y-4 text-xs">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto">
-                {roles.map((r) => (
-                  <label key={r.code} className="flex items-center gap-2 p-2 border border-slate-200 rounded cursor-pointer hover:bg-slate-50">
-                    <input
-                      type="checkbox"
-                      checked={editRoleCodes.includes(r.code)}
-                      onChange={(e) =>
-                        setEditRoleCodes((prev) =>
-                          e.target.checked ? [...prev, r.code] : prev.filter((c) => c !== r.code)
-                        )
-                      }
-                    />
-                    <div>
-                      <div className="font-mono font-semibold text-teal-800">{r.code}</div>
-                      <div className="text-slate-600">{r.name}</div>
-                    </div>
-                  </label>
-                ))}
+            <form onSubmit={handleSaveRoleMeta} className="p-6 space-y-4 text-xs">
+              {!editingRoleMeta && (
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Role Code (2–10 chars) *</label>
+                  <input
+                    required
+                    minLength={2}
+                    maxLength={10}
+                    value={roleMetaForm.code}
+                    onChange={(e) => setRoleMetaForm({ ...roleMetaForm, code: e.target.value.toUpperCase() })}
+                    placeholder="e.g. TRIAGE or AUD_JR"
+                    className="w-full px-3 py-2 font-mono border border-slate-300 rounded-md"
+                  />
+                </div>
+              )}
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Role Name *</label>
+                <input
+                  required
+                  value={roleMetaForm.name}
+                  onChange={(e) => setRoleMetaForm({ ...roleMetaForm, name: e.target.value })}
+                  placeholder="e.g. Triage Coordinator"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 mb-1">Duties &amp; Access Boundary</label>
+                <textarea
+                  rows={3}
+                  value={roleMetaForm.description}
+                  onChange={(e) => setRoleMetaForm({ ...roleMetaForm, description: e.target.value })}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md"
+                />
               </div>
               <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
-                <button type="button" onClick={() => setEditRolesTarget(null)} className="px-4 py-2 border border-slate-300 rounded-md">
+                <button type="button" onClick={() => setRoleModalOpen(false)} className="px-4 py-2 border border-slate-300 rounded-md">
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  disabled={editRoleCodes.length === 0}
-                  className="px-4 py-2 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md disabled:opacity-40"
-                >
-                  Save Roles
+                <button type="submit" className="px-4 py-2 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md">
+                  {editingRoleMeta ? 'Save Changes' : 'Create Role'}
                 </button>
               </div>
             </form>
@@ -1182,7 +1021,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
         </div>
       )}
 
-      {/* Edit Role Permissions Modal */}
+      {/* Edit Role Permissions Matrix Modal */}
       {editPermsRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
           <div className="bg-white border border-slate-200 rounded-lg max-w-3xl w-full max-h-[90vh] flex flex-col">
@@ -1191,38 +1030,59 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
                 <h3 className="font-display text-base font-semibold text-slate-900">
                   Configure RBAC Permissions · {editPermsRole.code} ({editPermsRole.name})
                 </h3>
-                <div className="text-xs text-slate-500">{selectedPermCodes.length} permissions enabled</div>
+                <div className="text-xs text-slate-500 font-mono tabular-nums">
+                  {selectedPermCodes.length} of {allPermissions.length} permissions enabled
+                </div>
               </div>
-              <button onClick={() => setEditPermsRole(null)} className="text-slate-400 hover:text-slate-700">
+              <button type="button" onClick={() => setEditPermsRole(null)} className="text-slate-400 hover:text-slate-700">
                 <X className="w-5 h-5" />
               </button>
             </div>
             <form onSubmit={handleSaveRolePerms} className="p-6 overflow-y-auto space-y-4 text-xs flex-1">
-              {Object.entries(permissionsByModule).map(([mod, perms]) => (
-                <div key={mod} className="border border-slate-200 rounded-md p-3 space-y-2">
-                  <div className="font-semibold text-slate-900 uppercase tracking-wide text-[11px]">{mod}</div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
-                    {perms.map((p) => (
-                      <label key={p.code} className="inline-flex items-start gap-2 cursor-pointer p-1 rounded hover:bg-slate-50">
-                        <input
-                          type="checkbox"
-                          className="mt-0.5"
-                          checked={selectedPermCodes.includes(p.code)}
-                          onChange={(e) =>
-                            setSelectedPermCodes((prev) =>
-                              e.target.checked ? [...prev, p.code] : prev.filter((c) => c !== p.code)
-                            )
-                          }
-                        />
-                        <div>
-                          <div className="font-mono font-medium text-slate-800">{p.code}</div>
-                          {p.description && <div className="text-slate-500 text-[11px]">{p.description}</div>}
-                        </div>
-                      </label>
-                    ))}
+              {Object.entries(permissionsByModule).map(([mod, perms]) => {
+                const modCodes = perms.map((p) => p.code);
+                const allModSelected = modCodes.every((c) => selectedPermCodes.includes(c));
+                return (
+                  <div key={mod} className="border border-slate-200 rounded-md p-3 space-y-2">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-1.5">
+                      <span className="font-semibold text-slate-900 uppercase tracking-wide text-[11px]">{mod}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedPermCodes((prev) =>
+                            allModSelected
+                              ? prev.filter((c) => !modCodes.includes(c))
+                              : [...new Set([...prev, ...modCodes])]
+                          )
+                        }
+                        className="text-[11px] font-medium text-teal-700 hover:text-teal-900"
+                      >
+                        {allModSelected ? 'Clear Module' : 'Select All'}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                      {perms.map((p) => (
+                        <label key={p.code} className="inline-flex items-start gap-2 cursor-pointer p-1 rounded hover:bg-slate-50">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5"
+                            checked={selectedPermCodes.includes(p.code)}
+                            onChange={(e) =>
+                              setSelectedPermCodes((prev) =>
+                                e.target.checked ? [...prev, p.code] : prev.filter((c) => c !== p.code)
+                              )
+                            }
+                          />
+                          <div>
+                            <div className="font-mono font-medium text-slate-800">{p.code}</div>
+                            {p.description && <div className="text-slate-500 text-[11px]">{p.description}</div>}
+                          </div>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               <div className="pt-3 border-t border-slate-200 flex justify-end gap-2">
                 <button type="button" onClick={() => setEditPermsRole(null)} className="px-4 py-2 border border-slate-300 rounded-md">
                   Cancel
@@ -1244,7 +1104,7 @@ export const AdminAuditView: React.FC<AdminAuditViewProps> = ({ user, initialTab
               <h3 className="font-display text-base font-semibold text-slate-900">
                 {catalogEditingId ? `Edit ${catalogEntity} #${catalogEditingId}` : `Add ${catalogEntity} Entry`}
               </h3>
-              <button onClick={() => setCatalogModalOpen(false)} className="text-slate-400 hover:text-slate-700">
+              <button type="button" onClick={() => setCatalogModalOpen(false)} className="text-slate-400 hover:text-slate-700">
                 <X className="w-5 h-5" />
               </button>
             </div>

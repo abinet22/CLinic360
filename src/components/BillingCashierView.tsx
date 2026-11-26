@@ -39,18 +39,39 @@ interface PrintableReceipt {
   items: Array<{ description: string; quantity: number; unit_price: number; line_total: number }>;
 }
 
+interface PaymentReportRow {
+  payment_date: string;
+  cashier_name: string;
+  payment_method: string;
+  tx_count: number;
+  total_amount: number;
+}
+
 interface BillingCashierViewProps {
   user: UserContext;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
+  initialSubTab?: 'invoices' | 'payments' | 'deposits' | 'approvals' | 'bypasses' | 'shifts' | 'reports';
 }
 
-export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, onNotify }) => {
-  const [subTab, setSubTab] = useState<'invoices' | 'deposits' | 'approvals' | 'bypasses' | 'shifts'>('invoices');
+export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, onNotify, initialSubTab }) => {
+  const [subTab, setSubTab] = useState<'invoices' | 'payments' | 'deposits' | 'approvals' | 'bypasses' | 'shifts' | 'reports'>(
+    initialSubTab || 'invoices'
+  );
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [invTotal, setInvTotal] = useState(0);
   const [invPage, setInvPage] = useState(1);
   const [invSearch, setInvSearch] = useState('');
   const [invStatus, setInvStatus] = useState('all');
+
+  const [payReportFrom, setPayReportFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 10);
+  });
+  const [payReportTo, setPayReportTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [payReportRows, setPayReportRows] = useState<PaymentReportRow[]>([]);
+  const [payReportOwnOnly, setPayReportOwnOnly] = useState(true);
+  const [payReportLoading, setPayReportLoading] = useState(false);
 
   const [deposits, setDeposits] = useState<PatientDeposit[]>([]);
   const [shifts, setShifts] = useState<CashierShift[]>([]);
@@ -117,6 +138,7 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
 
   const [receiptPreview, setReceiptPreview] = useState<PrintableReceipt | null>(null);
 
+  const canReadInvoices = user.permissions.includes('billing.invoice.read');
   const canCreateInvoice = user.permissions.includes('billing.invoice.create');
   const canTakePayment = user.permissions.includes('billing.payment.create');
   const canCreateDeposit = user.permissions.includes('billing.deposit.create');
@@ -124,8 +146,18 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
   const canReconcileShift = user.permissions.includes('billing.shift.reconcile');
   const canRequestApproval = user.permissions.includes('billing.approval.request');
   const canDecideApproval = user.permissions.includes('billing.approval.decide');
+  const canViewReports =
+    user.permissions.includes('finance.report.view') ||
+    user.permissions.includes('billing.report.own') ||
+    user.permissions.includes('audit.read');
   const canPrintReceipt =
     user.permissions.includes('billing.receipt.print') || user.permissions.includes('finance.report.view');
+
+  useEffect(() => {
+    if (initialSubTab) {
+      setSubTab(initialSubTab);
+    }
+  }, [initialSubTab]);
 
   useEffect(() => {
     if (!receiptPreview) return;
@@ -145,11 +177,24 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
       if (invSearch.trim()) qs.set('q', invSearch.trim());
 
       const [invRes, depRes, shfRes, appRes, bypRes] = await Promise.all([
-        apiFetch<{ invoices: Invoice[]; total?: number }>(`/api/billing/invoices?${qs}`),
-        apiFetch<{ deposits: PatientDeposit[] }>('/api/billing/deposits'),
-        apiFetch<{ shifts: CashierShift[] }>('/api/billing/shifts'),
-        apiFetch<{ approvals: ApprovalRequest[] }>('/api/billing/approvals'),
-        apiFetch<{ bypasses: PaymentGateBypass[] }>('/api/billing/bypasses').catch(() => ({ bypasses: [] as PaymentGateBypass[] })),
+        canReadInvoices
+          ? apiFetch<{ invoices: Invoice[]; total?: number }>(`/api/billing/invoices?${qs}`).catch(() => ({
+              invoices: [] as Invoice[],
+              total: 0,
+            }))
+          : Promise.resolve({ invoices: [] as Invoice[], total: 0 }),
+        canReadInvoices || canCreateDeposit
+          ? apiFetch<{ deposits: PatientDeposit[] }>('/api/billing/deposits').catch(() => ({ deposits: [] as PatientDeposit[] }))
+          : Promise.resolve({ deposits: [] as PatientDeposit[] }),
+        canManageShift || canReconcileShift || canReadInvoices
+          ? apiFetch<{ shifts: CashierShift[] }>('/api/billing/shifts').catch(() => ({ shifts: [] as CashierShift[] }))
+          : Promise.resolve({ shifts: [] as CashierShift[] }),
+        canReadInvoices || canRequestApproval || canDecideApproval
+          ? apiFetch<{ approvals: ApprovalRequest[] }>('/api/billing/approvals').catch(() => ({ approvals: [] as ApprovalRequest[] }))
+          : Promise.resolve({ approvals: [] as ApprovalRequest[] }),
+        canReadInvoices || canTakePayment
+          ? apiFetch<{ bypasses: PaymentGateBypass[] }>('/api/billing/bypasses').catch(() => ({ bypasses: [] as PaymentGateBypass[] }))
+          : Promise.resolve({ bypasses: [] as PaymentGateBypass[] }),
       ]);
       setInvoices(invRes.invoices || []);
       setInvTotal(typeof invRes.total === 'number' ? invRes.total : (invRes.invoices || []).length);
@@ -160,16 +205,51 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
-  }, [onNotify, invPage, invStatus, invSearch]);
+  }, [
+    onNotify,
+    invPage,
+    invStatus,
+    invSearch,
+    canReadInvoices,
+    canCreateDeposit,
+    canManageShift,
+    canReconcileShift,
+    canRequestApproval,
+    canDecideApproval,
+    canTakePayment,
+  ]);
+
+  const loadPaymentReport = useCallback(async () => {
+    if (!canViewReports) return;
+    setPayReportLoading(true);
+    try {
+      const res = await apiFetch<{ ownOnly?: boolean; rows: PaymentReportRow[] }>(
+        `/api/reports/daily-cash?from=${encodeURIComponent(payReportFrom)}&to=${encodeURIComponent(payReportTo)}`
+      );
+      setPayReportRows(res.rows || []);
+      setPayReportOwnOnly(Boolean(res.ownOnly));
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setPayReportLoading(false);
+    }
+  }, [canViewReports, payReportFrom, payReportTo, onNotify]);
 
   useEffect(() => {
     loadBilling();
   }, [loadBilling]);
 
+  useEffect(() => {
+    if (subTab === 'reports' && canViewReports) {
+      loadPaymentReport();
+    }
+  }, [subTab, canViewReports, loadPaymentReport]);
+
   useRealtimeSync(
     ['payment:confirmed', 'visit:updated', 'lab:updated', 'imaging:updated', 'pharmacy:updated'],
     () => {
       loadBilling();
+      if (subTab === 'reports' && canViewReports) loadPaymentReport();
     }
   );
 
@@ -575,47 +655,77 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
       {/* Navigation & Actions */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
-          <button
-            onClick={() => setSubTab('invoices')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-              subTab === 'invoices' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            Invoices &amp; Receipts ({invTotal})
-          </button>
-          <button
-            onClick={() => setSubTab('deposits')}
-            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md ${
-              subTab === 'deposits' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <Wallet className="w-3.5 h-3.5" />
-            <span>Patient Deposits ({deposits.filter((d) => d.status === 'active').length})</span>
-          </button>
-          <button
-            onClick={() => setSubTab('approvals')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-              subTab === 'approvals' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            Approvals ({approvals.filter((a) => a.status === 'pending').length} pending)
-          </button>
-          <button
-            onClick={() => setSubTab('bypasses')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-              subTab === 'bypasses' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            Gate Bypasses ({bypasses.filter((b) => b.follow_up_status === 'pending_billing').length} open)
-          </button>
-          <button
-            onClick={() => setSubTab('shifts')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
-              subTab === 'shifts' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            Shift Reconciliation ({shifts.length})
-          </button>
+          {canReadInvoices && (
+            <button
+              onClick={() => setSubTab('invoices')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'invoices' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Invoices &amp; Receipts ({invTotal})
+            </button>
+          )}
+          {(canTakePayment || canReadInvoices) && (
+            <button
+              onClick={() => setSubTab('payments')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'payments' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Payments
+            </button>
+          )}
+          {(canCreateDeposit || canReadInvoices) && (
+            <button
+              onClick={() => setSubTab('deposits')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'deposits' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Wallet className="w-3.5 h-3.5" />
+              <span>Patient Deposits ({deposits.filter((d) => d.status === 'active').length})</span>
+            </button>
+          )}
+          {(canRequestApproval || canDecideApproval || canReadInvoices) && (
+            <button
+              onClick={() => setSubTab('approvals')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'approvals' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Approvals ({approvals.filter((a) => a.status === 'pending').length} pending)
+            </button>
+          )}
+          {(canTakePayment || canReadInvoices) && (
+            <button
+              onClick={() => setSubTab('bypasses')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'bypasses' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Gate Bypasses ({bypasses.filter((b) => b.follow_up_status === 'pending_billing').length} open)
+            </button>
+          )}
+          {(canManageShift || canReconcileShift) && (
+            <button
+              onClick={() => setSubTab('shifts')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'shifts' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Shift Reconciliation ({shifts.length})
+            </button>
+          )}
+          {canViewReports && (
+            <button
+              onClick={() => setSubTab('reports')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md ${
+                subTab === 'reports' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Payment Reports
+            </button>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -1052,6 +1162,179 @@ export const BillingCashierView: React.FC<BillingCashierViewProps> = ({ user, on
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {subTab === 'payments' && (
+        <div className="space-y-5">
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+            <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">Collectible Invoices &amp; Cashier Desk</h2>
+                <p className="text-xs text-slate-500">Collect outstanding self-pay balances and reprint issued receipts.</p>
+              </div>
+              <div className="relative min-w-[220px]">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  value={invSearch}
+                  onChange={(e) => {
+                    setInvSearch(e.target.value);
+                    setInvPage(1);
+                  }}
+                  placeholder="Filter by invoice #, MRN, patient..."
+                  className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                />
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Invoice</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4 text-right">Total</th>
+                    <th className="py-2.5 px-4 text-right">Balance Due</th>
+                    <th className="py-2.5 px-4">Status</th>
+                    <th className="py-2.5 px-4 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {invoices
+                    .filter((i) => i.status !== 'voided')
+                    .map((inv) => {
+                      const balance = Math.max(0, Number(inv.total_amount) - Number(inv.paid_amount));
+                      return (
+                        <tr key={inv.id} className="hover:bg-slate-50/70">
+                          <td className="py-3 px-4 font-mono font-semibold text-slate-900">{inv.invoice_number}</td>
+                          <td className="py-3 px-4">
+                            <div className="font-medium text-slate-900">{inv.first_name} {inv.last_name}</div>
+                            <div className="font-mono text-slate-500">{inv.mrn}</div>
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums">${Number(inv.total_amount).toFixed(2)}</td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            ${balance.toFixed(2)}
+                          </td>
+                          <td className="py-3 px-4 capitalize font-medium text-slate-700">{inv.status.replace('_', ' ')}</td>
+                          <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
+                            {canTakePayment && balance > 0 && (
+                              <button
+                                onClick={() => {
+                                  setPayTarget(inv);
+                                  setPayAmount(balance.toFixed(2));
+                                }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+                              >
+                                <DollarSign className="w-3 h-3" />
+                                <span>Collect Payment</span>
+                              </button>
+                            )}
+                            {inv.payments[0]?.receipt_number && canPrintReceipt && (
+                              <button
+                                onClick={() => openReceipt(inv.payments[0].receipt_number!)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded"
+                              >
+                                <Printer className="w-3 h-3" />
+                                <span>Receipt</span>
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {subTab === 'reports' && (
+        <div className="space-y-5">
+          <div className="bg-white border border-slate-200 rounded-lg p-5 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900">
+                {payReportOwnOnly ? 'My Payment Collections Report' : 'Daily Cash & Payment Report'}
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {payReportOwnOnly
+                  ? 'Scoped to payments recorded by your cashier account.'
+                  : 'Clinic-wide payment collections aggregated by cashier, date, and payment method.'}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <label className="text-slate-600">From</label>
+              <input
+                type="date"
+                value={payReportFrom}
+                onChange={(e) => setPayReportFrom(e.target.value)}
+                className="px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+              />
+              <label className="text-slate-600">To</label>
+              <input
+                type="date"
+                value={payReportTo}
+                onChange={(e) => setPayReportTo(e.target.value)}
+                className="px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => loadPaymentReport()}
+                className="px-3 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-white border border-slate-200 rounded-lg p-4">
+              <div className="text-xs text-slate-500">Total Transactions</div>
+              <div className="text-xl font-display font-semibold text-slate-900 mt-1 tabular-nums">
+                {payReportRows.reduce((s, r) => s + Number(r.tx_count || 0), 0)}
+              </div>
+            </div>
+            <div className="bg-white border border-slate-200 rounded-lg p-4">
+              <div className="text-xs text-slate-500">Net Collected</div>
+              <div className="text-xl font-display font-semibold text-teal-800 mt-1 font-mono tabular-nums">
+                ${payReportRows.reduce((s, r) => s + Number(r.total_amount || 0), 0).toFixed(2)}
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+            {payReportLoading ? (
+              <div className="p-8 text-center text-sm text-slate-500">Loading payment report...</div>
+            ) : payReportRows.length === 0 ? (
+              <div className="p-10 text-center text-sm text-slate-500">No completed payments recorded in this date range.</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                      <th className="py-2.5 px-4">Date</th>
+                      <th className="py-2.5 px-4">Cashier</th>
+                      <th className="py-2.5 px-4">Payment Method</th>
+                      <th className="py-2.5 px-4 text-right">Tx Count</th>
+                      <th className="py-2.5 px-4 text-right">Net Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {payReportRows.map((row, idx) => (
+                      <tr key={idx} className="hover:bg-slate-50/70">
+                        <td className="py-3 px-4 font-mono text-slate-700">{row.payment_date}</td>
+                        <td className="py-3 px-4 font-medium text-slate-900">{row.cashier_name || 'Cashier'}</td>
+                        <td className="py-3 px-4 capitalize text-slate-700">{row.payment_method.replace('_', ' ')}</td>
+                        <td className="py-3 px-4 text-right font-mono tabular-nums">{row.tx_count}</td>
+                        <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                          ${Number(row.total_amount).toFixed(2)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

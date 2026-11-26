@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, CreditCard, Edit2, Eye, GitMerge, Lock, Megaphone, Plus, Receipt, Search, Stethoscope, UserPlus, X } from 'lucide-react';
 import { ApiError, apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
-import type { CashierShift, Patient, QueueTicket, ServiceItem, UserContext } from '../types';
+import type { CashierShift, Patient, QueueTicket, ServiceItem, UserContext, Visit } from '../types';
 
 interface DoctorOption {
   id: number;
@@ -13,6 +13,7 @@ interface DoctorOption {
 interface PatientsQueueViewProps {
   user: UserContext;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
+  initialSubTab?: 'patients' | 'register' | 'visits' | 'assign_doctor' | 'queue';
 }
 
 interface PatientDetailPayload {
@@ -26,8 +27,10 @@ interface PatientDetailPayload {
   accessHistory: Array<{ id: number; occurred_at: string; user_name: string; role_at_time: string; action: string }>;
 }
 
-export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNotify }) => {
-  const [subTab, setSubTab] = useState<'patients' | 'queue'>('patients');
+export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNotify, initialSubTab }) => {
+  const [subTab, setSubTab] = useState<'patients' | 'visits' | 'assign_doctor' | 'queue'>(
+    initialSubTab && initialSubTab !== 'register' ? initialSubTab : 'patients'
+  );
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [lookupField, setLookupField] = useState<'all' | 'name' | 'phone' | 'mrn'>('all');
@@ -38,6 +41,10 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   const [tickets, setTickets] = useState<QueueTicket[]>([]);
   const [deptFilter, setDeptFilter] = useState('ALL');
   const [loading, setLoading] = useState(true);
+  const [visits, setVisits] = useState<Visit[]>([]);
+  const [visitsLoading, setVisitsLoading] = useState(false);
+  const [assignDoctorSelections, setAssignDoctorSelections] = useState<Record<number, string>>({});
+  const [assigningVisitId, setAssigningVisitId] = useState<number | null>(null);
 
   const [showRegister, setShowRegister] = useState(false);
   const [duplicates, setDuplicates] = useState<Array<{ id: number; mrn: string; first_name: string; last_name: string; phone: string }>>([]);
@@ -134,6 +141,12 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   const canMerge = user.permissions.includes('patient.merge');
   const canCollectPayment = user.permissions.includes('billing.payment.create');
   const canManageShift = user.permissions.includes('billing.shift.manage');
+  const canAssignDoctor =
+    user.permissions.includes('visit.assign_doctor') ||
+    canCreateVisit ||
+    user.permissions.includes('vitals.create') ||
+    canQueue;
+  const canReadVisits = user.permissions.includes('visit.read') || canAssignDoctor;
 
   useEffect(() => {
     if (!search.trim()) {
@@ -182,6 +195,29 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     }
   }, [canCollectPayment, user.id]);
 
+  const loadVisits = useCallback(async () => {
+    if (!canReadVisits) return;
+    setVisitsLoading(true);
+    try {
+      const res = await apiFetch<{ visits: Visit[] }>('/api/visits');
+      const list = res.visits || [];
+      setVisits(list);
+      setAssignDoctorSelections((prev) => {
+        const next = { ...prev };
+        for (const v of list) {
+          if (!next[v.id]) {
+            next[v.id] = v.doctor_id ? String(v.doctor_id) : doctors[0] ? String(doctors[0].id) : '';
+          }
+        }
+        return next;
+      });
+    } catch {
+      // ignore if role lacks visit.read
+    } finally {
+      setVisitsLoading(false);
+    }
+  }, [canReadVisits, doctors]);
+
   useEffect(() => {
     loadPatients();
   }, [loadPatients]);
@@ -195,7 +231,20 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
   }, [loadCashierShift]);
 
   useEffect(() => {
-    if (canCreateVisit) {
+    loadVisits();
+  }, [loadVisits]);
+
+  useEffect(() => {
+    if (initialSubTab === 'register') {
+      setSubTab('patients');
+      setShowRegister(true);
+    } else if (initialSubTab) {
+      setSubTab(initialSubTab);
+    }
+  }, [initialSubTab]);
+
+  useEffect(() => {
+    if (canCreateVisit || canAssignDoctor) {
       apiFetch<{ doctors: DoctorOption[] }>('/api/doctors')
         .then((res) => {
           setDoctors(res.doctors || []);
@@ -211,12 +260,13 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
         })
         .catch(() => {});
     }
-  }, [canCreateVisit]);
+  }, [canCreateVisit, canAssignDoctor]);
 
   useRealtimeSync(['queue:updated', 'visit:updated', 'payment:confirmed'], () => {
     loadPatients();
     loadQueue();
     loadCashierShift();
+    loadVisits();
   });
 
   async function checkDuplicates() {
@@ -719,11 +769,33 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
     }
   }
 
+  async function handleAssignDoctor(visitId: number) {
+    const selectedDocId = assignDoctorSelections[visitId] || (doctors[0] ? String(doctors[0].id) : '');
+    if (!selectedDocId) {
+      onNotify('Select an active OPD doctor first.', 'error');
+      return;
+    }
+    setAssigningVisitId(visitId);
+    try {
+      const res = await apiFetch<{ doctor_name: string; specialty: string }>(`/api/visits/${visitId}/assign-doctor`, {
+        method: 'PATCH',
+        body: JSON.stringify({ doctor_id: Number(selectedDocId) }),
+      });
+      onNotify(`Assigned visit to ${res.doctor_name} (${res.specialty}) · Notification sent`, 'success');
+      loadVisits();
+      loadQueue();
+    } catch (err) {
+      onNotify((err as Error).message, 'error');
+    } finally {
+      setAssigningVisitId(null);
+    }
+  }
+
   return (
     <div className="space-y-5">
       {/* Sub-navigation & Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
+        <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
           <button
             onClick={() => setSubTab('patients')}
             className={`px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -732,6 +804,26 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
           >
             Patient Registry ({patientTotal})
           </button>
+          {canReadVisits && (
+            <button
+              onClick={() => setSubTab('visits')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                subTab === 'visits' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Patient Visits ({visits.length})
+            </button>
+          )}
+          {canAssignDoctor && (
+            <button
+              onClick={() => setSubTab('assign_doctor')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                subTab === 'assign_doctor' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              OPD Doctor Assignment
+            </button>
+          )}
           <button
             onClick={() => setSubTab('queue')}
             className={`px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
@@ -1192,6 +1284,131 @@ export const PatientsQueueView: React.FC<PatientsQueueViewProps> = ({ user, onNo
                       )}
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {(subTab === 'visits' || subTab === 'assign_doctor') && (
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="p-4 border-b border-slate-200 bg-slate-50/50 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900">
+                {subTab === 'assign_doctor' ? 'OPD Doctor Assignment' : 'Patient Visits & Triage Status'}
+              </h2>
+              <p className="text-xs text-slate-500">
+                {subTab === 'assign_doctor'
+                  ? 'Assign registered & vitals-checked patients to an OPD doctor. Assigning sends a targeted alert to that doctor only.'
+                  : 'Track active walk-in and scheduled visits across payment, vital signs, doctor assignment, and completion.'}
+              </p>
+            </div>
+            {canCreateVisit && (
+              <button
+                onClick={() => openCreateVisitModal()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded-md"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Register New Visit</span>
+              </button>
+            )}
+          </div>
+          {visitsLoading ? (
+            <div className="p-8 text-center text-sm text-slate-500">Loading visits...</div>
+          ) : visits.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No visits available for your current scope.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Visit #</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4">Stage &amp; Payment</th>
+                    <th className="py-2.5 px-4">Vitals</th>
+                    <th className="py-2.5 px-4">Assigned Doctor</th>
+                    {canAssignDoctor && <th className="py-2.5 px-4 text-right">Assign OPD Doctor</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs">
+                  {visits.map((v) => {
+                    const isClosed = v.status === 'closed';
+                    const selectedDoc =
+                      assignDoctorSelections[v.id] ?? (v.doctor_id ? String(v.doctor_id) : doctors[0] ? String(doctors[0].id) : '');
+                    return (
+                      <tr key={v.id} className="hover:bg-slate-50/70">
+                        <td className="py-3 px-4 font-mono">
+                          <div className="font-semibold text-slate-900">{v.visit_number}</div>
+                          <div className="text-[11px] text-slate-500 capitalize">
+                            {(v.visit_type || 'walk_in').replace('_', ' ')} · {v.triage_priority}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-medium text-slate-900">{v.first_name} {v.last_name}</div>
+                          <div className="font-mono text-slate-500">{v.mrn}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-medium text-slate-800 capitalize">
+                            {(v.workflow_stage || v.status).replace(/_/g, ' ')}
+                          </div>
+                          <div className="font-mono text-[11px] text-slate-500">
+                            {v.consultation_invoice_number
+                              ? `${v.consultation_invoice_number} (${(v.consultation_invoice_status || 'unpaid').replace('_', ' ')})`
+                              : v.patient_type}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          {(v.vitals_count ?? 0) > 0 ? (
+                            <span className="text-emerald-700 font-semibold">{v.vitals_count} recorded</span>
+                          ) : (
+                            <span className="text-amber-700">Pending vitals</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          {v.doctor_name ? (
+                            <div>
+                              <div className="font-medium text-slate-900">{v.doctor_name}</div>
+                              <div className="text-[11px] text-slate-500">{v.specialty || 'OPD'}</div>
+                            </div>
+                          ) : (
+                            <span className="text-amber-700 font-medium">Unassigned</span>
+                          )}
+                        </td>
+                        {canAssignDoctor && (
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            {isClosed ? (
+                              <span className="text-slate-400">Closed</span>
+                            ) : (
+                              <div className="inline-flex items-center gap-1.5">
+                                <select
+                                  value={selectedDoc}
+                                  onChange={(e) =>
+                                    setAssignDoctorSelections((prev) => ({ ...prev, [v.id]: e.target.value }))
+                                  }
+                                  className="px-2 py-1 text-xs border border-slate-300 rounded bg-white"
+                                >
+                                  {doctors.map((d) => (
+                                    <option key={d.id} value={d.id}>
+                                      {d.full_name} {d.specialty ? `(${d.specialty})` : ''}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  disabled={assigningVisitId === v.id || !selectedDoc}
+                                  onClick={() => handleAssignDoctor(v.id)}
+                                  className="px-2.5 py-1 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded disabled:opacity-50"
+                                >
+                                  {assigningVisitId === v.id ? 'Saving...' : v.doctor_id ? 'Reassign' : 'Assign Doctor'}
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

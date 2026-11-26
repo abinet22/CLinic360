@@ -16,7 +16,11 @@ CREATE TABLE IF NOT EXISTS departments (
   branch_id INT NOT NULL DEFAULT 1,
   code VARCHAR(20) NOT NULL UNIQUE,
   name VARCHAR(120) NOT NULL,
+  category VARCHAR(40) NOT NULL DEFAULT 'clinical',
+  head_name VARCHAR(140) NULL,
+  description VARCHAR(255) NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (branch_id) REFERENCES branches(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -48,11 +52,15 @@ CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   branch_id INT NOT NULL DEFAULT 1,
   department_id INT NULL,
+  employee_id INT NULL,
+  username VARCHAR(80) NULL UNIQUE,
   full_name VARCHAR(140) NOT NULL,
   email VARCHAR(160) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
   specialty VARCHAR(120) NULL,
   active TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive','locked') NOT NULL DEFAULT 'active',
+  exception_approved TINYINT(1) NOT NULL DEFAULT 0,
   must_change_password TINYINT(1) NOT NULL DEFAULT 0,
   two_fa_enabled TINYINT(1) NOT NULL DEFAULT 0,
   failed_attempts INT NOT NULL DEFAULT 0,
@@ -60,6 +68,7 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_users_employee_id (employee_id),
   FOREIGN KEY (branch_id) REFERENCES branches(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -571,6 +580,7 @@ CREATE TABLE IF NOT EXISTS patient_deposits (
 CREATE TABLE IF NOT EXISTS notifications (
   id INT AUTO_INCREMENT PRIMARY KEY,
   target_role VARCHAR(10) NOT NULL,
+  target_user_id INT NULL,
   title VARCHAR(140) NOT NULL,
   message VARCHAR(255) NOT NULL,
   severity ENUM('info','warning','critical') NOT NULL DEFAULT 'info',
@@ -578,7 +588,8 @@ CREATE TABLE IF NOT EXISTS notifications (
   entity_id INT NULL,
   is_read TINYINT(1) NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_notif_role_read (target_role, is_read)
+  INDEX idx_notif_role_read (target_role, is_read),
+  INDEX idx_notif_user_read (target_user_id, is_read)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -763,17 +774,18 @@ CREATE TABLE IF NOT EXISTS staff_contracts (
 
 CREATE TABLE IF NOT EXISTS leave_requests (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  user_id INT NOT NULL,
-  leave_type ENUM('annual','sick','study','emergency') NOT NULL DEFAULT 'annual',
+  user_id INT NULL,
+  employee_id INT NULL,
+  leave_type VARCHAR(40) NOT NULL DEFAULT 'annual',
   start_date DATE NOT NULL,
   end_date DATE NOT NULL,
   days_count INT NOT NULL DEFAULT 1,
   reason VARCHAR(255) NOT NULL,
-  status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  status ENUM('pending','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
   decided_by INT NULL,
   decided_at DATETIME NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES users(id)
+  decision_note VARCHAR(255) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS payroll_runs (
@@ -783,7 +795,7 @@ CREATE TABLE IF NOT EXISTS payroll_runs (
   total_gross DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   total_deductions DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   total_net DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-  status ENUM('draft','verified','approved','posted','paid') NOT NULL DEFAULT 'draft',
+  status ENUM('draft','verified','approved','posted','partially_paid','paid','rejected') NOT NULL DEFAULT 'draft',
   journal_entry_id INT NULL,
   payment_journal_entry_id INT NULL,
   created_by INT NOT NULL,
@@ -800,19 +812,27 @@ CREATE TABLE IF NOT EXISTS payroll_runs (
 CREATE TABLE IF NOT EXISTS payroll_items (
   id INT AUTO_INCREMENT PRIMARY KEY,
   payroll_run_id INT NOT NULL,
-  user_id INT NOT NULL,
+  user_id INT NULL,
+  employee_id INT NULL,
   staff_name VARCHAR(140) NOT NULL,
   role_code VARCHAR(16) NOT NULL,
   base_salary DECIMAL(12,2) NOT NULL,
   allowances DECIMAL(12,2) NOT NULL,
   taxable_allowances DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  overtime_pay DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  bonus_earnings DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   pension_employee DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   pension_employer DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   paye_tax DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  other_deductions DECIMAL(12,2) NOT NULL DEFAULT 0.00,
   tax_deduction DECIMAL(12,2) NOT NULL,
   net_pay DECIMAL(12,2) NOT NULL,
-  FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id),
-  FOREIGN KEY (user_id) REFERENCES users(id)
+  paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  payment_status VARCHAR(24) NOT NULL DEFAULT 'unpaid',
+  payment_method VARCHAR(32) NULL,
+  payment_ref VARCHAR(80) NULL,
+  paid_at DATETIME NULL,
+  FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS system_settings (
@@ -992,4 +1012,286 @@ CREATE INDEX idx_invoices_patient ON invoices(patient_id, status);
 CREATE INDEX idx_visits_patient ON visits(patient_id, workflow_stage);
 CREATE INDEX idx_audit_user ON audit_logs(user_id);
 CREATE INDEX idx_queue_dept_status ON queue_tickets(department, status);
+
+CREATE TABLE IF NOT EXISTS hr_employees (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_number VARCHAR(32) NOT NULL UNIQUE,
+  user_id INT NULL UNIQUE,
+  full_name VARCHAR(160) NOT NULL,
+  gender VARCHAR(20) NOT NULL DEFAULT 'unspecified',
+  phone VARCHAR(40) NULL,
+  email VARCHAR(160) NULL,
+  address VARCHAR(255) NULL,
+  emergency_contact_name VARCHAR(140) NULL,
+  emergency_contact_phone VARCHAR(40) NULL,
+  department_name VARCHAR(100) NOT NULL,
+  job_position VARCHAR(120) NOT NULL DEFAULT 'Staff',
+  employment_type VARCHAR(30) NOT NULL DEFAULT 'full_time',
+  hire_date DATE NOT NULL,
+  contract_start DATE NOT NULL,
+  contract_end DATE NULL,
+  basic_salary DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  housing_allowance DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  licence_number VARCHAR(80) NULL,
+  licence_expiry DATE NULL,
+  status ENUM('active','inactive','resigned','terminated') NOT NULL DEFAULT 'active',
+  terminated_at DATE NULL,
+  termination_reason VARCHAR(255) NULL,
+  access_review_required TINYINT(1) NOT NULL DEFAULT 0,
+  access_reviewed_at DATETIME NULL,
+  access_reviewed_by INT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_employee_documents (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  doc_type VARCHAR(40) NOT NULL DEFAULT 'contract',
+  title VARCHAR(160) NOT NULL,
+  file_ref VARCHAR(255) NULL,
+  expiry_date DATE NULL,
+  notes VARCHAR(255) NULL,
+  uploaded_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_attendance (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  user_id INT NULL,
+  attendance_date DATE NOT NULL,
+  check_in VARCHAR(10) NULL,
+  check_out VARCHAR(10) NULL,
+  hours_worked DECIMAL(6,2) NOT NULL DEFAULT 0.00,
+  status ENUM('present','late','early_departure','absent','on_leave') NOT NULL DEFAULT 'present',
+  late_minutes INT NOT NULL DEFAULT 0,
+  early_leave_minutes INT NOT NULL DEFAULT 0,
+  notes VARCHAR(255) NULL,
+  recorded_by INT NOT NULL,
+  updated_by INT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_hr_att_emp_date (employee_id, attendance_date),
+  FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_leave_types (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(32) NOT NULL UNIQUE,
+  name VARCHAR(100) NOT NULL,
+  annual_allowance_days INT NOT NULL DEFAULT 0,
+  paid TINYINT(1) NOT NULL DEFAULT 1,
+  description VARCHAR(255) NULL,
+  active TINYINT(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_overtime (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  user_id INT NULL,
+  overtime_date DATE NOT NULL,
+  hours DECIMAL(6,2) NOT NULL,
+  day_type ENUM('regular','weekend','holiday') NOT NULL DEFAULT 'regular',
+  rate_multiplier DECIMAL(4,2) NOT NULL DEFAULT 1.50,
+  hourly_rate_snapshot DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  computed_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  reason VARCHAR(255) NOT NULL,
+  status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  decided_by INT NULL,
+  decided_at DATETIME NULL,
+  decision_note VARCHAR(255) NULL,
+  payroll_run_id INT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_adjustments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id INT NOT NULL,
+  user_id INT NULL,
+  adjustment_type ENUM('earning','deduction') NOT NULL,
+  category VARCHAR(60) NOT NULL,
+  description VARCHAR(255) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  effective_month VARCHAR(10) NOT NULL,
+  effective_date DATE NOT NULL,
+  recurring TINYINT(1) NOT NULL DEFAULT 0,
+  status ENUM('active','applied','cancelled') NOT NULL DEFAULT 'active',
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hr_monthly_submissions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  pay_month VARCHAR(10) NOT NULL UNIQUE,
+  status ENUM('submitted','locked') NOT NULL DEFAULT 'submitted',
+  total_employees INT NOT NULL DEFAULT 0,
+  total_attendance_hours DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  total_overtime_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  total_extra_earnings DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  total_extra_deductions DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  notes VARCHAR(255) NULL,
+  submitted_by INT NOT NULL,
+  submitted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS payroll_components (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(32) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  component_type ENUM('earning','deduction') NOT NULL,
+  calc_method ENUM('fixed','percentage','manual') NOT NULL DEFAULT 'fixed',
+  default_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  account_code VARCHAR(20) NOT NULL DEFAULT '5100',
+  is_recurring TINYINT(1) NOT NULL DEFAULT 1,
+  is_taxable TINYINT(1) NOT NULL DEFAULT 1,
+  is_pensionable TINYINT(1) NOT NULL DEFAULT 0,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS finance_cash_bank_accounts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  account_name VARCHAR(140) NOT NULL,
+  account_type ENUM('cash','bank') NOT NULL DEFAULT 'bank',
+  account_number VARCHAR(60) NULL,
+  bank_name VARCHAR(140) NULL,
+  coa_code VARCHAR(20) NOT NULL,
+  opening_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  current_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS finance_cash_bank_transfers (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  transfer_number VARCHAR(32) NOT NULL UNIQUE,
+  transfer_date DATE NOT NULL,
+  from_account_id INT NOT NULL,
+  to_account_id INT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  reference_no VARCHAR(80) NULL,
+  notes VARCHAR(255) NULL,
+  journal_entry_id INT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (from_account_id) REFERENCES finance_cash_bank_accounts(id),
+  FOREIGN KEY (to_account_id) REFERENCES finance_cash_bank_accounts(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS finance_payments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  payment_number VARCHAR(32) NOT NULL UNIQUE,
+  payment_date DATE NOT NULL,
+  payment_category VARCHAR(40) NOT NULL,
+  payee_name VARCHAR(160) NOT NULL,
+  cash_bank_account_id INT NOT NULL,
+  payment_method VARCHAR(30) NOT NULL DEFAULT 'bank_transfer',
+  amount DECIMAL(12,2) NOT NULL,
+  reference_no VARCHAR(80) NULL,
+  attachment_ref VARCHAR(255) NULL,
+  linked_type VARCHAR(40) NULL,
+  linked_id INT NULL,
+  notes VARCHAR(255) NULL,
+  journal_entry_id INT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cash_bank_account_id) REFERENCES finance_cash_bank_accounts(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS finance_receipts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  receipt_number VARCHAR(32) NOT NULL UNIQUE,
+  receipt_date DATE NOT NULL,
+  income_category VARCHAR(40) NOT NULL,
+  payer_name VARCHAR(160) NOT NULL,
+  cash_bank_account_id INT NOT NULL,
+  payment_method VARCHAR(30) NOT NULL DEFAULT 'bank_transfer',
+  amount DECIMAL(12,2) NOT NULL,
+  reference_no VARCHAR(80) NULL,
+  attachment_ref VARCHAR(255) NULL,
+  notes VARCHAR(255) NULL,
+  journal_entry_id INT NULL,
+  created_by INT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cash_bank_account_id) REFERENCES finance_cash_bank_accounts(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS specialties (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(30) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  department_id INT NULL,
+  description VARCHAR(255) NULL,
+  consultation_fee DECIMAL(12,2) NOT NULL DEFAULT 45.00,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS clinic_rooms (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  room_code VARCHAR(30) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  department_id INT NULL,
+  specialty_id INT NULL,
+  room_type ENUM('consultation','examination','triage','procedure','ward','diagnostic') NOT NULL DEFAULT 'consultation',
+  capacity INT NOT NULL DEFAULT 1,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id),
+  FOREIGN KEY (specialty_id) REFERENCES specialties(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_departments (
+  user_id INT NOT NULL,
+  department_id INT NOT NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, department_id),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (department_id) REFERENCES departments(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_clinic_units (
+  user_id INT NOT NULL,
+  clinic_room_id INT NOT NULL,
+  PRIMARY KEY (user_id, clinic_room_id),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (clinic_room_id) REFERENCES clinic_rooms(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS doctor_assignments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  visit_id INT NOT NULL,
+  patient_id INT NOT NULL,
+  doctor_id INT NOT NULL,
+  assigned_by INT NULL,
+  specialty VARCHAR(120) NULL,
+  clinic_room_id INT NULL,
+  status ENUM('active','reassigned','completed') NOT NULL DEFAULT 'active',
+  notes VARCHAR(255) NULL,
+  assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_doc_assign_visit (visit_id),
+  INDEX idx_doc_assign_doctor (doctor_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+  jti VARCHAR(64) PRIMARY KEY,
+  user_id INT NOT NULL,
+  ip_address VARCHAR(64) NULL,
+  user_agent VARCHAR(255) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at DATETIME NOT NULL,
+  revoked_at DATETIME NULL,
+  revoked_by INT NULL,
+  INDEX idx_sessions_user (user_id, revoked_at),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 

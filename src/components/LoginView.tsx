@@ -335,15 +335,15 @@ export const LoginView: React.FC<LoginViewProps> = ({ onSuccess }) => {
               <form onSubmit={(e) => handleLogin(e)} className="space-y-4">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                    Staff Email
+                    Work Email or Username
                   </label>
                   <input
-                    type="email"
+                    type="text"
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-700/20 focus:border-teal-700"
-                    placeholder="name@clinic360.local"
+                    placeholder="name@clinic360.local or username"
                   />
                 </div>
 

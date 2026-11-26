@@ -1,12 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertTriangle, BedDouble, Check, CheckCircle2, Edit3, Eye, FlaskConical, Lock, Pill, Plus, Printer, Scan, Syringe, Trash2, Unlock, X } from 'lucide-react';
+import { Activity, AlertTriangle, BedDouble, Check, CheckCircle2, Edit3, Eye, FileText, FlaskConical, Lock, Pill, Plus, Printer, Scan, Syringe, Trash2, Unlock, X } from 'lucide-react';
 import { ApiError, apiFetch } from '../lib/api';
 import { useRealtimeSync } from '../lib/useRealtimeSync';
 import type {
   ImagingAttachment,
   ImagingCatalogItem,
+  LabOrder,
   LabPanelResultItem,
   NursingProcedure,
+  Prescription,
   ServiceItem,
   UserContext,
   Visit,
@@ -31,14 +33,46 @@ interface MedicineCatalog {
   unit_price: number;
 }
 
+interface ClinicalReportRow {
+  id: number;
+  visit_number: string;
+  visit_date: string;
+  mrn: string;
+  patient_name: string;
+  diagnosis_code: string;
+  diagnosis_text: string;
+  treatment_plan: string | null;
+  status: string;
+  workflow_stage: string | null;
+  triage_priority: string;
+  doctor_name: string;
+  lab_count: number;
+  imaging_count: number;
+  rx_count: number;
+}
+
 interface ClinicalOpdViewProps {
   user: UserContext;
   onNotify: (msg: string, type?: 'success' | 'error') => void;
+  initialSection?: 'all' | 'vitals_only' | 'consultations' | 'prescriptions' | 'lab_requests' | 'reports';
 }
 
-export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify }) => {
+export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify, initialSection }) => {
+  const [section, setSection] = useState<'all' | 'vitals_only' | 'consultations' | 'prescriptions' | 'lab_requests' | 'reports'>(
+    initialSection || 'all'
+  );
   const [visits, setVisits] = useState<Visit[]>([]);
   const [selectedVisitId, setSelectedVisitId] = useState<number | null>(null);
+  const [doctorLabOrders, setDoctorLabOrders] = useState<LabOrder[]>([]);
+  const [doctorPrescriptions, setDoctorPrescriptions] = useState<Prescription[]>([]);
+  const [clinicalReports, setClinicalReports] = useState<ClinicalReportRow[]>([]);
+  const [reportFrom, setReportFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  });
+  const [reportTo, setReportTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [worklistLoading, setWorklistLoading] = useState(false);
   const [visitDetail, setVisitDetail] = useState<{
     visit: Visit;
     vitals: VitalsRecord[];
@@ -185,6 +219,17 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
   const canCompleteNursing = user.permissions.includes('nursing.procedure.perform');
   const canPrescribe = user.permissions.includes('prescription.create');
   const canAdmit = user.permissions.includes('ipd.admission.create');
+  const canReadLabOrders = user.permissions.includes('lab.order.read') || canOrderLab;
+  const canReadImagingOrders = user.permissions.includes('imaging.order.read') || canOrderImaging;
+  const canReadRx = user.permissions.includes('pharmacy.prescription.read') || canPrescribe;
+  const canSeeNursingSection =
+    canNursingOrder || canCompleteNursing || user.roles.includes('MGR') || user.roles.includes('ADM');
+
+  useEffect(() => {
+    if (initialSection) {
+      setSection(initialSection);
+    }
+  }, [initialSection]);
 
   const loadVisits = useCallback(async () => {
     try {
@@ -197,6 +242,42 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
       onNotify((err as Error).message, 'error');
     }
   }, [onNotify, selectedVisitId]);
+
+  const loadSectionData = useCallback(async () => {
+    if (section === 'lab_requests' && canReadLabOrders) {
+      setWorklistLoading(true);
+      try {
+        const res = await apiFetch<{ orders: LabOrder[] }>('/api/lab/orders');
+        setDoctorLabOrders(res.orders || []);
+      } catch (err) {
+        onNotify((err as Error).message, 'error');
+      } finally {
+        setWorklistLoading(false);
+      }
+    } else if (section === 'prescriptions' && canReadRx) {
+      setWorklistLoading(true);
+      try {
+        const res = await apiFetch<{ prescriptions: Prescription[] }>('/api/pharmacy/prescriptions');
+        setDoctorPrescriptions(res.prescriptions || []);
+      } catch (err) {
+        onNotify((err as Error).message, 'error');
+      } finally {
+        setWorklistLoading(false);
+      }
+    } else if (section === 'reports') {
+      setWorklistLoading(true);
+      try {
+        const res = await apiFetch<{ rows: ClinicalReportRow[] }>(
+          `/api/reports/my-clinical-reports?from=${encodeURIComponent(reportFrom)}&to=${encodeURIComponent(reportTo)}`
+        );
+        setClinicalReports(res.rows || []);
+      } catch (err) {
+        onNotify((err as Error).message, 'error');
+      } finally {
+        setWorklistLoading(false);
+      }
+    }
+  }, [section, canReadLabOrders, canReadRx, reportFrom, reportTo, onNotify]);
 
   const loadVisitDetail = useCallback(async (id: number) => {
     try {
@@ -254,6 +335,10 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
   }, [loadVisits, canAdmit, user.permissions]);
 
   useEffect(() => {
+    loadSectionData();
+  }, [loadSectionData]);
+
+  useEffect(() => {
     if (selectedVisitId) {
       setVitalsBypassGate(false);
       setVitalsBypassReason('');
@@ -268,6 +353,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
     () => {
       loadVisits();
       if (selectedVisitId) loadVisitDetail(selectedVisitId);
+      loadSectionData();
     }
   );
 
@@ -393,6 +479,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
       });
       onNotify(`Lab test ordered · Invoice ${res.invoiceNumber} created`, 'success');
       loadVisitDetail(selectedVisitId);
+      loadSectionData();
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -471,7 +558,8 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
         body: JSON.stringify({ action: 'ack_critical' }),
       });
       onNotify('Critical lab result acknowledged & logged', 'success');
-      loadVisitDetail(selectedVisitId);
+      if (selectedVisitId) loadVisitDetail(selectedVisitId);
+      loadSectionData();
     } catch (err) {
       onNotify((err as Error).message, 'error');
     }
@@ -544,6 +632,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
       ]);
       loadVisitDetail(selectedVisitId);
       loadVisits();
+      loadSectionData();
     } catch (err) {
       if (err instanceof ApiError && err.status === 409 && Array.isArray(err.data?.allergyConflicts)) {
         setRxOverrideRequired(true);
@@ -640,6 +729,462 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
         (patientAllergyTokens.some((t) => t.includes('sulfa')) && g.includes('sulfamethoxazole'))
       );
     });
+
+  if (section === 'reports') {
+    const completedCount = clinicalReports.filter((r) => r.status === 'closed').length;
+    const totalLabs = clinicalReports.reduce((acc, r) => acc + Number(r.lab_count || 0), 0);
+    const totalRx = clinicalReports.reduce((acc, r) => acc + Number(r.rx_count || 0), 0);
+    return (
+      <div className="space-y-5">
+        <div className="bg-white border border-slate-200 rounded-lg p-5 flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+              <FileText className="w-4 h-4 text-teal-700" />
+              <span>My Clinical Reports</span>
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Consultation summary, diagnosis records, and diagnostic/prescription volume strictly scoped to your assigned visits.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <label className="text-slate-600">From</label>
+            <input
+              type="date"
+              value={reportFrom}
+              onChange={(e) => setReportFrom(e.target.value)}
+              className="px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+            />
+            <label className="text-slate-600">To</label>
+            <input
+              type="date"
+              value={reportTo}
+              onChange={(e) => setReportTo(e.target.value)}
+              className="px-2.5 py-1.5 border border-slate-300 rounded font-mono"
+            />
+            <button
+              type="button"
+              onClick={() => loadSectionData()}
+              className="px-3 py-1.5 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">Assigned Consultations</div>
+            <div className="text-xl font-display font-semibold text-slate-900 mt-1 tabular-nums">{clinicalReports.length}</div>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">Completed / Closed</div>
+            <div className="text-xl font-display font-semibold text-emerald-700 mt-1 tabular-nums">{completedCount}</div>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">Lab Orders Issued</div>
+            <div className="text-xl font-display font-semibold text-slate-900 mt-1 tabular-nums">{totalLabs}</div>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-lg p-4">
+            <div className="text-xs text-slate-500">e-Prescriptions Issued</div>
+            <div className="text-xl font-display font-semibold text-teal-800 mt-1 tabular-nums">{totalRx}</div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          {worklistLoading ? (
+            <div className="p-8 text-center text-sm text-slate-500">Loading clinical reports...</div>
+          ) : clinicalReports.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No assigned consultations found in this date range.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Visit &amp; Date</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4">Diagnosis (ICD-10)</th>
+                    <th className="py-2.5 px-4 text-right">Lab / Img / Rx</th>
+                    <th className="py-2.5 px-4">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {clinicalReports.map((row) => (
+                    <tr key={row.id} className="hover:bg-slate-50/70">
+                      <td className="py-3 px-4 font-mono">
+                        <div className="font-semibold text-slate-900">{row.visit_number}</div>
+                        <div className="text-slate-500">{row.visit_date}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-slate-900">{row.patient_name}</div>
+                        <div className="font-mono text-slate-500">{row.mrn}</div>
+                      </td>
+                      <td className="py-3 px-4 max-w-sm">
+                        <div className="font-medium text-slate-900">
+                          <span className="font-mono text-teal-800 mr-1.5">[{row.diagnosis_code}]</span>
+                          {row.diagnosis_text}
+                        </div>
+                        {row.treatment_plan && <div className="text-slate-500 truncate mt-0.5">{row.treatment_plan}</div>}
+                      </td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-700">
+                        {row.lab_count} / {row.imaging_count} / {row.rx_count}
+                      </td>
+                      <td className="py-3 px-4 capitalize font-medium text-slate-800">
+                        {row.status.replace('_', ' ')}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        <PrintDocumentModal request={printRequest} onClose={() => setPrintRequest(null)} />
+      </div>
+    );
+  }
+
+  if (section === 'lab_requests') {
+    const openVisits = visits.filter((vi) => vi.status !== 'closed');
+    return (
+      <div className="space-y-5">
+        <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                <FlaskConical className="w-4 h-4 text-teal-700" />
+                <span>Lab Requests</span>
+              </h2>
+              <p className="text-xs text-slate-500">
+                Order laboratory investigations for your assigned patients and review verified or critical results.
+              </p>
+            </div>
+          </div>
+          {canOrderLab && openVisits.length > 0 && (
+            <div className="pt-2 border-t border-slate-100 grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center text-xs">
+              <select
+                value={selectedVisitId || ''}
+                onChange={(e) => setSelectedVisitId(Number(e.target.value))}
+                className="md:col-span-5 px-2.5 py-2 border border-slate-300 rounded bg-white"
+              >
+                {openVisits.map((vi) => (
+                  <option key={vi.id} value={vi.id}>
+                    {vi.visit_number} — {vi.first_name} {vi.last_name} ({vi.mrn})
+                  </option>
+                ))}
+              </select>
+              <select
+                value={selectedLabId}
+                onChange={(e) => setSelectedLabId(e.target.value)}
+                className="md:col-span-5 px-2.5 py-2 border border-slate-300 rounded bg-white"
+              >
+                {labCatalog.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} (${Number(t.price).toFixed(2)})
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={handleOrderLab}
+                className="md:col-span-2 px-3.5 py-2 font-medium text-white bg-teal-700 hover:bg-teal-800 rounded"
+              >
+                Order Lab Test
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          {worklistLoading ? (
+            <div className="p-8 text-center text-sm text-slate-500">Loading lab requests...</div>
+          ) : doctorLabOrders.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No laboratory requests found for your assigned patients.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/70 font-medium text-slate-500">
+                    <th className="py-2.5 px-4">Order</th>
+                    <th className="py-2.5 px-4">Patient</th>
+                    <th className="py-2.5 px-4">Test</th>
+                    <th className="py-2.5 px-4">Status &amp; Bill</th>
+                    <th className="py-2.5 px-4">Result</th>
+                    <th className="py-2.5 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {doctorLabOrders.map((lo) => (
+                    <tr key={lo.id} className="hover:bg-slate-50/70">
+                      <td className="py-3 px-4 font-mono">
+                        <div className="font-semibold text-slate-900">#{lo.id} · {lo.test_code}</div>
+                        <div className="text-slate-500">{lo.created_at}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-medium text-slate-900">{lo.first_name} {lo.last_name}</div>
+                        <div className="font-mono text-slate-500">{lo.mrn}</div>
+                      </td>
+                      <td className="py-3 px-4 font-medium text-slate-900">{lo.test_name}</td>
+                      <td className="py-3 px-4 font-mono">
+                        <div className="capitalize text-slate-800">{lo.status}</div>
+                        <div className="text-slate-500">{lo.invoice_number || 'Direct'} ({lo.invoice_status || 'n/a'})</div>
+                      </td>
+                      <td className="py-3 px-4 font-mono">
+                        <span className={lo.abnormal_flag === 'critical' ? 'text-red-700 font-semibold' : 'text-slate-900'}>
+                          {lo.result_value || 'Pending'}
+                        </span>
+                        {lo.abnormal_flag && lo.abnormal_flag !== 'normal' && (
+                          <span className="ml-1.5 text-red-700 uppercase">({lo.abnormal_flag})</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
+                        {lo.abnormal_flag === 'critical' && !lo.critical_ack_at && canUpdateVisit && (
+                          <button
+                            onClick={() => handleAckCriticalLab(lo.id)}
+                            className="px-2.5 py-1 text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded"
+                          >
+                            Ack Critical
+                          </button>
+                        )}
+                        {(lo.status === 'verified' || lo.status === 'amended') && (
+                          <button
+                            onClick={() => setPrintRequest({ type: 'lab', orderId: lo.id })}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+                          >
+                            <Printer className="w-3 h-3" />
+                            <span>Print Report</span>
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+        <PrintDocumentModal request={printRequest} onClose={() => setPrintRequest(null)} />
+      </div>
+    );
+  }
+
+  if (section === 'prescriptions') {
+    const openVisits = visits.filter((vi) => vi.status !== 'closed');
+    return (
+      <div className="space-y-5">
+        {canPrescribe && (
+          <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-display text-base font-semibold text-slate-900 flex items-center gap-2">
+                  <Pill className="w-4 h-4 text-teal-700" />
+                  <span>New e-Prescription</span>
+                </h2>
+                <p className="text-xs text-slate-500">Issue multi-item prescriptions for your assigned OPD patients.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setRxItems((prev) => [
+                    ...prev,
+                    {
+                      medicine_id: medCatalog[0] ? String(medCatalog[0].id) : '',
+                      dosage: '1 tablet',
+                      frequency: 'Twice daily',
+                      duration_days: '5',
+                      quantity: '10',
+                      instructions: '',
+                    },
+                  ])
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Medicine Row</span>
+              </button>
+            </div>
+            {openVisits.length === 0 ? (
+              <div className="text-xs text-slate-500">No open assigned visits available for prescribing.</div>
+            ) : (
+              <form onSubmit={handleOrderRx} className="space-y-2.5">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Assigned Patient Visit *</label>
+                  <select
+                    value={selectedVisitId || ''}
+                    onChange={(e) => setSelectedVisitId(Number(e.target.value))}
+                    className="w-full max-w-lg px-2.5 py-2 text-xs border border-slate-300 rounded bg-white"
+                  >
+                    {openVisits.map((vi) => (
+                      <option key={vi.id} value={vi.id}>
+                        {vi.visit_number} — {vi.first_name} {vi.last_name} ({vi.mrn}) · Allergies: {vi.allergies || 'None'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {rxItems.map((row, idx) => (
+                  <div key={idx} className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center p-2 bg-slate-50 border border-slate-200 rounded">
+                    <select
+                      value={row.medicine_id}
+                      onChange={(e) => {
+                        const next = [...rxItems];
+                        next[idx] = { ...row, medicine_id: e.target.value };
+                        setRxItems(next);
+                      }}
+                      className="sm:col-span-4 px-2.5 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                    >
+                      {medCatalog.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.generic_name} {m.strength} (${Number(m.unit_price).toFixed(2)} · Stock: {m.stock_qty})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      value={row.dosage}
+                      onChange={(e) => {
+                        const next = [...rxItems];
+                        next[idx] = { ...row, dosage: e.target.value };
+                        setRxItems(next);
+                      }}
+                      placeholder="Dosage"
+                      className="sm:col-span-2 px-2 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                    />
+                    <input
+                      value={row.frequency}
+                      onChange={(e) => {
+                        const next = [...rxItems];
+                        next[idx] = { ...row, frequency: e.target.value };
+                        setRxItems(next);
+                      }}
+                      placeholder="Frequency"
+                      className="sm:col-span-2 px-2 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      value={row.duration_days}
+                      onChange={(e) => {
+                        const next = [...rxItems];
+                        next[idx] = { ...row, duration_days: e.target.value };
+                        setRxItems(next);
+                      }}
+                      placeholder="Days"
+                      className="sm:col-span-1 px-2 py-1.5 text-xs font-mono border border-slate-300 rounded bg-white"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      value={row.quantity}
+                      onChange={(e) => {
+                        const next = [...rxItems];
+                        next[idx] = { ...row, quantity: e.target.value };
+                        setRxItems(next);
+                      }}
+                      placeholder="Qty"
+                      className="sm:col-span-2 px-2 py-1.5 text-xs font-mono border border-slate-300 rounded bg-white"
+                    />
+                    <div className="sm:col-span-1 flex justify-end">
+                      {rxItems.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => setRxItems((prev) => prev.filter((_, i) => i !== idx))}
+                          className="p-1.5 text-red-600 hover:bg-red-50 rounded"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {(rxAllergyWarnings.length > 0 || rxOverrideRequired) && (
+                  <input
+                    required
+                    minLength={5}
+                    value={rxAllergyOverride}
+                    onChange={(e) => setRxAllergyOverride(e.target.value)}
+                    placeholder="Allergy conflict detected — enter mandatory override reason (min 5 chars)..."
+                    className="w-full px-2.5 py-1.5 text-xs bg-red-50 border border-red-300 rounded text-slate-900"
+                  />
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    value={rxNotes}
+                    onChange={(e) => setRxNotes(e.target.value)}
+                    placeholder="Counseling instructions / pharmacy notes (optional)..."
+                    className="flex-1 min-w-[220px] px-2.5 py-1.5 text-xs border border-slate-300 rounded"
+                  />
+                  <button
+                    type="submit"
+                    className="px-4 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-800 rounded whitespace-nowrap"
+                  >
+                    Send e-Rx ({rxItems.length})
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        )}
+
+        <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
+            <h3 className="font-display text-sm font-semibold text-slate-900">Issued Prescriptions</h3>
+            <span className="text-xs font-mono text-slate-500">{doctorPrescriptions.length} records</span>
+          </div>
+          {worklistLoading ? (
+            <div className="p-8 text-center text-sm text-slate-500">Loading prescriptions...</div>
+          ) : doctorPrescriptions.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">No prescriptions recorded for your assigned patients.</div>
+          ) : (
+            <div className="divide-y divide-slate-100 text-xs">
+              {doctorPrescriptions.map((pr) => (
+                <div key={pr.id} className="p-4 flex flex-wrap items-start justify-between gap-3 hover:bg-slate-50/60">
+                  <div className="space-y-1">
+                    <div className="font-mono text-slate-500">
+                      <span className="font-semibold text-slate-900">Rx #{pr.id}</span> · {pr.visit_number || `Visit #${pr.visit_id}`} ·{' '}
+                      <span className="capitalize">{pr.status.replace(/_/g, ' ')}</span>
+                    </div>
+                    <div className="font-medium text-slate-900">
+                      {pr.first_name} {pr.last_name} <span className="font-mono text-slate-500">({pr.mrn})</span>
+                    </div>
+                    {(pr.items || []).map((it, idx) => (
+                      <div key={idx} className="text-slate-700">
+                        • {it.generic_name} {it.strength} — {it.dosage}, {it.frequency} (Qty {it.quantity})
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-slate-500">
+                      {pr.invoice_number ? `${pr.invoice_number} (${pr.invoice_status || 'n/a'})` : pr.patient_type}
+                    </span>
+                    <button
+                      onClick={() =>
+                        setPrintRequest({
+                          type: 'prescription',
+                          data: {
+                            prescriptionId: pr.id,
+                            visitNumber: pr.visit_number || `Visit #${pr.visit_id}`,
+                            mrn: pr.mrn,
+                            patientName: `${pr.first_name} ${pr.last_name}`,
+                            allergies: pr.allergies || 'None known',
+                            doctorName: pr.doctor_name,
+                            status: pr.status,
+                            items: pr.items || [],
+                          },
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-teal-800 border border-teal-200 hover:bg-teal-50 rounded"
+                    >
+                      <Printer className="w-3 h-3" />
+                      <span>Print Rx</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <PrintDocumentModal request={printRequest} onClose={() => setPrintRequest(null)} />
+      </div>
+    );
+  }
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -745,7 +1290,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
               </div>
 
               <div className="flex items-center gap-2">
-                {!isClosed && canAdmit && (
+                {section !== 'vitals_only' && !isClosed && canAdmit && (
                   <button
                     onClick={() => {
                       setAdmitDx(v.diagnosis_text || v.chief_complaint || '');
@@ -757,7 +1302,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                     <span>Admit to Ward</span>
                   </button>
                 )}
-                {!isClosed && canCloseVisit && (
+                {section !== 'vitals_only' && !isClosed && canCloseVisit && (
                   <button
                     onClick={handleCloseVisit}
                     className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-md"
@@ -776,7 +1321,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
             </div>
 
             {/* Manager Reopen Box when closed */}
-            {isClosed && canReopenVisit && (
+            {section !== 'vitals_only' && isClosed && canReopenVisit && (
               <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex flex-wrap items-center gap-3">
                 <Unlock className="w-4 h-4 text-amber-800 shrink-0" />
                 <input
@@ -944,6 +1489,7 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
             </div>
 
             {/* OPD Consultation Notes */}
+            {section !== 'vitals_only' && canUpdateVisit && (
             <div className="bg-white border border-slate-200 rounded-lg p-5">
               <h3 className="font-display text-sm font-semibold text-slate-900 mb-4">OPD Clinical Consultation</h3>
               <form onSubmit={handleSaveConsult} className="space-y-3">
@@ -1031,9 +1577,12 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                 )}
               </form>
             </div>
+            )}
 
             {/* Orders: Lab, Imaging & Pharmacy */}
+            {section !== 'vitals_only' && (canReadLabOrders || canReadImagingOrders || canSeeNursingSection || canReadRx) && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {canReadLabOrders && (
               <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <h3 className="font-display text-sm font-semibold text-slate-900 flex items-center gap-2">
                   <FlaskConical className="w-4 h-4 text-teal-700" />
@@ -1153,7 +1702,9 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                   )}
                 </div>
               </div>
+              )}
 
+              {canReadImagingOrders && (
               <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <h3 className="font-display text-sm font-semibold text-slate-900 flex items-center gap-2">
                   <Scan className="w-4 h-4 text-teal-700" />
@@ -1238,8 +1789,10 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                   )}
                 </div>
               </div>
+              )}
 
               {/* Nursing Procedures (NUR-INJ, NUR-NEB) */}
+              {canSeeNursingSection && (
               <div className="md:col-span-2 bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <h3 className="font-display text-sm font-semibold text-slate-900 flex items-center gap-2">
                   <Syringe className="w-4 h-4 text-teal-700" />
@@ -1334,7 +1887,9 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                   )}
                 </div>
               </div>
+              )}
 
+              {canReadRx && (
               <div className="md:col-span-2 bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <div className="flex items-center justify-between">
                   <h3 className="font-display text-sm font-semibold text-slate-900 flex items-center gap-2">
@@ -1528,7 +2083,9 @@ export const ClinicalOpdView: React.FC<ClinicalOpdViewProps> = ({ user, onNotify
                   )}
                 </div>
               </div>
+              )}
             </div>
+            )}
           </>
         )}
       </div>

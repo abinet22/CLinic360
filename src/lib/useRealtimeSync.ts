@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { apiFetch, getAuthToken } from './api';
+import { ApiError, apiFetch } from './api';
 
 export type ClinicEventType =
   | 'connected'
@@ -10,6 +10,7 @@ export type ClinicEventType =
   | 'lab:updated'
   | 'imaging:updated'
   | 'pharmacy:updated'
+  | 'finance:updated'
   | 'notification:created';
 
 export type RealtimeStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
@@ -20,7 +21,7 @@ const listenersByEvent = new Map<ClinicEventType, Set<EventHandler>>();
 const statusListeners = new Set<(status: RealtimeStatus) => void>();
 
 let source: EventSource | null = null;
-let currentToken: string | null = null;
+let isAuthenticatedSession = false;
 let currentStatus: RealtimeStatus = 'disconnected';
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let streamGeneration = 0;
@@ -42,6 +43,7 @@ const STREAM_EVENTS: ClinicEventType[] = [
   'lab:updated',
   'imaging:updated',
   'pharmacy:updated',
+  'finance:updated',
   'notification:created',
 ];
 
@@ -56,22 +58,26 @@ function closeStream() {
     source.close();
     source = null;
   }
-  currentToken = null;
   setStatus('disconnected');
 }
 
+export function setRealtimeAuthenticated(authenticated: boolean) {
+  isAuthenticatedSession = authenticated;
+  if (!authenticated) {
+    closeStream();
+  }
+}
+
 async function ensureStream() {
-  const token = getAuthToken();
-  if (!token) {
+  if (!isAuthenticatedSession) {
     closeStream();
     return;
   }
-  if ((source || isConnecting) && currentToken === token) {
+  if (source || isConnecting) {
     return;
   }
   closeStream();
   const gen = streamGeneration;
-  currentToken = token;
   isConnecting = true;
   setStatus('connecting');
 
@@ -79,10 +85,11 @@ async function ensureStream() {
   try {
     const res = await apiFetch<{ ticket?: string }>('/api/events/ticket', { method: 'POST' });
     ticket = res.ticket || '';
-  } catch {
+  } catch (err) {
     if (gen !== streamGeneration) return;
     isConnecting = false;
-    if (!getAuthToken()) {
+    if (!isAuthenticatedSession || (err instanceof ApiError && (err.status === 401 || err.status === 403))) {
+      isAuthenticatedSession = false;
       setStatus('disconnected');
       return;
     }
@@ -96,7 +103,7 @@ async function ensureStream() {
     return;
   }
 
-  if (gen !== streamGeneration || !ticket || getAuthToken() !== token) {
+  if (gen !== streamGeneration || !ticket || !isAuthenticatedSession) {
     isConnecting = false;
     return;
   }
@@ -136,7 +143,7 @@ async function ensureStream() {
     if (source === es) {
       source = null;
     }
-    if (!getAuthToken()) {
+    if (!isAuthenticatedSession) {
       setStatus('disconnected');
       return;
     }
@@ -150,9 +157,12 @@ async function ensureStream() {
   };
 }
 
-export function resetRealtimeStream() {
+export function resetRealtimeStream(authenticated?: boolean) {
+  if (typeof authenticated === 'boolean') {
+    isAuthenticatedSession = authenticated;
+  }
   closeStream();
-  if (getAuthToken()) {
+  if (isAuthenticatedSession) {
     ensureStream();
   }
 }

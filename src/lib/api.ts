@@ -1,14 +1,26 @@
-const TOKEN_KEY = 'clinic360_token';
+const LEGACY_TOKEN_KEY = 'clinic360_token';
+let memoryToken: string | null = null;
+
+try {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    window.localStorage.removeItem(LEGACY_TOKEN_KEY);
+  }
+} catch {
+  // ignore storage access errors
+}
 
 export function getAuthToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return memoryToken;
 }
 
 export function setAuthToken(token: string | null): void {
-  if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
-  } else {
-    localStorage.removeItem(TOKEN_KEY);
+  memoryToken = token || null;
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(LEGACY_TOKEN_KEY);
+    }
+  } catch {
+    // ignore storage access errors
   }
 }
 
@@ -32,7 +44,11 @@ export async function apiFetch<T = unknown>(url: string, options: RequestInit = 
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, {
+    ...options,
+    credentials: options.credentials ?? 'include',
+    headers,
+  });
   const rawText = await res.text();
 
   let data: Record<string, unknown> = {};

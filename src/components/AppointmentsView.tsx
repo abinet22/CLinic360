@@ -51,6 +51,11 @@ export const AppointmentsView: React.FC<AppointmentsViewProps> = ({ user, onNoti
     reason: '',
   });
 
+  const isDoctorOnly =
+    user.roles.includes('DOC') &&
+    !user.roles.includes('MGR') &&
+    !user.roles.includes('ADM') &&
+    !user.roles.includes('AUD');
   const canCreate = user.permissions.includes('appointment.create');
   const canUpdate = user.permissions.includes('appointment.update');
   const canManageBlocks = user.permissions.includes('appointment.block.manage');
@@ -223,20 +228,22 @@ export const AppointmentsView: React.FC<AppointmentsViewProps> = ({ user, onNoti
             />
           )}
 
-          <select
-            value={doctorFilter}
-            onChange={(e) => setDoctorFilter(e.target.value)}
-            className="px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
-          >
-            <option value="">All Clinicians</option>
-            {doctors.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.full_name}
-              </option>
-            ))}
-          </select>
+          {!isDoctorOnly && (
+            <select
+              value={doctorFilter}
+              onChange={(e) => setDoctorFilter(e.target.value)}
+              className="px-3 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+            >
+              <option value="">All Clinicians</option>
+              {doctors.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.full_name}
+                </option>
+              ))}
+            </select>
+          )}
 
-          {viewMode === 'table' && (dateFilter || doctorFilter) && (
+          {viewMode === 'table' && (dateFilter || (!isDoctorOnly && doctorFilter)) && (
             <button
               onClick={() => {
                 setDateFilter('');
@@ -327,7 +334,12 @@ export const AppointmentsView: React.FC<AppointmentsViewProps> = ({ user, onNoti
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-slate-500 font-medium">
                   <th className="py-2.5 px-3 w-20 font-mono">Time</th>
-                  {(doctorFilter ? doctors.filter((d) => String(d.id) === doctorFilter) : doctors).map((doc) => (
+                  {(isDoctorOnly
+                    ? doctors.filter((d) => d.id === user.id)
+                    : doctorFilter
+                      ? doctors.filter((d) => String(d.id) === doctorFilter)
+                      : doctors
+                  ).map((doc) => (
                     <th key={doc.id} className="py-2.5 px-3 min-w-[210px] border-l border-slate-200">
                       <div className="text-slate-900 font-semibold">{doc.full_name}</div>
                       {doc.specialty && <div className="text-[11px] font-normal text-slate-500">{doc.specialty}</div>}
@@ -339,7 +351,11 @@ export const AppointmentsView: React.FC<AppointmentsViewProps> = ({ user, onNoti
                 {GRID_HOURS.map((hour) => {
                   const hourNum = Number(hour.slice(0, 2));
                   const nextHourStr = `${String(hourNum + 1).padStart(2, '0')}:00`;
-                  const visibleDocs = doctorFilter ? doctors.filter((d) => String(d.id) === doctorFilter) : doctors;
+                  const visibleDocs = isDoctorOnly
+                    ? doctors.filter((d) => d.id === user.id)
+                    : doctorFilter
+                      ? doctors.filter((d) => String(d.id) === doctorFilter)
+                      : doctors;
 
                   return (
                     <tr key={hour}>

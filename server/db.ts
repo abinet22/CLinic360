@@ -179,7 +179,11 @@ async function initSqliteSchema(db: Database.Database) {
       branch_id INTEGER NOT NULL DEFAULT 1,
       code TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1
+      category TEXT NOT NULL DEFAULT 'clinical',
+      head_name TEXT NULL,
+      description TEXT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS roles (
@@ -210,11 +214,15 @@ async function initSqliteSchema(db: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       branch_id INTEGER NOT NULL DEFAULT 1,
       department_id INTEGER NULL,
+      employee_id INTEGER NULL,
+      username TEXT NULL,
       full_name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       specialty TEXT NULL,
       active INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'active',
+      exception_approved INTEGER NOT NULL DEFAULT 0,
       must_change_password INTEGER NOT NULL DEFAULT 0,
       two_fa_enabled INTEGER NOT NULL DEFAULT 0,
       failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -728,6 +736,7 @@ async function initSqliteSchema(db: Database.Database) {
     CREATE TABLE IF NOT EXISTS notifications (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       target_role TEXT NOT NULL,
+      target_user_id INTEGER NULL,
       title TEXT NOT NULL,
       message TEXT NOT NULL,
       severity TEXT NOT NULL DEFAULT 'info',
@@ -923,7 +932,8 @@ async function initSqliteSchema(db: Database.Database) {
 
     CREATE TABLE IF NOT EXISTS leave_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
+      user_id INTEGER NULL,
+      employee_id INTEGER NULL,
       leave_type TEXT NOT NULL DEFAULT 'annual',
       start_date TEXT NOT NULL,
       end_date TEXT NOT NULL,
@@ -932,8 +942,8 @@ async function initSqliteSchema(db: Database.Database) {
       status TEXT NOT NULL DEFAULT 'pending',
       decided_by INTEGER NULL,
       decided_at TEXT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (user_id) REFERENCES users(id)
+      decision_note TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS payroll_runs (
@@ -1148,10 +1158,290 @@ async function initSqliteSchema(db: Database.Database) {
       active INTEGER NOT NULL DEFAULT 1
     );
 
+    CREATE TABLE IF NOT EXISTS hr_employees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_number TEXT NOT NULL UNIQUE,
+      user_id INTEGER NULL UNIQUE,
+      full_name TEXT NOT NULL,
+      gender TEXT NOT NULL DEFAULT 'unspecified',
+      phone TEXT NULL,
+      email TEXT NULL,
+      address TEXT NULL,
+      emergency_contact_name TEXT NULL,
+      emergency_contact_phone TEXT NULL,
+      department_name TEXT NOT NULL,
+      job_position TEXT NOT NULL DEFAULT 'Staff',
+      employment_type TEXT NOT NULL DEFAULT 'full_time',
+      hire_date TEXT NOT NULL,
+      contract_start TEXT NOT NULL,
+      contract_end TEXT NULL,
+      basic_salary REAL NOT NULL DEFAULT 0,
+      housing_allowance REAL NOT NULL DEFAULT 0,
+      licence_number TEXT NULL,
+      licence_expiry TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      terminated_at TEXT NULL,
+      termination_reason TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_employee_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL,
+      doc_type TEXT NOT NULL DEFAULT 'contract',
+      title TEXT NOT NULL,
+      file_ref TEXT NULL,
+      expiry_date TEXT NULL,
+      notes TEXT NULL,
+      uploaded_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_attendance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL,
+      user_id INTEGER NULL,
+      attendance_date TEXT NOT NULL,
+      check_in TEXT NULL,
+      check_out TEXT NULL,
+      hours_worked REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'present',
+      late_minutes INTEGER NOT NULL DEFAULT 0,
+      early_leave_minutes INTEGER NOT NULL DEFAULT 0,
+      notes TEXT NULL,
+      recorded_by INTEGER NOT NULL,
+      updated_by INTEGER NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (employee_id, attendance_date),
+      FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_leave_types (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      annual_allowance_days INTEGER NOT NULL DEFAULT 0,
+      paid INTEGER NOT NULL DEFAULT 1,
+      description TEXT NULL,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_overtime (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL,
+      user_id INTEGER NULL,
+      overtime_date TEXT NOT NULL,
+      hours REAL NOT NULL,
+      day_type TEXT NOT NULL DEFAULT 'regular',
+      rate_multiplier REAL NOT NULL DEFAULT 1.5,
+      hourly_rate_snapshot REAL NOT NULL DEFAULT 0,
+      computed_amount REAL NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      decided_by INTEGER NULL,
+      decided_at TEXT NULL,
+      decision_note TEXT NULL,
+      payroll_run_id INTEGER NULL,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      employee_id INTEGER NOT NULL,
+      user_id INTEGER NULL,
+      adjustment_type TEXT NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount REAL NOT NULL,
+      effective_month TEXT NOT NULL,
+      effective_date TEXT NOT NULL,
+      recurring INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (employee_id) REFERENCES hr_employees(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_monthly_submissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pay_month TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      total_employees INTEGER NOT NULL DEFAULT 0,
+      total_attendance_hours REAL NOT NULL DEFAULT 0,
+      total_overtime_amount REAL NOT NULL DEFAULT 0,
+      total_extra_earnings REAL NOT NULL DEFAULT 0,
+      total_extra_deductions REAL NOT NULL DEFAULT 0,
+      notes TEXT NULL,
+      submitted_by INTEGER NOT NULL,
+      submitted_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS payroll_components (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      component_type TEXT NOT NULL,
+      calc_method TEXT NOT NULL DEFAULT 'fixed',
+      default_value REAL NOT NULL DEFAULT 0,
+      account_code TEXT NOT NULL DEFAULT '5100',
+      is_recurring INTEGER NOT NULL DEFAULT 1,
+      is_taxable INTEGER NOT NULL DEFAULT 1,
+      is_pensionable INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS finance_cash_bank_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_name TEXT NOT NULL,
+      account_type TEXT NOT NULL DEFAULT 'bank',
+      account_number TEXT NULL,
+      bank_name TEXT NULL,
+      coa_code TEXT NOT NULL,
+      opening_balance REAL NOT NULL DEFAULT 0,
+      current_balance REAL NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS finance_cash_bank_transfers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transfer_number TEXT NOT NULL UNIQUE,
+      transfer_date TEXT NOT NULL,
+      from_account_id INTEGER NOT NULL,
+      to_account_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      reference_no TEXT NULL,
+      notes TEXT NULL,
+      journal_entry_id INTEGER NULL,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (from_account_id) REFERENCES finance_cash_bank_accounts(id),
+      FOREIGN KEY (to_account_id) REFERENCES finance_cash_bank_accounts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS finance_payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      payment_number TEXT NOT NULL UNIQUE,
+      payment_date TEXT NOT NULL,
+      payment_category TEXT NOT NULL,
+      payee_name TEXT NOT NULL,
+      cash_bank_account_id INTEGER NOT NULL,
+      payment_method TEXT NOT NULL DEFAULT 'bank_transfer',
+      amount REAL NOT NULL,
+      reference_no TEXT NULL,
+      attachment_ref TEXT NULL,
+      linked_type TEXT NULL,
+      linked_id INTEGER NULL,
+      notes TEXT NULL,
+      journal_entry_id INTEGER NULL,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (cash_bank_account_id) REFERENCES finance_cash_bank_accounts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS finance_receipts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      receipt_number TEXT NOT NULL UNIQUE,
+      receipt_date TEXT NOT NULL,
+      income_category TEXT NOT NULL,
+      payer_name TEXT NOT NULL,
+      cash_bank_account_id INTEGER NOT NULL,
+      payment_method TEXT NOT NULL DEFAULT 'bank_transfer',
+      amount REAL NOT NULL,
+      reference_no TEXT NULL,
+      attachment_ref TEXT NULL,
+      notes TEXT NULL,
+      journal_entry_id INTEGER NULL,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (cash_bank_account_id) REFERENCES finance_cash_bank_accounts(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS specialties (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      department_id INTEGER NULL,
+      description TEXT NULL,
+      consultation_fee REAL NOT NULL DEFAULT 45.00,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (department_id) REFERENCES departments(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS clinic_rooms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_code TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      department_id INTEGER NULL,
+      specialty_id INTEGER NULL,
+      room_type TEXT NOT NULL DEFAULT 'consultation',
+      capacity INTEGER NOT NULL DEFAULT 1,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (department_id) REFERENCES departments(id),
+      FOREIGN KEY (specialty_id) REFERENCES specialties(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_departments (
+      user_id INTEGER NOT NULL,
+      department_id INTEGER NOT NULL,
+      is_primary INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, department_id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (department_id) REFERENCES departments(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_clinic_units (
+      user_id INTEGER NOT NULL,
+      clinic_room_id INTEGER NOT NULL,
+      PRIMARY KEY (user_id, clinic_room_id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (clinic_room_id) REFERENCES clinic_rooms(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS doctor_assignments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      visit_id INTEGER NOT NULL,
+      patient_id INTEGER NOT NULL,
+      doctor_id INTEGER NOT NULL,
+      assigned_by INTEGER NULL,
+      specialty TEXT NULL,
+      clinic_room_id INTEGER NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      notes TEXT NULL,
+      assigned_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      jti TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      ip_address TEXT NULL,
+      user_agent TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT NULL,
+      revoked_by INTEGER NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_invoices_patient ON invoices(patient_id, status);
     CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id, workflow_stage);
     CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id);
     CREATE INDEX IF NOT EXISTS idx_queue_dept_status ON queue_tickets(department, status);
+    CREATE INDEX IF NOT EXISTS idx_hr_att_emp_date ON hr_attendance(employee_id, attendance_date);
+    CREATE INDEX IF NOT EXISTS idx_hr_adj_emp_month ON hr_adjustments(employee_id, effective_month);
+    CREATE INDEX IF NOT EXISTS idx_doc_assign_visit ON doctor_assignments(visit_id);
+    CREATE INDEX IF NOT EXISTS idx_doc_assign_doctor ON doctor_assignments(doctor_id, status);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id, revoked_at);
   `);
 
   // Safe migrations for pre-existing clinic360.db files
@@ -1173,6 +1463,17 @@ async function initSqliteSchema(db: Database.Database) {
   safeAddColumn(db, 'admissions', 'last_bed_billed_at TEXT NULL');
   safeAddColumn(db, 'medication_administrations', 'medication_order_id INTEGER NULL');
   safeAddColumn(db, 'users', 'two_fa_enabled INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'users', 'employee_id INTEGER NULL');
+  safeAddColumn(db, 'users', 'username TEXT NULL');
+  safeAddColumn(db, 'users', "status TEXT NOT NULL DEFAULT 'active'");
+  safeAddColumn(db, 'users', 'exception_approved INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'departments', "category TEXT NOT NULL DEFAULT 'clinical'");
+  safeAddColumn(db, 'departments', 'head_name TEXT NULL');
+  safeAddColumn(db, 'departments', 'description TEXT NULL');
+  safeAddColumn(db, 'departments', 'created_at TEXT NULL');
+  safeAddColumn(db, 'hr_employees', 'access_review_required INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'hr_employees', 'access_reviewed_at TEXT NULL');
+  safeAddColumn(db, 'hr_employees', 'access_reviewed_by INTEGER NULL');
   safeAddColumn(db, 'visits', "visit_type TEXT NOT NULL DEFAULT 'walk_in'");
   safeAddColumn(db, 'visits', 'specialty TEXT NULL');
   safeAddColumn(db, 'visits', 'consultation_invoice_id INTEGER NULL');
@@ -1196,6 +1497,118 @@ async function initSqliteSchema(db: Database.Database) {
   safeAddColumn(db, 'payroll_items', 'pension_employee REAL NOT NULL DEFAULT 0');
   safeAddColumn(db, 'payroll_items', 'pension_employer REAL NOT NULL DEFAULT 0');
   safeAddColumn(db, 'payroll_items', 'paye_tax REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'payroll_items', 'employee_id INTEGER NULL');
+  safeAddColumn(db, 'payroll_items', 'overtime_pay REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'payroll_items', 'bonus_earnings REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'payroll_items', 'other_deductions REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'payroll_items', 'paid_amount REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'payroll_items', "payment_status TEXT NOT NULL DEFAULT 'unpaid'");
+  safeAddColumn(db, 'payroll_items', 'payment_method TEXT NULL');
+  safeAddColumn(db, 'payroll_items', 'payment_ref TEXT NULL');
+  safeAddColumn(db, 'payroll_items', 'paid_at TEXT NULL');
+  safeAddColumn(db, 'chart_of_accounts', 'parent_id INTEGER NULL');
+  safeAddColumn(db, 'chart_of_accounts', 'description TEXT NULL');
+  safeAddColumn(db, 'expense_vouchers', 'reference_number TEXT NULL');
+  safeAddColumn(db, 'expense_vouchers', 'attachment_ref TEXT NULL');
+  safeAddColumn(db, 'expense_vouchers', 'paid_amount REAL NOT NULL DEFAULT 0');
+  safeAddColumn(db, 'expense_vouchers', 'cash_bank_account_id INTEGER NULL');
+  safeAddColumn(db, 'goods_receipts', 'delivery_date TEXT NULL');
+  safeAddColumn(db, 'goods_receipts', 'received_date TEXT NULL');
+  safeAddColumn(db, 'goods_receipts', 'department_name TEXT NULL');
+  safeAddColumn(db, 'goods_receipts', 'attachment_ref TEXT NULL');
+  safeAddColumn(db, 'goods_receipts', "approval_status TEXT NOT NULL DEFAULT 'approved'");
+  safeAddColumn(db, 'goods_receipts', 'approved_by INTEGER NULL');
+  safeAddColumn(db, 'goods_receipts', 'approved_at TEXT NULL');
+  safeAddColumn(db, 'goods_receipts', 'rejected_reason TEXT NULL');
+  safeAddColumn(db, 'leave_requests', 'employee_id INTEGER NULL');
+  safeAddColumn(db, 'leave_requests', 'decision_note TEXT NULL');
+  safeAddColumn(db, 'notifications', 'target_user_id INTEGER NULL');
+  try {
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_users_employee_id ON users(employee_id)');
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_emp_one_account ON users(employee_id) WHERE employee_id IS NOT NULL AND exception_approved = 0');
+  } catch {
+    // ignore index warning
+  }
+
+  // Allow payroll_items.user_id and leave_requests.user_id to be NULL for non-login staff on existing DBs
+  const piCols = db.prepare('PRAGMA table_info(payroll_items)').all() as Array<{ name: string; notnull: number }>;
+  const piUserCol = piCols.find((c) => c.name === 'user_id');
+  if (piUserCol && piUserCol.notnull === 1) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE payroll_items_migr (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payroll_run_id INTEGER NOT NULL,
+        user_id INTEGER NULL,
+        employee_id INTEGER NULL,
+        staff_name TEXT NOT NULL,
+        role_code TEXT NOT NULL,
+        base_salary REAL NOT NULL,
+        allowances REAL NOT NULL,
+        taxable_allowances REAL NOT NULL DEFAULT 0,
+        overtime_pay REAL NOT NULL DEFAULT 0,
+        bonus_earnings REAL NOT NULL DEFAULT 0,
+        pension_employee REAL NOT NULL DEFAULT 0,
+        pension_employer REAL NOT NULL DEFAULT 0,
+        paye_tax REAL NOT NULL DEFAULT 0,
+        other_deductions REAL NOT NULL DEFAULT 0,
+        tax_deduction REAL NOT NULL,
+        net_pay REAL NOT NULL,
+        paid_amount REAL NOT NULL DEFAULT 0,
+        payment_status TEXT NOT NULL DEFAULT 'unpaid',
+        payment_method TEXT NULL,
+        payment_ref TEXT NULL,
+        paid_at TEXT NULL,
+        FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id)
+      );
+      INSERT INTO payroll_items_migr (
+        id, payroll_run_id, user_id, employee_id, staff_name, role_code, base_salary, allowances,
+        taxable_allowances, overtime_pay, bonus_earnings, pension_employee, pension_employer,
+        paye_tax, other_deductions, tax_deduction, net_pay, paid_amount, payment_status, payment_method, payment_ref, paid_at
+      )
+      SELECT
+        id, payroll_run_id, user_id, employee_id, staff_name, role_code, base_salary, allowances,
+        taxable_allowances, overtime_pay, bonus_earnings, pension_employee, pension_employer,
+        paye_tax, other_deductions, tax_deduction, net_pay, paid_amount, payment_status, payment_method, payment_ref, paid_at
+      FROM payroll_items;
+      DROP TABLE payroll_items;
+      ALTER TABLE payroll_items_migr RENAME TO payroll_items;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
+
+  const lrCols = db.prepare('PRAGMA table_info(leave_requests)').all() as Array<{ name: string; notnull: number }>;
+  const lrUserCol = lrCols.find((c) => c.name === 'user_id');
+  if (lrUserCol && lrUserCol.notnull === 1) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE leave_requests_migr (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NULL,
+        employee_id INTEGER NULL,
+        leave_type TEXT NOT NULL DEFAULT 'annual',
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        days_count INTEGER NOT NULL DEFAULT 1,
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        decided_by INTEGER NULL,
+        decided_at TEXT NULL,
+        decision_note TEXT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO leave_requests_migr (
+        id, user_id, employee_id, leave_type, start_date, end_date, days_count, reason, status, decided_by, decided_at, decision_note, created_at
+      )
+      SELECT
+        id, user_id, employee_id, leave_type, start_date, end_date, days_count, reason, status, decided_by, decided_at, decision_note, created_at
+      FROM leave_requests;
+      DROP TABLE leave_requests;
+      ALTER TABLE leave_requests_migr RENAME TO leave_requests;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
 }
 
 async function ensureExtraPermissionsAndSeeds() {
@@ -1258,12 +1671,44 @@ async function ensureExtraPermissionsAndSeeds() {
     ['lab.critical.ack', 'Laboratory', 'Acknowledge critical laboratory results on patient chart'],
     ['lab.sample.recollect', 'Laboratory', 'Reset rejected laboratory sample for recollection'],
     ['catalog.manage', 'Administration', 'Create and update services, tariffs, lab tests, imaging exams, medicines, and wards'],
+    ['hr.attendance.manage', 'HR', 'Register and correct daily employee attendance and working hours'],
+    ['hr.overtime.manage', 'HR', 'Register and approve employee overtime records'],
+    ['hr.payroll.submit', 'HR', 'Finalize and submit monthly employee payroll inputs to Finance'],
+    ['finance.coa.manage', 'Finance', 'Create, edit, and organize hierarchical Chart of Accounts'],
+    ['finance.payroll.generate', 'Finance', 'Configure payroll components and generate monthly payroll from HR inputs'],
+    ['finance.payment.manage', 'Finance', 'Register outgoing payment vouchers and salary disbursements'],
+    ['finance.receipt.manage', 'Finance', 'Register general non-patient receipts and other income'],
+    ['finance.bank.manage', 'Finance', 'Manage cash and bank accounts, transfers, and reconciliation'],
+    ['finance.grv.manage', 'Finance', 'Register and approve supplier Goods Received Vouchers (GRVs)'],
+    ['visit.assign_doctor', 'OPD', 'Assign OPD doctor to patient visit'],
+    ['billing.report.own', 'Cashier', 'View own cashier daily payment collection report'],
+    ['admin.config.manage', 'Administration', 'Configure clinic departments, specialties, rooms, clinical rules, and system policies'],
+    ['admin.backup.manage', 'Administration', 'Inspect database backup status, integrity verification, and maintenance tasks'],
   ];
 
   for (const [code, module, description] of extraPerms) {
     const existing = await queryOne<{ id: number }>('SELECT id FROM permissions WHERE code = ?', [code]);
     if (!existing) {
       await execute('INSERT INTO permissions (code, module, description) VALUES (?, ?, ?)', [code, module, description]);
+    }
+  }
+
+  // Always keep ADM granted any newly added Administration/System permissions
+  const admRoleAlways = await queryOne<{ id: number }>("SELECT id FROM roles WHERE code = 'ADM'");
+  if (admRoleAlways) {
+    const allPermsAlways = await query<{ id: number }>('SELECT id FROM permissions');
+    for (const perm of allPermsAlways) {
+      const exists = await queryOne('SELECT 1 FROM role_permissions WHERE role_id = ? AND permission_id = ?', [
+        admRoleAlways.id,
+        perm.id,
+      ]);
+      if (!exists) {
+        await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [
+          admRoleAlways.id,
+          perm.id,
+          'all',
+        ]);
+      }
     }
   }
 
@@ -1352,6 +1797,184 @@ async function ensureExtraPermissionsAndSeeds() {
     await execute("INSERT INTO system_settings (setting_key, setting_value) VALUES ('rbac_defaults_v2_applied', '1')");
   }
 
+  const rbacV3Applied = await queryOne<{ setting_value: string }>(
+    "SELECT setting_value FROM system_settings WHERE setting_key = 'rbac_defaults_v3_applied'"
+  );
+  if (!rbacV3Applied) {
+    const v3Bindings: Record<string, string[]> = {
+      HRO: ['hr.attendance.manage', 'hr.overtime.manage', 'hr.payroll.submit'],
+      ACC: [
+        'finance.coa.manage',
+        'finance.payroll.generate',
+        'finance.payment.manage',
+        'finance.receipt.manage',
+        'finance.bank.manage',
+        'finance.grv.manage',
+      ],
+      STO: ['finance.grv.manage'],
+    };
+    for (const [roleCode, permCodes] of Object.entries(v3Bindings)) {
+      const role = await queryOne<{ id: number }>('SELECT id FROM roles WHERE code = ?', [roleCode]);
+      if (!role) continue;
+      for (const pCode of permCodes) {
+        const perm = await queryOne<{ id: number }>('SELECT id FROM permissions WHERE code = ?', [pCode]);
+        if (!perm) continue;
+        const exists = await queryOne('SELECT 1 FROM role_permissions WHERE role_id = ? AND permission_id = ?', [
+          role.id,
+          perm.id,
+        ]);
+        if (!exists) {
+          await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [
+            role.id,
+            perm.id,
+            'all',
+          ]);
+        }
+      }
+    }
+    await execute("INSERT INTO system_settings (setting_key, setting_value) VALUES ('rbac_defaults_v3_applied', '1')");
+  }
+
+  const rbacV4Applied = await queryOne<{ setting_value: string }>(
+    "SELECT setting_value FROM system_settings WHERE setting_key = 'rbac_defaults_v4_applied'"
+  );
+  if (!rbacV4Applied) {
+    // 1. Grant ADM full system permissions across all modules
+    const admRole = await queryOne<{ id: number }>("SELECT id FROM roles WHERE code = 'ADM'");
+    if (admRole) {
+      const allPerms = await query<{ id: number }>('SELECT id FROM permissions');
+      for (const perm of allPerms) {
+        const exists = await queryOne('SELECT 1 FROM role_permissions WHERE role_id = ? AND permission_id = ?', [
+          admRole.id,
+          perm.id,
+        ]);
+        if (!exists) {
+          await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [
+            admRole.id,
+            perm.id,
+            'all',
+          ]);
+        }
+      }
+    }
+
+    // 2. Role-specific strict RBAC additions
+    const v4Bindings: Record<string, string[]> = {
+      CSH: [
+        'patient.create', 'patient.read', 'patient.update', 'visit.create', 'visit.read', 'visit.assign_doctor',
+        'vitals.create', 'vitals.read', 'queue.manage', 'appointment.read', 'appointment.create', 'appointment.update',
+        'billing.invoice.create', 'billing.invoice.read', 'billing.payment.create', 'billing.shift.manage',
+        'billing.approval.request', 'billing.deposit.create', 'billing.receipt.print', 'billing.report.own',
+        'ipd.discharge.clear', 'hr.leave.request', 'hr.payslip.own',
+      ],
+      REC: [
+        'patient.create', 'patient.read', 'patient.update', 'patient.identity.update', 'visit.create', 'visit.read',
+        'visit.assign_doctor', 'vitals.create', 'vitals.read', 'queue.manage', 'appointment.create',
+        'appointment.read', 'appointment.update', 'appointment.block.manage', 'billing.invoice.create',
+        'billing.invoice.read', 'billing.payment.create', 'billing.shift.manage', 'billing.receipt.print',
+        'billing.report.own', 'hr.leave.request', 'hr.payslip.own',
+      ],
+      DOC: [
+        'patient.read', 'patient.clinical.read', 'patient.update', 'appointment.read', 'appointment.update',
+        'appointment.block.manage', 'vitals.create', 'vitals.read', 'visit.read', 'visit.update', 'visit.close',
+        'order.lab.create', 'order.imaging.create', 'prescription.create', 'lab.order.read', 'imaging.order.read',
+        'lab.critical.ack', 'pharmacy.prescription.read', 'ipd.admission.read', 'ipd.admission.create',
+        'ipd.discharge.create', 'nursing.procedure.perform', 'payment.gate.bypass', 'triage.emergency.set',
+        'hr.leave.request', 'hr.payslip.own',
+      ],
+      NUR: [
+        'patient.read', 'patient.clinical.read', 'queue.manage', 'appointment.read', 'appointment.update',
+        'vitals.create', 'vitals.read', 'visit.read', 'visit.create', 'visit.assign_doctor',
+        'nursing.procedure.perform', 'triage.emergency.set', 'lab.order.read', 'imaging.order.read',
+        'ipd.admission.read', 'ipd.bed.assign', 'ipd.mar.give', 'hr.leave.request', 'hr.payslip.own',
+      ],
+      MGR: [
+        'visit.assign_doctor',
+      ],
+    };
+    for (const [roleCode, permCodes] of Object.entries(v4Bindings)) {
+      const role = await queryOne<{ id: number }>('SELECT id FROM roles WHERE code = ?', [roleCode]);
+      if (!role) continue;
+      for (const pCode of permCodes) {
+        const perm = await queryOne<{ id: number }>('SELECT id FROM permissions WHERE code = ?', [pCode]);
+        if (!perm) continue;
+        const exists = await queryOne('SELECT 1 FROM role_permissions WHERE role_id = ? AND permission_id = ?', [
+          role.id,
+          perm.id,
+        ]);
+        if (!exists) {
+          await execute('INSERT INTO role_permissions (role_id, permission_id, scope) VALUES (?, ?, ?)', [
+            role.id,
+            perm.id,
+            roleCode === 'CSH' ? 'own' : 'all',
+          ]);
+        }
+      }
+    }
+
+    // 3. Enforce strict least-privilege revocations (no role cross-bleed)
+    const v4Revocations: Array<[string, string]> = [
+      // Cashier / Reception: strictly no clinical chart editing, prescribing, or inpatient ward board
+      ['CSH', 'patient.clinical.read'],
+      ['CSH', 'visit.update'],
+      ['CSH', 'visit.close'],
+      ['CSH', 'prescription.create'],
+      ['CSH', 'order.lab.create'],
+      ['CSH', 'order.imaging.create'],
+      ['CSH', 'ipd.admission.read'],
+      ['CSH', 'ipd.bed.bill'],
+      ['REC', 'patient.clinical.read'],
+      ['REC', 'visit.update'],
+      ['REC', 'visit.close'],
+      ['REC', 'prescription.create'],
+      ['REC', 'order.lab.create'],
+      ['REC', 'order.imaging.create'],
+      ['REC', 'ipd.admission.read'],
+      // Doctor: no cashier/billing/admin/queue/appointment-booking-for-others clutter
+      ['DOC', 'billing.invoice.create'],
+      ['DOC', 'billing.invoice.read'],
+      ['DOC', 'billing.payment.create'],
+      ['DOC', 'billing.shift.manage'],
+      ['DOC', 'admin.user.manage'],
+      ['DOC', 'admin.role.manage'],
+      ['DOC', 'finance.report.view'],
+      ['DOC', 'accounting.ledger.manage'],
+      ['DOC', 'pharmacy.dispense'],
+      ['DOC', 'visit.create'],
+      ['DOC', 'queue.manage'],
+      ['DOC', 'appointment.create'],
+      // Nurse: no physician prescribing/diagnosis closing/lab ordering
+      ['NUR', 'visit.update'],
+      ['NUR', 'visit.close'],
+      ['NUR', 'prescription.create'],
+      ['NUR', 'order.lab.create'],
+      ['NUR', 'order.imaging.create'],
+      // Diagnostics & Pharmacy: strictly own department workflow (no OPD triage/consult tab)
+      ['LAB', 'visit.read'],
+      ['LAB', 'vitals.read'],
+      ['LAB', 'patient.clinical.read'],
+      ['IMG', 'visit.read'],
+      ['IMG', 'vitals.read'],
+      ['IMG', 'patient.clinical.read'],
+      ['PHA', 'visit.read'],
+      ['PHA', 'vitals.read'],
+      ['PHA', 'patient.clinical.read'],
+      // Accountant: focused financial access without inpatient ward clutter
+      ['ACC', 'ipd.admission.read'],
+      ['ACC', 'ipd.bed.bill'],
+    ];
+    for (const [rCode, pCode] of v4Revocations) {
+      await execute(
+        `DELETE FROM role_permissions
+         WHERE role_id = (SELECT id FROM roles WHERE code = ?)
+           AND permission_id = (SELECT id FROM permissions WHERE code = ?)`,
+        [rCode, pCode]
+      );
+    }
+
+    await execute("INSERT INTO system_settings (setting_key, setting_value) VALUES ('rbac_defaults_v4_applied', '1')");
+  }
+
   const extraSeqs: Array<[string, string, number]> = [
     ['ADM', 'ADM-26-', 10],
     ['GRN', 'GRN-26-', 10],
@@ -1363,6 +1986,10 @@ async function ensureExtraPermissionsAndSeeds() {
     ['CLM', 'CLM-26-', 10],
     ['PAY', 'PAY-26-', 10],
     ['CN', 'CN-26-', 10],
+    ['FPV', 'FPV-26-', 10],
+    ['FRV', 'FRV-26-', 10],
+    ['TRF', 'TRF-26-', 10],
+    ['EMP', 'EMP-', 200],
   ];
   for (const [seqKey, prefix, curVal] of extraSeqs) {
     const seqRow = await queryOne('SELECT seq_key FROM sequences WHERE seq_key = ?', [seqKey]);
@@ -1527,8 +2154,10 @@ async function ensureExtraPermissionsAndSeeds() {
 
   const notifCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM notifications');
   if (Number(notifCount?.cnt || 0) === 0) {
+    const primaryDoc = await queryOne<{ id: number }>("SELECT id FROM users WHERE email = 'doc@clinic360.local'");
     await execute(
-      "INSERT INTO notifications (target_role, title, message, severity, entity_type) VALUES ('DOC', 'Urgent Triage Alert', 'Amira Kassahun (C360-000096) flagged SpO2 91% and Temp 38.6C in Triage.', 'critical', 'visit')"
+      "INSERT INTO notifications (target_role, target_user_id, title, message, severity, entity_type) VALUES ('DOC', ?, 'Urgent Triage Alert', 'Amira Kassahun (C360-000096) flagged SpO2 91% and Temp 38.6C in Triage.', 'critical', 'visit')",
+      [primaryDoc?.id ?? null]
     );
     await execute(
       "INSERT INTO notifications (target_role, title, message, severity, entity_type) VALUES ('ACC', 'Discount Approval Pending', 'Cashier David Kim requested $10.00 courtesy waiver on INV-26-000100.', 'warning', 'approval')"
@@ -1744,22 +2373,17 @@ async function ensureExtraPermissionsAndSeeds() {
     ['1150', 'Patient Accounts Receivable (Self-Pay)', 'asset', 'debit'],
     ['2210', 'PAYE Income Tax Payable', 'liability', 'credit'],
     ['2220', 'Employee & Employer Pension Payable', 'liability', 'credit'],
+    ['3000', "Owner's Capital & Clinic Equity", 'equity', 'credit'],
+    ['3100', 'Retained Earnings', 'equity', 'credit'],
+    ['4050', 'Other Income, Grants & General Receipts', 'revenue', 'credit'],
     ['5020', 'Inventory Expiry & Shrinkage Loss', 'expense', 'debit'],
+    ['5210', 'Electricity, Water & Utility Bills', 'expense', 'debit'],
+    ['5220', 'Clinic Rent & Facility Lease', 'expense', 'debit'],
+    ['5230', 'Internet & Communications Expense', 'expense', 'debit'],
     ['5300', 'Medical Equipment Maintenance & Repairs', 'expense', 'debit'],
     ['5400', 'Office, IT & Operational Admin Expense', 'expense', 'debit'],
   ];
   const coaCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM chart_of_accounts');
-  if (Number(coaCount?.cnt || 0) > 0) {
-    for (const [code, name, type, normal] of extraCoa) {
-      const exists = await queryOne<{ id: number }>('SELECT id FROM chart_of_accounts WHERE code = ?', [code]);
-      if (!exists) {
-        await execute(
-          'INSERT INTO chart_of_accounts (code, name, account_type, normal_balance) VALUES (?, ?, ?, ?)',
-          [code, name, type, normal]
-        );
-      }
-    }
-  }
   if (Number(coaCount?.cnt || 0) === 0) {
     const accounts: Array<[string, string, string, string]> = [
       ['1010', 'Cash on Hand & Till Drawer', 'asset', 'debit'],
@@ -1789,6 +2413,19 @@ async function ensureExtraPermissionsAndSeeds() {
         [code, name, type, normal]
       );
     }
+  }
+
+  for (const [code, name, type, normal] of extraCoa) {
+    const exists = await queryOne<{ id: number }>('SELECT id FROM chart_of_accounts WHERE code = ?', [code]);
+    if (!exists) {
+      await execute(
+        'INSERT INTO chart_of_accounts (code, name, account_type, normal_balance) VALUES (?, ?, ?, ?)',
+        [code, name, type, normal]
+      );
+    }
+  }
+
+  if (Number(coaCount?.cnt || 0) === 0) {
 
     const coaByCode: Record<string, number> = {};
     const coaRows = await query<{ id: number; code: string }>('SELECT id, code FROM chart_of_accounts');
@@ -1904,6 +2541,390 @@ async function ensureExtraPermissionsAndSeeds() {
          VALUES (?, 'annual', ?, ?, 3, 'Annual family leave (coverage arranged with WRD)', 'pending')`,
         [nurUser.id, nextMon, nextWed]
       );
+    }
+  }
+
+  // Seed Leave Types if empty
+  const leaveTypeCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM hr_leave_types');
+  if (Number(leaveTypeCnt?.cnt || 0) === 0) {
+    const defaultLeaveTypes: Array<[string, string, number, number, string]> = [
+      ['annual', 'Annual Leave', 21, 1, 'Paid annual vacation leave entitlement'],
+      ['sick', 'Sick Leave', 12, 1, 'Paid medical or sick leave with certificate above 2 days'],
+      ['maternity', 'Maternity / Paternity Leave', 90, 1, 'Paid parental leave per clinic policy'],
+      ['emergency', 'Emergency Leave', 5, 1, 'Urgent family or compassionate emergency leave'],
+      ['unpaid', 'Unpaid Leave', 0, 0, 'Authorized leave without pay (pro-rata salary deduction applies)'],
+      ['study', 'CME / Special Study Leave', 10, 1, 'Continuing medical education & licensing conference leave'],
+    ];
+    for (const [code, name, days, paid, desc] of defaultLeaveTypes) {
+      await execute(
+        'INSERT INTO hr_leave_types (code, name, annual_allowance_days, paid, description, active) VALUES (?, ?, ?, ?, ?, 1)',
+        [code, name, days, paid, desc]
+      );
+    }
+  }
+
+  // Seed Payroll Components if empty
+  const pcCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM payroll_components');
+  if (Number(pcCnt?.cnt || 0) === 0) {
+    const defaultComponents: Array<[string, string, string, string, number, string, number, number, number]> = [
+      ['BASIC', 'Basic Salary', 'earning', 'fixed', 0, '5100', 1, 1, 1],
+      ['HOUSING', 'Housing Allowance', 'earning', 'fixed', 0, '5100', 1, 1, 0],
+      ['TRANSPORT', 'Transport Allowance', 'earning', 'fixed', 0, '5100', 1, 1, 0],
+      ['MEDICAL', 'Medical Allowance', 'earning', 'fixed', 0, '5100', 1, 0, 0],
+      ['OVERTIME', 'Overtime Payment', 'earning', 'manual', 0, '5100', 0, 1, 0],
+      ['BONUS', 'Performance Bonus & Incentives', 'earning', 'manual', 0, '5100', 0, 1, 0],
+      ['PAYE', 'Income Tax (PAYE)', 'deduction', 'percentage', 0, '2210', 1, 0, 0],
+      ['PENSION_EE', 'Pension Contribution (7% EE)', 'deduction', 'percentage', 7, '2220', 1, 0, 0],
+      ['LOAN', 'Employee Loan Deduction', 'deduction', 'manual', 0, '2200', 0, 0, 0],
+      ['ADVANCE', 'Salary Advance Deduction', 'deduction', 'manual', 0, '2200', 0, 0, 0],
+      ['UNPAID_LEAVE', 'Unpaid Leave / Absence Deduction', 'deduction', 'manual', 0, '5100', 0, 0, 0],
+    ];
+    for (const [code, name, cType, method, defVal, acct, recur, taxable, pensionable] of defaultComponents) {
+      await execute(
+        `INSERT INTO payroll_components (code, name, component_type, calc_method, default_value, account_code, is_recurring, is_taxable, is_pensionable, active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        [code, name, cType, method, defVal, acct, recur, taxable, pensionable]
+      );
+    }
+  }
+
+  // Seed Finance Cash & Bank Accounts if empty
+  const cbCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM finance_cash_bank_accounts');
+  if (Number(cbCnt?.cnt || 0) === 0) {
+    await execute(
+      `INSERT INTO finance_cash_bank_accounts (account_name, account_type, account_number, bank_name, coa_code, opening_balance, current_balance, active)
+       VALUES ('Clinic Petty Cash Safe', 'cash', 'CASH-001', 'Main Clinic Vault', '1010', 2500.00, 2500.00, 1)`
+    );
+    await execute(
+      `INSERT INTO finance_cash_bank_accounts (account_name, account_type, account_number, bank_name, coa_code, opening_balance, current_balance, active)
+       VALUES ('Clinic Operating Bank Account', 'bank', '0011-4892-7701', 'Commercial Bank of East Africa', '1020', 48500.00, 48500.00, 1)`
+    );
+  }
+
+  // Backfill hr_employees from staff_contracts + users if hr_employees is empty
+  const hrEmpCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM hr_employees');
+  if (Number(hrEmpCnt?.cnt || 0) === 0) {
+    const existingContracts = await query<{
+      user_id: number;
+      employee_code: string;
+      department_name: string;
+      contract_type: string;
+      base_salary: number;
+      housing_allowance: number;
+      licence_number: string | null;
+      licence_expiry: string | null;
+      contract_start: string;
+      contract_end: string | null;
+      status: string;
+      full_name: string;
+      email: string;
+      specialty: string | null;
+      role_name: string | null;
+    }>(
+      `SELECT sc.*, u.full_name, u.email, u.specialty,
+              (SELECT r.name FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id ORDER BY ur.role_id ASC LIMIT 1) AS role_name
+       FROM staff_contracts sc
+       INNER JOIN users u ON u.id = sc.user_id
+       ORDER BY sc.employee_code ASC`
+    );
+    for (const c of existingContracts) {
+      await execute(
+        `INSERT INTO hr_employees (
+          employee_number, user_id, full_name, gender, email, department_name, job_position,
+          employment_type, hire_date, contract_start, contract_end, basic_salary, housing_allowance,
+          licence_number, licence_expiry, status
+        ) VALUES (?, ?, ?, 'unspecified', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          c.employee_code,
+          c.user_id,
+          c.full_name,
+          c.email,
+          c.department_name,
+          c.specialty || c.role_name || 'Staff Member',
+          c.contract_type || 'full_time',
+          c.contract_start,
+          c.contract_start,
+          c.contract_end || null,
+          Number(c.base_salary),
+          Number(c.housing_allowance || 0),
+          c.licence_number || null,
+          c.licence_expiry || null,
+          c.status === 'active' ? 'active' : 'inactive',
+        ]
+      );
+    }
+  }
+
+  // Ensure every existing user has an HR employee register record (unless already linked) and backfill users.employee_id / username / status
+  if (allowDemoSeed) {
+    const usersToLink = await query<{
+      id: number;
+      full_name: string;
+      email: string;
+      specialty: string | null;
+      active: number;
+      locked_until: string | null;
+      employee_id: number | null;
+      username: string | null;
+      role_code: string | null;
+      role_name: string | null;
+    }>(
+      `SELECT u.id, u.full_name, u.email, u.specialty, u.active, u.locked_until, u.employee_id, u.username,
+              (SELECT r.code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id ORDER BY ur.role_id ASC LIMIT 1) AS role_code,
+              (SELECT r.name FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id ORDER BY ur.role_id ASC LIMIT 1) AS role_name
+       FROM users u
+       ORDER BY u.id ASC`
+    );
+
+    const deptByRole: Record<string, string> = {
+      DOC: 'Outpatient Department',
+      NUR: 'Triage & Nursing',
+      WRD: 'Inpatient Wards',
+      LAB: 'Clinical Laboratory',
+      IMG: 'Diagnostic Imaging',
+      PHA: 'Dispensary Pharmacy',
+      STO: 'Central Medical Store',
+      CSH: 'Cashier & Finance',
+      REC: 'Front Desk & Reception',
+      ACC: 'Cashier & Finance',
+      HRO: 'Human Resources',
+      MGR: 'Medical Administration',
+      ADM: 'System Administration',
+      AUD: 'Internal Audit & Compliance',
+    };
+
+    for (const u of usersToLink) {
+      let hrEmp = await queryOne<{ id: number }>('SELECT id FROM hr_employees WHERE user_id = ? LIMIT 1', [u.id]);
+      if (!hrEmp && u.employee_id) {
+        hrEmp = await queryOne<{ id: number }>('SELECT id FROM hr_employees WHERE id = ? LIMIT 1', [u.employee_id]);
+      }
+      if (!hrEmp) {
+        const empNum = await nextSequence('EMP').catch(() => `EMP-${String(300 + u.id)}`);
+        const deptName = deptByRole[u.role_code || 'ADM'] || 'Administration';
+        const insHr = await execute(
+          `INSERT INTO hr_employees (
+            employee_number, user_id, full_name, gender, email, department_name, job_position,
+            employment_type, hire_date, contract_start, basic_salary, housing_allowance, status
+          ) VALUES (?, ?, ?, 'unspecified', ?, ?, ?, 'full_time', '2025-01-01', '2025-01-01', 2800, 350, 'active')`,
+          [empNum, u.id, u.full_name, u.email, deptName, u.specialty || u.role_name || 'Clinic Staff']
+        );
+        hrEmp = { id: insHr.insertId };
+      }
+      const nextUsername = u.username || u.email.split('@')[0].toLowerCase();
+      const nextStatus = !u.active ? 'inactive' : u.locked_until ? 'locked' : 'active';
+      await execute(
+        'UPDATE users SET employee_id = COALESCE(employee_id, ?), username = COALESCE(username, ?), status = ? WHERE id = ?',
+        [hrEmp.id, nextUsername, nextStatus, u.id]
+      );
+    }
+
+    // Seed two unprovisioned HR staff members so Admin can test HR-to-User creation out of the box!
+    const unlinkedHr = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM hr_employees WHERE user_id IS NULL');
+    if (Number(unlinkedHr?.cnt || 0) === 0) {
+      const candidates: Array<[string, string, string, string, string, string]> = [
+        ['EMP-901', 'Dr. Miriam Bekele', 'miriam.bekele@clinic360.local', '+1-555-0191', 'Outpatient Department', 'Consultant Physician'],
+        ['EMP-902', 'Daniel Tesfaye, RN', 'daniel.tesfaye@clinic360.local', '+1-555-0192', 'Triage & Nursing', 'Triage Registered Nurse'],
+      ];
+      for (const [empNum, fullName, email, phone, deptName, jobPos] of candidates) {
+        const existsEmp = await queryOne('SELECT id FROM hr_employees WHERE employee_number = ?', [empNum]);
+        if (!existsEmp) {
+          await execute(
+            `INSERT INTO hr_employees (
+              employee_number, user_id, full_name, gender, phone, email, department_name, job_position,
+              employment_type, hire_date, contract_start, basic_salary, housing_allowance, status
+            ) VALUES (?, NULL, ?, 'unspecified', ?, ?, ?, ?, 'full_time', '2026-01-15', '2026-01-15', 3200, 400, 'active')`,
+            [empNum, fullName, phone, email, deptName, jobPos]
+          );
+        }
+      }
+    }
+  }
+
+  // Ensure standard clinic departments exist and are enriched
+  const standardDepts: Array<[string, string, string, string, string]> = [
+    ['OPD', 'Outpatient Department', 'clinical', 'Dr. Elena Vance', 'General and specialist outpatient consultations'],
+    ['EMG', 'Emergency & Resuscitation', 'clinical', 'Dr. Marcus Thorne', 'Acute emergency stabilization and trauma bay'],
+    ['TRIAGE', 'Triage & Nursing', 'clinical', 'Clara Ortiz, RN', 'Vital signs, triage scoring, and OPD nursing procedures'],
+    ['WRD', 'Inpatient Wards', 'clinical', 'Grace Okonkwo, RN', 'Inpatient admissions, ward beds, and medication administration'],
+    ['LAB', 'Clinical Laboratory', 'diagnostic', 'Tariq Hassan', 'Hematology, biochemistry, microbiology, and pathology'],
+    ['IMG', 'Diagnostic Imaging', 'diagnostic', 'Dr. Kenji Sato', 'Radiology, X-Ray, ultrasound, ECG, and echocardiography'],
+    ['PHA', 'Dispensary Pharmacy', 'pharmacy', 'Nadia Patel, PharmD', 'Outpatient/inpatient medication dispensing and counselling'],
+    ['STO', 'Central Medical Store', 'inventory', 'Samuel Osei', 'Main warehouse receiving, cold chain, and FEFO stock issue'],
+    ['FIN', 'Cashier & Finance', 'finance', 'Arthur Pendelton', 'Patient billing, cashier desks, GL accounting, and payouts'],
+    ['REC', 'Front Desk & Reception', 'operations', 'Maya Lin', 'Patient registration, appointments, and queue control'],
+    ['HR', 'Human Resources', 'administration', 'Elena Rostova', 'Staff register, attendance, leave, and payroll prep'],
+    ['ADM', 'Administration', 'administration', 'Hannah Brooks', 'System configuration, RBAC governance, and audit compliance'],
+  ];
+  for (const [code, name, category, headName, desc] of standardDepts) {
+    const existing = await queryOne<{ id: number; category: string | null }>('SELECT id, category FROM departments WHERE code = ?', [code]);
+    if (!existing) {
+      await execute(
+        'INSERT INTO departments (branch_id, code, name, category, head_name, description, active) VALUES (1, ?, ?, ?, ?, ?, 1)',
+        [code, name, category, headName, desc]
+      );
+    } else if (!existing.category) {
+      await execute(
+        'UPDATE departments SET category = ?, head_name = COALESCE(head_name, ?), description = COALESCE(description, ?) WHERE id = ?',
+        [category, headName, desc, existing.id]
+      );
+    }
+  }
+
+  // Seed default medical specialties if empty
+  const specCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM specialties');
+  if (Number(specCnt?.cnt || 0) === 0) {
+    const opdDept = await queryOne<{ id: number }>("SELECT id FROM departments WHERE code = 'OPD'");
+    const imgDept = await queryOne<{ id: number }>("SELECT id FROM departments WHERE code = 'IMG'");
+    const emgDept = await queryOne<{ id: number }>("SELECT id FROM departments WHERE code = 'EMG'");
+    const defaultSpecs: Array<[string, string, number | null, string, number]> = [
+      ['GEN_MED', 'General Medicine', opdDept?.id ?? null, 'Primary outpatient adult consultations and chronic care', 45],
+      ['INT_MED', 'Internal Medicine', opdDept?.id ?? null, 'Complex medical diagnostics and specialist follow-up', 75],
+      ['PEDS', 'Pediatrics & Family Care', opdDept?.id ?? null, 'Pediatric wellness, immunization, and acute child care', 55],
+      ['SURG', 'General Surgery', opdDept?.id ?? null, 'Pre-operative evaluation and minor surgical follow-up', 75],
+      ['OBGYN', 'Gynecology & Obstetrics', opdDept?.id ?? null, 'Antenatal, postnatal, and gynecologic consultations', 75],
+      ['CARD', 'Cardiology', opdDept?.id ?? null, 'Cardiovascular assessment, ECG, and echo review', 85],
+      ['EMG_MED', 'Emergency Medicine', emgDept?.id ?? null, 'Acute stabilization and urgent walk-in care', 65],
+      ['RAD', 'Diagnostic Radiology', imgDept?.id ?? null, 'Radiology imaging interpretation and reporting', 65],
+    ];
+    for (const [code, name, deptId, desc, fee] of defaultSpecs) {
+      await execute(
+        'INSERT INTO specialties (code, name, department_id, description, consultation_fee, active) VALUES (?, ?, ?, ?, ?, 1)',
+        [code, name, deptId, desc, fee]
+      );
+    }
+  }
+
+  // Seed default clinic rooms & units if empty
+  const roomCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM clinic_rooms');
+  if (Number(roomCnt?.cnt || 0) === 0) {
+    const deptRows = await query<{ id: number; code: string }>('SELECT id, code FROM departments');
+    const deptByCode = new Map(deptRows.map((d) => [d.code, d.id]));
+    const specRows = await query<{ id: number; code: string }>('SELECT id, code FROM specialties');
+    const specByCode = new Map(specRows.map((s) => [s.code, s.id]));
+
+    const defaultRooms: Array<[string, string, string, string | null, string, number]> = [
+      ['OPD-R1', 'OPD Consultation Room 1', 'OPD', 'INT_MED', 'consultation', 1],
+      ['OPD-R2', 'OPD Consultation Room 2', 'OPD', 'PEDS', 'consultation', 1],
+      ['OPD-R3', 'OPD Specialist Suite 3', 'OPD', 'CARD', 'consultation', 1],
+      ['TRG-01', 'Triage Assessment Bay 1', 'TRIAGE', null, 'triage', 2],
+      ['TRG-02', 'Triage Assessment Bay 2', 'TRIAGE', null, 'triage', 2],
+      ['EMG-01', 'Emergency Stabilization Bay', 'EMG', 'EMG_MED', 'examination', 2],
+      ['PROC-01', 'OPD Minor Procedure & Dressing Room', 'TRIAGE', null, 'procedure', 1],
+      ['LAB-01', 'Phlebotomy & Sample Booth', 'LAB', null, 'diagnostic', 2],
+      ['RAD-01', 'X-Ray & Ultrasound Suite', 'IMG', 'RAD', 'diagnostic', 1],
+    ];
+    for (const [roomCode, name, deptCode, specCode, roomType, capacity] of defaultRooms) {
+      await execute(
+        'INSERT INTO clinic_rooms (room_code, name, department_id, specialty_id, room_type, capacity, active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+        [roomCode, name, deptByCode.get(deptCode) ?? null, specCode ? specByCode.get(specCode) ?? null : null, roomType, capacity]
+      );
+    }
+  }
+
+  // Backfill user_departments from primary roles if empty
+  const udCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM user_departments');
+  if (Number(udCnt?.cnt || 0) === 0) {
+    const deptRows = await query<{ id: number; code: string }>('SELECT id, code FROM departments');
+    const deptByCode = new Map(deptRows.map((d) => [d.code, d.id]));
+    const roleDeptCode: Record<string, string> = {
+      DOC: 'OPD', NUR: 'TRIAGE', WRD: 'WRD', LAB: 'LAB', IMG: 'IMG',
+      PHA: 'PHA', STO: 'STO', CSH: 'FIN', ACC: 'FIN', REC: 'REC',
+      HRO: 'HR', ADM: 'ADM', MGR: 'ADM', AUD: 'ADM',
+    };
+    const uRoles = await query<{ user_id: number; role_code: string }>(
+      'SELECT ur.user_id, r.code AS role_code FROM user_roles ur INNER JOIN roles r ON r.id = ur.role_id'
+    );
+    for (const ur of uRoles) {
+      const deptId = deptByCode.get(roleDeptCode[ur.role_code] || 'ADM');
+      if (deptId) {
+        const exists = await queryOne('SELECT 1 FROM user_departments WHERE user_id = ? AND department_id = ?', [ur.user_id, deptId]);
+        if (!exists) {
+          await execute('INSERT INTO user_departments (user_id, department_id, is_primary) VALUES (?, ?, 1)', [ur.user_id, deptId]);
+        }
+      }
+    }
+  }
+
+  // Backfill doctor_assignments from visits
+  const daCnt = await queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM doctor_assignments');
+  if (Number(daCnt?.cnt || 0) === 0) {
+    const assignedVisits = await query<{ id: number; patient_id: number; doctor_id: number; specialty: string | null; status: string; created_by: number | null }>(
+      'SELECT id, patient_id, doctor_id, specialty, status, created_by FROM visits WHERE doctor_id IS NOT NULL'
+    );
+    for (const v of assignedVisits) {
+      await execute(
+        'INSERT INTO doctor_assignments (visit_id, patient_id, doctor_id, assigned_by, specialty, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [v.id, v.patient_id, v.doctor_id, v.created_by, v.specialty || 'General Medicine', v.status === 'closed' ? 'completed' : 'active', 'Initial visit assignment']
+      );
+    }
+  }
+
+  // Seed extended categorized system settings if missing
+  const extendedSettings: Array<[string, string]> = [
+    ['clinic_profile_json', JSON.stringify({
+      legalName: 'Clinic360 Central Medical Center Ltd.',
+      facilityCode: 'C360-MAIN',
+      address: '420 Bole Medhanialem Ave, Suite 100',
+      phone: '+1 (555) 234-8900',
+      email: 'info@clinic360.local',
+      operatingHours: 'Mon-Sat 07:30 - 20:00, Emergency 24/7',
+      taxId: 'TIN-004921882',
+    })],
+    ['clinical_config_json', JSON.stringify({
+      mrnPrefix: 'C360-',
+      visitPrefix: 'VIS-26-',
+      defaultSlotMinutes: 20,
+      maxDailyPatientsPerDoctor: 35,
+      allowWalkInRegistration: true,
+      requireVitalsBeforeConsultation: true,
+      requirePaymentBeforeConsultation: true,
+      vitalReferenceRanges: {
+        bpSystolicMin: 90, bpSystolicMax: 140,
+        bpDiastolicMin: 60, bpDiastolicMax: 90,
+        tempMinC: 36.1, tempMaxC: 37.8,
+        pulseMin: 60, pulseMax: 100,
+        spo2Min: 95,
+      },
+      autoAssignRoomBySpecialty: true,
+    })],
+    ['billing_config_json', JSON.stringify({
+      defaultTaxRatePct: 0,
+      cashierMaxDiscountPct: 10,
+      requireShiftForCollection: true,
+      allowPartialPayments: true,
+      allowInsuranceCreditBilling: true,
+      receiptFooterNote: 'Thank you for choosing Clinic360 Central Medical Center.',
+    })],
+    ['notifications_config_json', JSON.stringify({
+      enableInAppAlerts: true,
+      enableSmsAlerts: false,
+      enableEmailAlerts: true,
+      notifyDoctorOnAssignment: true,
+      notifyNurseOnPaymentClearance: true,
+      notifyAdminOnAccessReview: true,
+      criticalLabAlertImmediate: true,
+    })],
+    ['documents_config_json', JSON.stringify({
+      prescriptionHeader: 'Clinic360 Outpatient Pharmacy & Medical Prescription',
+      labReportHeader: 'Clinic360 Accredited Clinical Laboratory Report',
+      radiologyHeader: 'Clinic360 Diagnostic Imaging & Radiology Report',
+      invoiceHeader: 'Official Clinic360 Tax Invoice & Statement',
+      showClinicStampOnPrint: true,
+    })],
+    ['security_config_json', JSON.stringify({
+      sessionTimeoutMinutes: 720,
+      passwordMinLength: 8,
+      requireMixedCasePassword: true,
+      maxFailedLoginAttempts: 5,
+      lockoutDurationMinutes: 15,
+      enforce2faForPrivilegedRoles: true,
+      allowMultipleActiveSessions: true,
+    })],
+  ];
+  for (const [k, v] of extendedSettings) {
+    const exists = await queryOne('SELECT setting_key FROM system_settings WHERE setting_key = ?', [k]);
+    if (!exists) {
+      await execute('INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?)', [k, v]);
     }
   }
 }
@@ -2403,7 +3424,9 @@ export async function initDatabase(): Promise<{ dialect: DbDialect }> {
     }
   }
 
-  const dbPath = path.resolve(process.cwd(), 'clinic360.db');
+  const dbPath = process.env.SQLITE_PATH
+    ? path.resolve(process.env.SQLITE_PATH)
+    : path.resolve(process.cwd(), 'clinic360.db');
   sqliteDb = new Database(dbPath);
   activeDialect = 'sqlite';
   await initSqliteSchema(sqliteDb);
